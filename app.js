@@ -595,7 +595,6 @@ function saveCurrentPlace(){
   state.savedPlaces = [state.loc, ...state.savedPlaces].slice(0,12);
   store.set('lemons.savedPlaces', state.savedPlaces);
   flash('saved to the little lemon list');
-  const b = $('#saveplace'); if(b) b.textContent = 'saved';
 }
 function removeSavedPlace(i){
   state.savedPlaces.splice(i,1);
@@ -710,7 +709,7 @@ function renderApp(){
   const today = daily[0];
   const app = $('#app');
   setTopActions(`
-    <button id="saveplace">${isSavedPlace(state.loc)?'saved':'save'}</button>
+    <button id="saveplace">save</button>
     <button id="openplaces">places</button>
     <button id="shareloc">share</button>
   `);
@@ -870,26 +869,36 @@ function renderAir(){
   }
   const topPollen = (a.pollen || []).slice(0,4);
   const timeFmt = new Intl.DateTimeFormat('en-US', {hour:'numeric', timeZone: state.tz || undefined});
+  const hourlyAir = (a.hourly||[]).filter((_,i)=>i%3===0).slice(0,8);
   $('#view-air').innerHTML = `
     <div class="airwrap">
-      <div class="airhero">
-        <span>Air + pollen</span>
-        <strong>${a.aqi!=null?Math.round(a.aqi):'—'}</strong>
-        <p>${esc(aqiLabel(a.aqi))} air. Clean little read for the lungs.</p>
+      <div class="aircurrent">
+        <div class="airlabel">Air quality</div>
+        <div class="bigtemp airscore">${a.aqi!=null?Math.round(a.aqi):'—'}<sup>AQI</sup></div>
+        <div class="cond">${lemonMark('Air quality')} ${esc(aqiLabel(a.aqi))}</div>
+        <div class="hilo">Clean little read for the lungs</div>
+        <div class="statrow airstats">
+          <div class="stat"><div class="k">PM2.5</div><div class="v">${a.pm25!=null?Math.round(a.pm25):'—'}<small> µg/m³</small></div></div>
+          <div class="stat"><div class="k">PM10</div><div class="v">${a.pm10!=null?Math.round(a.pm10):'—'}<small> µg/m³</small></div></div>
+          <div class="stat"><div class="k">Ozone</div><div class="v">${a.ozone!=null?Math.round(a.ozone):'—'}<small> µg/m³</small></div></div>
+          <div class="stat"><div class="k">NO₂</div><div class="v">${a.no2!=null?Math.round(a.no2):'—'}<small> µg/m³</small></div></div>
+        </div>
       </div>
-      <div class="airgrid">
-        <div class="aircard"><span>PM2.5</span><b>${a.pm25!=null?Math.round(a.pm25):'—'}</b><small>µg/m³</small></div>
-        <div class="aircard"><span>PM10</span><b>${a.pm10!=null?Math.round(a.pm10):'—'}</b><small>µg/m³</small></div>
-        <div class="aircard"><span>Ozone</span><b>${a.ozone!=null?Math.round(a.ozone):'—'}</b><small>µg/m³</small></div>
-        <div class="aircard"><span>NO₂</span><b>${a.no2!=null?Math.round(a.no2):'—'}</b><small>µg/m³</small></div>
-      </div>
-      <div class="pollenbox">
+
+      <div class="airsection">
         <h3>Pollen vibe</h3>
-        ${topPollen.length ? topPollen.map(([name,val])=>`<div class="pollenrow"><span>${esc(name)}</span><b>${esc(pollenLabel(val))}</b><small>${Math.round(val)} grains/m³</small></div>`).join('') : '<p class="blendnote">No pollen data for this spot right now.</p>'}
+        <div class="airrows">
+          ${topPollen.length ? topPollen.map(([name,val])=>`<div class="airrowline"><span>${esc(name)}</span><b>${esc(pollenLabel(val))}</b><small>${Math.round(val)} grains/m³</small></div>`).join('') : '<p class="airnone">No pollen data for this spot right now.</p>'}
+        </div>
       </div>
-      <div class="aqistrip">
-        ${(a.hourly||[]).filter((_,i)=>i%3===0).slice(0,8).map(h=>`<div><span>${esc(timeFmt.format(new Date(h.epochH*3600000)))}</span><b>${h.aqi!=null?Math.round(h.aqi):'—'}</b></div>`).join('')}
+
+      <div class="airsection">
+        <h3>Air through the day</h3>
+        <div class="airtimeline">
+          ${hourlyAir.length ? hourlyAir.map(h=>`<div class="airtimeitem"><span>${esc(timeFmt.format(new Date(h.epochH*3600000)))}</span><b>${h.aqi!=null?Math.round(h.aqi):'—'}</b><small>AQI</small></div>`).join('') : '<p class="airnone">No hourly air read came back.</p>'}
+        </div>
       </div>
+
       <p class="blendnote">AQI and pollen use the Open-Meteo air-quality feed. Pollen can be patchy by region, so treat it as a clean heads-up, not a medical-grade read.</p>
     </div>`;
 }
