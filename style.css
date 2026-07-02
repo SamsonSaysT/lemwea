@@ -64,7 +64,8 @@ nav.tabs button{
 }
 nav.tabs button:hover{color:var(--ink)}
 nav.tabs button[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--zest)}
-.panelview{display:none;animation:panelin .18s cubic-bezier(.16,1,.3,1)}
+.swipehint{display:none;color:var(--muted);font-size:.72rem;text-align:center;padding:7px 0 0;letter-spacing:.04em}
+.panelview{display:none;animation:panelin .18s cubic-bezier(.16,1,.3,1);touch-action:pan-y}
 .panelview.active{display:block}
 @keyframes panelin{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 
@@ -239,6 +240,10 @@ footer.site b{color:var(--ink);font-weight:600}
   *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important}
   #intro{display:none}
   .msg .spin{animation:none}
+}
+
+@media (max-width:640px){
+  .swipehint{display:block}
 }
 
 @media (max-width:480px){

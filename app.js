@@ -60,12 +60,67 @@ function iconFor(c, size=24){
   if(c>=61) return `<svg ${S}><path d="${cloud}"/><path d="M8.5 20l-.8 2.2M12 20l-.8 2.2M15.5 20l-.8 2.2"/></svg>`;
   return `<svg ${S}><path d="${cloud}"/></svg>`;
 }
+function codeSeverity(c){
+  if(c==null) return 99;
+  if(c===0) return 0;
+  if(c===1) return 1;
+  if(c===2) return 2;
+  if(c===3) return 3;
+  if(c===45||c===48) return 4;
+  if(c>=51&&c<=57) return 5;
+  if(c>=61&&c<=67) return 6;
+  if(c>=71&&c<=77) return 6.5;
+  if(c===80||c===81) return 7;
+  if(c===82) return 7.5;
+  if(c===85||c===86) return 7.5;
+  if(c>=95) return 8;
+  return 9;
+}
 function modeCode(codes){
-  const v = codes.filter(c=>c!=null);
+  return pickWeatherCode(codes);
+}
+function pickWeatherCode(codes, precipAvg=null){
+  const v = codes.filter(c=>c!=null && isFinite(c)).map(Number);
   if(!v.length) return null;
   const count = {};
   v.forEach(c=>count[c]=(count[c]||0)+1);
-  return +Object.entries(count).sort((a,b)=> b[1]-a[1] || b[0]-a[0])[0][0];
+  const wetTie = typeof precipAvg === 'number' && isFinite(precipAvg) && precipAvg >= 45;
+  return +Object.entries(count).sort((a,b)=>{
+    const ca = a[1], cb = b[1];
+    if(cb !== ca) return cb - ca;
+    const sa = codeSeverity(+a[0]), sb = codeSeverity(+b[0]);
+    // Old code picked the biggest WMO number on ties, so one thunder vote could beat one sunny vote.
+    // Now ties choose the calmer icon unless the blended precip chance is genuinely high.
+    return wetTie ? sb - sa : sa - sb;
+  })[0][0];
+}
+const localPartFmtCache = new Map();
+function localDateHour(epochH){
+  const tz = state.tz || 'UTC';
+  let fmt = localPartFmtCache.get(tz);
+  if(!fmt){
+    fmt = new Intl.DateTimeFormat('en-US', {timeZone:tz, year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', hourCycle:'h23'});
+    localPartFmtCache.set(tz, fmt);
+  }
+  const parts = Object.fromEntries(fmt.formatToParts(new Date(epochH*3600000)).map(p=>[p.type,p.value]));
+  return {date:`${parts.year}-${parts.month}-${parts.day}`, hour:+parts.hour};
+}
+function representativeDailyCode(date, fallbackRows=[]){
+  const dayCodes = [], dayPrecip = [];
+  okSources().forEach(s=>{
+    if(!s.hourly) return;
+    for(const [h,row] of s.hourly.entries()){
+      const lp = localDateHour(h);
+      // Use late morning through afternoon for the daily icon. Daily weather_code can mean
+      // “worst thing possible that day,” which made sunny days show as thunder.
+      if(lp.date === date && lp.hour >= 10 && lp.hour <= 18){
+        if(row.code!=null) dayCodes.push(row.code);
+        if(row.precip!=null) dayPrecip.push(row.precip);
+      }
+    }
+  });
+  if(dayCodes.length) return pickWeatherCode(dayCodes, avg(dayPrecip));
+  return pickWeatherCode(fallbackRows.map(r=>r.code), avg(fallbackRows.map(r=>r.precip)));
 }
 
 /* =====================================================================
@@ -116,7 +171,8 @@ async function fetchOpenMeteo(lat, lon){
       tempC: temps[nowIdx], feelsC: g('apparent_temperature')[nowIdx] ?? null,
       humidity: g('relative_humidity_2m')[nowIdx] ?? null,
       windKmh: g('wind_speed_10m')[nowIdx] ?? null,
-      code: g('weather_code')[nowIdx] ?? null
+      code: g('weather_code')[nowIdx] ?? null,
+      precip: g('precipitation_probability')[nowIdx] ?? null
     };
     return {id:m.key, name:m.name, ok:true, current:cur, hourly, daily};
   });
@@ -167,7 +223,8 @@ async function fetchNWS(lat, lon){
       feelsC:null,
       humidity: first.relativeHumidity?.value ?? null,
       windKmh: (parseFloat(first.windSpeed)||0) * 1.60934 || null,
-      code: nwsCode(first.shortForecast)
+      code: nwsCode(first.shortForecast),
+      precip: first.probabilityOfPrecipitation?.value ?? null
     } : null;
     return {...base, ok:true, current, hourly, daily};
   }catch(e){ return {...base, ok:false}; }
@@ -206,7 +263,7 @@ async function fetchMetNo(lat, lon){
     });
     const cur = ts[0]?.data?.instant?.details;
     const current = cur ? { tempC:cur.air_temperature, feelsC:null, humidity:cur.relative_humidity ?? null,
-      windKmh: cur.wind_speed!=null ? cur.wind_speed*3.6 : null, code: metCode(ts[0].data?.next_1_hours?.summary?.symbol_code||'') } : null;
+      windKmh: cur.wind_speed!=null ? cur.wind_speed*3.6 : null, code: metCode(ts[0].data?.next_1_hours?.summary?.symbol_code||''), precip:null } : null;
     return {...base, ok:true, current, hourly, daily};
   }catch(e){ return {...base, ok:false}; }
 }
@@ -240,7 +297,7 @@ async function fetchBrightSky(lat, lon){
     });
     const nowH = Math.floor(Date.now()/3600000);
     const c = hourly.get(nowH) || hourly.get(nowH+1);
-    const current = c ? {tempC:c.tempC, feelsC:null, humidity:null, windKmh:null, code:c.code} : null;
+    const current = c ? {tempC:c.tempC, feelsC:null, humidity:null, windKmh:null, code:c.code, precip:c.precip} : null;
     return {...base, ok:true, current, hourly, daily};
   }catch(e){ return {...base, ok:false}; }
 }
@@ -281,7 +338,7 @@ function consensusCurrent(){
     feelsC: avg(s.map(x=>x.current.feelsC)),
     humidity: avg(s.map(x=>x.current.humidity)),
     windKmh: avg(s.map(x=>x.current.windKmh)),
-    code: modeCode(s.map(x=>x.current.code)),
+    code: pickWeatherCode(s.map(x=>x.current.code), avg(s.map(x=>x.current.precip))),
     spreadC: temps.length>1 ? Math.max(...temps)-Math.min(...temps) : 0,
     count: s.length
   };
@@ -293,7 +350,7 @@ function consensusHourly(hours=24){
     const rows = okSources().map(s=>s.hourly?.get(h)).filter(Boolean);
     if(!rows.length) continue;
     out.push({ epochH:h, tempC:avg(rows.map(r=>r.tempC)), precip:avg(rows.map(r=>r.precip)),
-      code:modeCode(rows.map(r=>r.code)), count:rows.length });
+      code:pickWeatherCode(rows.map(r=>r.code), avg(rows.map(r=>r.precip))), count:rows.length });
   }
   return out;
 }
@@ -304,7 +361,7 @@ function consensusDaily(days=16){
   return [...dates].filter(d=>d>=todayStr).sort().slice(0,days).map(date=>{
     const rows = okSources().map(s=>s.daily?.get(date)).filter(Boolean);
     return { date, hiC:avg(rows.map(r=>r.hiC)), loC:avg(rows.map(r=>r.loC)),
-      precip:avg(rows.map(r=>r.precip)), code:modeCode(rows.map(r=>r.code)), count:rows.length };
+      precip:avg(rows.map(r=>r.precip)), code:representativeDailyCode(date, rows), count:rows.length };
   }).filter(d=>d.hiC!=null||d.loC!=null);
 }
 
@@ -324,7 +381,7 @@ function lemonSpinner(){
       <path d="M50 27v46M27 50h46M34 34l32 32M66 34L34 66"/></g></svg>`;
 }
 function renderLoading(){
-  $('#app').innerHTML = `<div class="msg">${lemonSpinner()}<h2>Squeezing the sources…</h2>ECMWF · GFS · ICON · UKMO · Météo-France · NWS · MET Norway · 16-day</div>`;
+  $('#app').innerHTML = `<div class="msg">${lemonSpinner()}<h2>Squeezing the sources…</h2>ECMWF · GFS · ICON · UKMO · Météo-France · NWS · MET Norway · corrected icons</div>`;
 }
 
 function renderLocationScreen(){
@@ -459,6 +516,7 @@ function renderApp(){
       ${['current','hourly','daily','radar'].map(t=>
         `<button role="tab" data-tab="${t}" aria-selected="${state.tab===t}">${t[0].toUpperCase()+t.slice(1)}</button>`).join('')}
     </nav>
+    <div class="swipehint" aria-hidden="true">swipe left / right to switch</div>
     <section id="view-current" class="panelview" role="tabpanel"></section>
     <section id="view-hourly" class="panelview" role="tabpanel"></section>
     <section id="view-daily" class="panelview" role="tabpanel"></section>
@@ -479,6 +537,7 @@ function renderApp(){
 
   $('#changeloc').addEventListener('click', renderLocationScreen);
   app.querySelectorAll('[data-tab]').forEach(b=>b.addEventListener('click', ()=>switchTab(b.dataset.tab)));
+  initSwipeNav(app);
 
   renderCurrent(cur, today);
   renderHourly();
@@ -570,6 +629,31 @@ function renderDaily(daily){
         </div>`;}).join('')}
     </div>
     <p class="blendnote">Highs and lows averaged across every source with an opinion that day. Free no-key forecast data is shown out to 16 days.</p>`;
+}
+
+/* ---------- mobile swipe between sections ---------- */
+function initSwipeNav(el){
+  const tabs = ['current','hourly','daily','radar'];
+  let startX=0, startY=0, startT=0, tracking=false;
+  const ignore = target => !!target.closest('button,input,select,textarea,a,.hscroll,#map,.leaflet-container,.scrub');
+  el.addEventListener('touchstart', e=>{
+    if(e.touches.length !== 1 || ignore(e.target)) return;
+    tracking = true;
+    startX = e.touches[0].clientX;
+    startY = e.touches[0].clientY;
+    startT = Date.now();
+  }, {passive:true});
+  el.addEventListener('touchend', e=>{
+    if(!tracking || !e.changedTouches.length) return;
+    tracking = false;
+    const dx = e.changedTouches[0].clientX - startX;
+    const dy = e.changedTouches[0].clientY - startY;
+    const fastEnough = Date.now() - startT < 800;
+    if(!fastEnough || Math.abs(dx) < 55 || Math.abs(dx) < Math.abs(dy)*1.35) return;
+    const i = tabs.indexOf(state.tab);
+    const next = dx < 0 ? Math.min(i+1, tabs.length-1) : Math.max(i-1, 0);
+    if(next !== i) switchTab(tabs[next]);
+  }, {passive:true});
 }
 
 /* ---------- tabs ---------- */
