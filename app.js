@@ -22,12 +22,29 @@ const cToF = c => c*9/5+32;
 const kmhToMph = k => k*0.621371;
 
 /* ---------- state ---------- */
+const TABS = ['current','hourly','daily','radar','air'];
+function parseSharedLocation(){
+  const p = new URLSearchParams(location.search);
+  const lat = parseFloat(p.get('lat'));
+  const lon = parseFloat(p.get('lon'));
+  if(!isFinite(lat) || !isFinite(lon)) return null;
+  return {
+    lat, lon,
+    name: p.get('name') || 'Shared spot',
+    admin: p.get('admin') || ''
+  };
+}
 const state = {
-  loc: store.get('lemons.loc'),          // {lat, lon, name, admin}
-  unit: store.get('lemons.unit') || 'F', // 'F' | 'C'
+  // Plain visits always start at “Where are you, Lemons?”
+  // Only a shared ?lat=&lon= link starts directly on a forecast.
+  loc: parseSharedLocation(),             // {lat, lon, name, admin}
+  unit: store.get('lemons.unit') || 'F',  // 'F' | 'C'
   hourlyHours: store.get('lemons.hourlyHours') || 72,
+  savedPlaces: store.get('lemons.savedPlaces') || [],
   tz: undefined,
   sources: [],                            // normalized per-source data
+  alerts: [],
+  air: null,
   tab: 'current',
   radar: null
 };
@@ -143,7 +160,7 @@ async function fetchOpenMeteo(lat, lon){
   const models = OM_MODELS.map(m=>m.key).join(',');
   const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`
     + `&hourly=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation_probability,weather_code,wind_speed_10m`
-    + `&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code`
+    + `&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code,sunrise,sunset`
     + `&models=${models}&timezone=auto&forecast_days=16&wind_speed_unit=kmh`;
   const d = await fetchJSON(url);
   state.tz = d.timezone || state.tz;
@@ -165,7 +182,10 @@ async function fetchOpenMeteo(lat, lon){
     (d.daily.time||[]).forEach((date,i)=>{
       const hi = gd('temperature_2m_max')[i], lo = gd('temperature_2m_min')[i];
       if(hi==null&&lo==null) return;
-      daily.set(date, { hiC:hi, loC:lo, precip:(gd('precipitation_probability_max')[i] ?? null), code:(gd('weather_code')[i] ?? null) });
+      daily.set(date, {
+        hiC:hi, loC:lo, precip:(gd('precipitation_probability_max')[i] ?? null), code:(gd('weather_code')[i] ?? null),
+        sunrise:(d.daily.sunrise?.[i] ?? null), sunset:(d.daily.sunset?.[i] ?? null)
+      });
     });
     const cur = {
       tempC: temps[nowIdx], feelsC: g('apparent_temperature')[nowIdx] ?? null,
@@ -228,6 +248,24 @@ async function fetchNWS(lat, lon){
     } : null;
     return {...base, ok:true, current, hourly, daily};
   }catch(e){ return {...base, ok:false}; }
+}
+
+async function fetchNWSAlerts(lat, lon){
+  try{
+    const d = await fetchJSON(`https://api.weather.gov/alerts/active?point=${lat.toFixed(4)},${lon.toFixed(4)}`, {}, 9000);
+    return (d.features || []).slice(0,4).map(f=>{
+      const p = f.properties || {};
+      return {
+        event:p.event || 'Weather Alert',
+        headline:p.headline || p.event || 'Weather Alert',
+        severity:p.severity || '',
+        urgency:p.urgency || '',
+        expires:p.expires || p.ends || null,
+        instruction:p.instruction || '',
+        description:p.description || ''
+      };
+    });
+  }catch(e){ return []; }
 }
 
 /* ---- 3. MET Norway ---- */
@@ -302,24 +340,58 @@ async function fetchBrightSky(lat, lon){
   }catch(e){ return {...base, ok:false}; }
 }
 
+/* ---- 5. Open-Meteo Air Quality + pollen ---- */
+async function fetchAirQuality(lat, lon){
+  const fields = [
+    'us_aqi','pm2_5','pm10','ozone','nitrogen_dioxide','carbon_monoxide',
+    'alder_pollen','birch_pollen','grass_pollen','mugwort_pollen','olive_pollen','ragweed_pollen'
+  ];
+  try{
+    const url = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lon}`
+      + `&hourly=${fields.join(',')}&timezone=auto&forecast_days=5`;
+    const d = await fetchJSON(url, {}, 12000);
+    const times = (d.hourly?.time || []).map(epochHour);
+    const nowH = Math.floor(Date.now()/3600000);
+    let idx = times.findIndex(t=>t>=nowH);
+    if(idx < 0) idx = Math.max(0, times.length-1);
+    const h = d.hourly || {};
+    const get = name => h[name]?.[idx] ?? null;
+    const pollen = [
+      ['Grass', get('grass_pollen')], ['Ragweed', get('ragweed_pollen')],
+      ['Birch', get('birch_pollen')], ['Alder', get('alder_pollen')],
+      ['Mugwort', get('mugwort_pollen')], ['Olive', get('olive_pollen')]
+    ].filter(x=>x[1]!=null).sort((a,b)=>b[1]-a[1]);
+    const hourly = times.slice(idx, idx+24).map((t,i)=>{
+      const j = idx+i;
+      return { epochH:t, aqi:h.us_aqi?.[j] ?? null, pm25:h.pm2_5?.[j] ?? null, grass:h.grass_pollen?.[j] ?? null, ragweed:h.ragweed_pollen?.[j] ?? null };
+    });
+    return {
+      ok:true,
+      aqi:get('us_aqi'), pm25:get('pm2_5'), pm10:get('pm10'), ozone:get('ozone'),
+      no2:get('nitrogen_dioxide'), co:get('carbon_monoxide'), pollen, hourly
+    };
+  }catch(e){ return {ok:false}; }
+}
+
 /* =====================================================================
    BLEND — squeeze all sources into one consensus
    ===================================================================== */
 async function loadWeather(){
   renderLoading();
   const {lat, lon} = state.loc;
-  const results = await Promise.allSettled([
-    fetchOpenMeteo(lat, lon),
-    fetchNWS(lat, lon),
-    fetchMetNo(lat, lon),
-    fetchBrightSky(lat, lon)
+  const [weatherResults, alertResult, airResult] = await Promise.all([
+    Promise.allSettled([fetchOpenMeteo(lat, lon), fetchNWS(lat, lon), fetchMetNo(lat, lon), fetchBrightSky(lat, lon)]),
+    fetchNWSAlerts(lat, lon).then(v=>({ok:true, value:v})).catch(()=>({ok:false, value:[]})),
+    fetchAirQuality(lat, lon).then(v=>({ok:true, value:v})).catch(()=>({ok:false, value:{ok:false}}))
   ]);
   let sources = [];
-  results.forEach(r=>{
+  weatherResults.forEach(r=>{
     if(r.status!=='fulfilled' || r.value==null) return;
     Array.isArray(r.value) ? sources.push(...r.value) : sources.push(r.value);
   });
   state.sources = sources;
+  state.alerts = alertResult.value || [];
+  state.air = airResult.value || {ok:false};
   state.updated = Date.now();
   if(!sources.some(s=>s.ok)){
     $('#app').innerHTML = `<div class="msg"><h2>The lemon came up dry.</h2>
@@ -361,7 +433,8 @@ function consensusDaily(days=16){
   return [...dates].filter(d=>d>=todayStr).sort().slice(0,days).map(date=>{
     const rows = okSources().map(s=>s.daily?.get(date)).filter(Boolean);
     return { date, hiC:avg(rows.map(r=>r.hiC)), loC:avg(rows.map(r=>r.loC)),
-      precip:avg(rows.map(r=>r.precip)), code:representativeDailyCode(date, rows), count:rows.length };
+      precip:avg(rows.map(r=>r.precip)), code:representativeDailyCode(date, rows), count:rows.length,
+      sunrise:(rows.find(r=>r.sunrise)?.sunrise ?? null), sunset:(rows.find(r=>r.sunset)?.sunset ?? null) };
   }).filter(d=>d.hiC!=null||d.loC!=null);
 }
 
@@ -381,10 +454,19 @@ function lemonSpinner(){
       <path d="M50 27v46M27 50h46M34 34l32 32M66 34L34 66"/></g></svg>`;
 }
 function renderLoading(){
-  $('#app').innerHTML = `<div class="msg">${lemonSpinner()}<h2>Squeezing the sources…</h2>ECMWF · GFS · ICON · UKMO · Météo-France · NWS · MET Norway · corrected icons</div>`;
+  $('#app').innerHTML = `<div class="msg">${lemonSpinner()}<h2>Squeezing the sources…</h2>ECMWF · GFS · ICON · UKMO · Météo-France · NWS alerts · air + pollen</div>`;
+}
+
+
+function setTopActions(html){
+  const el = $('#topActions');
+  if(!el) return;
+  el.innerHTML = html || '';
+  el.classList.toggle('hidden', !html);
 }
 
 function renderLocationScreen(){
+  setTopActions('');
   const insecure = !window.isSecureContext;
   $('#app').innerHTML = `
     <div class="locscreen">
@@ -399,9 +481,12 @@ function renderLocationScreen(){
         <input id="citysearch" type="search" placeholder="City, town, or ZIP…" autocomplete="off" aria-label="Search for a city, town, or ZIP code">
         <ul class="results" id="cityresults"></ul>
       </div>
-      <p class="lochelp">Search now checks Open-Meteo/GeoNames first, then OpenStreetMap for smaller US towns and ZIPs. Try things like <b>Ferndale MI</b>, <b>Lakewood OH</b>, or <b>48220</b>.</p>
+      <div class="lowkeyrow"><button class="ghostlink" id="savedplacesbtn">saved places</button></div>
+      <div id="placesPanel" class="placespanel hidden"></div>
+      <p class="lochelp">Search checks Open-Meteo/GeoNames first, then OpenStreetMap for smaller US towns and ZIPs. Try things like <b>Ferndale MI</b>, <b>Lakewood OH</b>, or <b>48220</b>.</p>
     </div>`;
   $('#geobtn').addEventListener('click', geolocate);
+  $('#savedplacesbtn').addEventListener('click', ()=>togglePlacesPanel());
   const input = $('#citysearch');
   let deb;
   input.addEventListener('input', ()=>{ clearTimeout(deb); deb = setTimeout(()=>searchCity(input.value.trim()), 700); });
@@ -497,24 +582,148 @@ async function searchCity(q){
   }catch(e){ ul.innerHTML = `<li><button disabled>Search failed — try again</button></li>`; }
 }
 function setLocation(loc){
-  state.loc = loc; store.set('lemons.loc', loc);
+  state.loc = loc;
   if(state.radar){ state.radar.destroy(); state.radar = null; }
   loadWeather();
 }
 
+function placeKey(p){ return `${String(p.name||'').toLowerCase()}|${(+p.lat).toFixed(3)}|${(+p.lon).toFixed(3)}`; }
+function isSavedPlace(p){ return state.savedPlaces.some(x=>placeKey(x) === placeKey(p)); }
+function saveCurrentPlace(){
+  if(!state.loc) return;
+  if(isSavedPlace(state.loc)){ flash('already tucked in the lemon list'); return; }
+  state.savedPlaces = [state.loc, ...state.savedPlaces].slice(0,12);
+  store.set('lemons.savedPlaces', state.savedPlaces);
+  flash('saved to the little lemon list');
+  const b = $('#saveplace'); if(b) b.textContent = 'saved';
+}
+function removeSavedPlace(i){
+  state.savedPlaces.splice(i,1);
+  store.set('lemons.savedPlaces', state.savedPlaces);
+  togglePlacesPanel(true);
+}
+function togglePlacesPanel(forceOpen=false){
+  const panel = $('#placesPanel'); if(!panel) return;
+  const shouldOpen = forceOpen || panel.classList.contains('hidden');
+  if(!shouldOpen){ panel.classList.add('hidden'); return; }
+  if(!state.savedPlaces.length){
+    panel.innerHTML = `<p class="emptyplaces">No saved places yet. Once you pick a spot, hit <b>save</b>.</p>`;
+  }else{
+    panel.innerHTML = `<div class="placeshead">saved spots</div>` + state.savedPlaces.map((p,i)=>`
+      <div class="placeitem">
+        <button class="placego" data-place="${i}">${esc(p.name)}<span>${esc(p.admin||'')}</span></button>
+        <button class="placeremove" data-remove="${i}" aria-label="Remove ${esc(p.name)}">×</button>
+      </div>`).join('');
+  }
+  panel.classList.remove('hidden');
+  panel.querySelectorAll('[data-place]').forEach(b=>b.addEventListener('click', ()=>setLocation(state.savedPlaces[+b.dataset.place])));
+  panel.querySelectorAll('[data-remove]').forEach(b=>b.addEventListener('click', e=>{ e.stopPropagation(); removeSavedPlace(+b.dataset.remove); }));
+}
+function shareCurrentLocation(){
+  if(!state.loc) return;
+  const u = new URL(location.href);
+  u.search = '';
+  u.hash = '';
+  u.searchParams.set('lat', (+state.loc.lat).toFixed(5));
+  u.searchParams.set('lon', (+state.loc.lon).toFixed(5));
+  u.searchParams.set('name', state.loc.name || 'Lemons spot');
+  if(state.loc.admin) u.searchParams.set('admin', state.loc.admin);
+  const link = u.toString();
+  if(navigator.clipboard && window.isSecureContext){
+    navigator.clipboard.writeText(link).then(()=>flash('share link copied, smooth')).catch(()=>window.prompt('Copy this link', link));
+  }else{
+    window.prompt('Copy this link', link);
+  }
+}
+function flash(msg){
+  let t = $('#toast');
+  if(!t){ t = document.createElement('div'); t.id = 'toast'; document.body.appendChild(t); }
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(window.__lemonsToast);
+  window.__lemonsToast = setTimeout(()=>t.classList.remove('show'), 1800);
+}
+function formatTime(iso){
+  if(!iso) return '—';
+  return new Intl.DateTimeFormat('en-US', {hour:'numeric', minute:'2-digit', timeZone:state.tz||undefined}).format(new Date(iso));
+}
+function lemonMark(label){
+  return `<span class="lemonmark" aria-label="${esc(label)}"><svg viewBox="0 0 22 22" aria-hidden="true"><ellipse cx="11" cy="11" rx="8" ry="10" fill="var(--zest)" stroke="currentColor" stroke-width="1.4"/><path d="M11 4.5v13M5.3 11h11.4M7.2 6.7l7.6 8.6M14.8 6.7l-7.6 8.6" stroke="var(--pith)" stroke-width="1.35" stroke-linecap="round"/></svg></span>`;
+}
+function renderSunStrip(day){
+  if(!day || (!day.sunrise && !day.sunset)) return '';
+  return `<div class="sunstrip">
+    <span>${lemonMark('Lemonrise')} Lemonrise <b>${formatTime(day.sunrise)}</b></span>
+    <span>${lemonMark('Lemonset')} Lemonset <b>${formatTime(day.sunset)}</b></span>
+  </div>`;
+}
+function alertUntil(a){ return a.expires ? `until ${formatTime(a.expires)}` : ''; }
+function renderAlerts(){
+  if(!state.alerts || !state.alerts.length) return '';
+  return `<div class="alertstack">${state.alerts.map(a=>`
+    <div class="lemonalert">
+      <span class="alertdot">!</span>
+      <div><b>${esc(a.event)}</b>${alertUntil(a)?` <span>${esc(alertUntil(a))}</span>`:''}<small>${esc(a.headline || '')}</small></div>
+    </div>`).join('')}</div>`;
+}
+function firstRainWindow(hours){
+  return hours.find(h => h.precip != null && h.precip >= 35);
+}
+function lemonsSays(cur, today){
+  const hours = consensusHourly(18);
+  const rain = firstRainWindow(hours);
+  const aqi = state.air?.ok && state.air.aqi!=null ? state.air.aqi : null;
+  const lines = [];
+
+  if(state.alerts?.length){
+    const alertText = (state.alerts[0].event || '').toLowerCase();
+    if(alertText.includes('heat')) lines.push('Keep it breezy and shaded; the peel is running hot.');
+    else if(alertText.includes('storm') || alertText.includes('thunder')) lines.push('Storm energy is on the peel, so keep the moves flexible.');
+    else if(alertText.includes('flood')) lines.push('Water might get bold out there; cruise smart.');
+    else lines.push('There is an alert on the peel, so stay casually aware.');
+  }else if(cur.code>=95){
+    lines.push('Thunder has a little attitude today; keep one eye on the sky.');
+  }else if(cur.code>=61){
+    lines.push('Soft rain mode is around; not a panic, just a bring-a-layer type beat.');
+  }else if(cur.code<=1){
+    lines.push('Golden and easy out there. Smooth little lemon day.');
+  }else if(cur.code===2){
+    lines.push('Partly bright and still smooth. Good outside energy.');
+  }else if(cur.code===3){
+    lines.push('Clouds are hanging around, but the vibe stays composed.');
+  }else{
+    lines.push('A clean little read for the day. Nothing too dramatic.');
+  }
+
+  if(rain){
+    const when = new Intl.DateTimeFormat('en-US',{hour:'numeric', timeZone:state.tz||undefined}).format(new Date(rain.epochH*3600000));
+    lines.push(`Rain might slide through around ${when}.`);
+  }else{
+    lines.push('Rain is not really pressing in the next few hours.');
+  }
+
+  if(aqi!=null) lines.push(`Air is ${aqiLabel(aqi).toLowerCase()}, pretty low-key.`);
+  return lines.join(' ');
+}
 function renderApp(){
   const cur = consensusCurrent();
   const daily = consensusDaily(16);
   const today = daily[0];
   const app = $('#app');
+  setTopActions(`
+    <button id="saveplace">${isSavedPlace(state.loc)?'saved':'save'}</button>
+    <button id="openplaces">places</button>
+    <button id="shareloc">share</button>
+  `);
   app.innerHTML = `
     <div class="locrow">
       <div class="locname">${esc(state.loc.name)}${state.loc.admin?`<span class="sub">${esc(state.loc.admin)}</span>`:''}</div>
       <button class="linkish" id="changeloc">change location</button>
     </div>
+    <div id="placesPanel" class="placespanel hidden"></div>
+    ${renderAlerts()}
     <nav class="tabs" role="tablist" aria-label="Forecast views">
-      ${['current','hourly','daily','radar'].map(t=>
-        `<button role="tab" data-tab="${t}" aria-selected="${state.tab===t}">${t[0].toUpperCase()+t.slice(1)}</button>`).join('')}
+      ${TABS.map(t=>
+        `<button role="tab" data-tab="${t}" aria-selected="${state.tab===t}">${t==='air'?'Air':t[0].toUpperCase()+t.slice(1)}</button>`).join('')}
     </nav>
     <div class="swipehint" aria-hidden="true">swipe left / right to switch</div>
     <section id="view-current" class="panelview" role="tabpanel"></section>
@@ -533,15 +742,20 @@ function renderApp(){
         <p class="radarnote">Past two hours of precipitation plus a short nowcast. Tiles by RainViewer.</p>
         <p class="mapcredit">Basemap © OpenStreetMap/CARTO · radar © RainViewer</p>
       </div>
-    </section>`;
+    </section>
+    <section id="view-air" class="panelview" role="tabpanel"></section>`;
 
-  $('#changeloc').addEventListener('click', renderLocationScreen);
+  $('#changeloc').addEventListener('click', ()=>{ state.loc = null; state.tab = 'current'; renderLocationScreen(); });
+  $('#saveplace').addEventListener('click', saveCurrentPlace);
+  $('#openplaces').addEventListener('click', ()=>togglePlacesPanel());
+  $('#shareloc').addEventListener('click', shareCurrentLocation);
   app.querySelectorAll('[data-tab]').forEach(b=>b.addEventListener('click', ()=>switchTab(b.dataset.tab)));
   initSwipeNav(app);
 
   renderCurrent(cur, today);
   renderHourly();
   renderDaily(daily);
+  renderAir();
   switchTab(state.tab);
 }
 
@@ -557,6 +771,8 @@ function renderCurrent(cur, today){
       <div class="bigtemp">${T(cur.tempC)}<sup>°${state.unit}</sup></div>
       <div class="cond">${iconFor(cur.code,22)} ${codeLabel(cur.code)}</div>
       ${today?`<div class="hilo">H ${T(today.hiC)}° · L ${T(today.loC)}°</div>`:''}
+      ${renderSunStrip(today)}
+      <div class="lemonsays"><span>Lemons says</span><p>${esc(lemonsSays(cur, today))}</p></div>
       <div class="statrow">
         <div class="stat"><div class="k">Feels like</div><div class="v">${T(cur.feelsC ?? cur.tempC)}°</div></div>
         <div class="stat"><div class="k">Humidity</div><div class="v">${cur.humidity!=null?Math.round(cur.humidity):'—'}<small>%</small></div></div>
@@ -631,9 +847,56 @@ function renderDaily(daily){
     <p class="blendnote">Highs and lows averaged across every source with an opinion that day. Free no-key forecast data is shown out to 16 days.</p>`;
 }
 
+function aqiLabel(v){
+  if(v==null) return 'Unknown';
+  if(v<=50) return 'Good';
+  if(v<=100) return 'Moderate';
+  if(v<=150) return 'Unhealthy for sensitive folks';
+  if(v<=200) return 'Unhealthy';
+  return 'Very unhealthy';
+}
+function pollenLabel(v){
+  if(v==null) return '—';
+  if(v<=1) return 'barely there';
+  if(v<=15) return 'low';
+  if(v<=50) return 'medium';
+  return 'high';
+}
+function renderAir(){
+  const a = state.air;
+  if(!a || !a.ok){
+    $('#view-air').innerHTML = `<div class="msg"><h2>Air read is being shy.</h2>Air quality or pollen data did not come back for this spot.</div>`;
+    return;
+  }
+  const topPollen = (a.pollen || []).slice(0,4);
+  const timeFmt = new Intl.DateTimeFormat('en-US', {hour:'numeric', timeZone: state.tz || undefined});
+  $('#view-air').innerHTML = `
+    <div class="airwrap">
+      <div class="airhero">
+        <span>Air + pollen</span>
+        <strong>${a.aqi!=null?Math.round(a.aqi):'—'}</strong>
+        <p>${esc(aqiLabel(a.aqi))} air. Clean little read for the lungs.</p>
+      </div>
+      <div class="airgrid">
+        <div class="aircard"><span>PM2.5</span><b>${a.pm25!=null?Math.round(a.pm25):'—'}</b><small>µg/m³</small></div>
+        <div class="aircard"><span>PM10</span><b>${a.pm10!=null?Math.round(a.pm10):'—'}</b><small>µg/m³</small></div>
+        <div class="aircard"><span>Ozone</span><b>${a.ozone!=null?Math.round(a.ozone):'—'}</b><small>µg/m³</small></div>
+        <div class="aircard"><span>NO₂</span><b>${a.no2!=null?Math.round(a.no2):'—'}</b><small>µg/m³</small></div>
+      </div>
+      <div class="pollenbox">
+        <h3>Pollen vibe</h3>
+        ${topPollen.length ? topPollen.map(([name,val])=>`<div class="pollenrow"><span>${esc(name)}</span><b>${esc(pollenLabel(val))}</b><small>${Math.round(val)} grains/m³</small></div>`).join('') : '<p class="blendnote">No pollen data for this spot right now.</p>'}
+      </div>
+      <div class="aqistrip">
+        ${(a.hourly||[]).filter((_,i)=>i%3===0).slice(0,8).map(h=>`<div><span>${esc(timeFmt.format(new Date(h.epochH*3600000)))}</span><b>${h.aqi!=null?Math.round(h.aqi):'—'}</b></div>`).join('')}
+      </div>
+      <p class="blendnote">AQI and pollen use the Open-Meteo air-quality feed. Pollen can be patchy by region, so treat it as a clean heads-up, not a medical-grade read.</p>
+    </div>`;
+}
+
 /* ---------- mobile swipe between sections ---------- */
 function initSwipeNav(el){
-  const tabs = ['current','hourly','daily','radar'];
+  const tabs = TABS;
   let startX=0, startY=0, startT=0, tracking=false;
   const ignore = target => !!target.closest('button,input,select,textarea,a,.hscroll,#map,.leaflet-container,.scrub');
   el.addEventListener('touchstart', e=>{
