@@ -1035,3 +1035,10 @@ $('#unitC').addEventListener('click', ()=>setUnit('C'));
 
 /* ---------- boot ---------- */
 if(state.loc) loadWeather(); else renderLocationScreen();
+
+/* ---------- PWA service worker ---------- */
+if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./service-worker.js').catch(() => {});
+  });
+}
