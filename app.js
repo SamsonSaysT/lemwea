@@ -483,7 +483,7 @@ function renderLocationScreen(){
       </div>
       <div class="lowkeyrow"><button class="ghostlink" id="savedplacesbtn">saved places</button></div>
       <div id="placesPanel" class="placespanel hidden"></div>
-      <p class="lochelp">Search checks Open-Meteo/GeoNames first, then OpenStreetMap for smaller US towns and ZIPs. Try things like <b>Ferndale MI</b>, <b>Lakewood OH</b>, or <b>48220</b>.</p>
+      <p class="lochelp">Search checks Open-Meteo/GeoNames first, then OpenStreetMap for smaller US towns and ZIPs. Try things like <b>Detroit MI</b>, <b>Lakewood OH</b>, or <b>48220</b>.</p>
     </div>`;
   $('#geobtn').addEventListener('click', geolocate);
   $('#savedplacesbtn').addEventListener('click', ()=>togglePlacesPanel());
