@@ -724,7 +724,6 @@ function renderApp(){
       ${TABS.map(t=>
         `<button role="tab" data-tab="${t}" aria-selected="${state.tab===t}">${t==='air'?'Air':t[0].toUpperCase()+t.slice(1)}</button>`).join('')}
     </nav>
-    <div class="swipehint" aria-hidden="true">swipe left / right to switch</div>
     <section id="view-current" class="panelview" role="tabpanel"></section>
     <section id="view-hourly" class="panelview" role="tabpanel"></section>
     <section id="view-daily" class="panelview" role="tabpanel"></section>
@@ -905,9 +904,17 @@ function renderAir(){
 
 /* ---------- mobile swipe between sections ---------- */
 function initSwipeNav(el){
+  // Bind only once; renderApp can re-run when units/location update.
+  if(el.dataset.swipeBound === 'true') return;
+  el.dataset.swipeBound = 'true';
+
   const tabs = TABS;
   let startX=0, startY=0, startT=0, tracking=false;
-  const ignore = target => !!target.closest('button,input,select,textarea,a,.hscroll,#map,.leaflet-container,.scrub');
+
+  const ignore = target => !!target.closest(
+    'button,input,select,textarea,a,.hscroll,.airtimeline,#map,.leaflet-container,.scrub'
+  );
+
   el.addEventListener('touchstart', e=>{
     if(e.touches.length !== 1 || ignore(e.target)) return;
     tracking = true;
@@ -915,13 +922,17 @@ function initSwipeNav(el){
     startY = e.touches[0].clientY;
     startT = Date.now();
   }, {passive:true});
+
   el.addEventListener('touchend', e=>{
     if(!tracking || !e.changedTouches.length) return;
     tracking = false;
     const dx = e.changedTouches[0].clientX - startX;
     const dy = e.changedTouches[0].clientY - startY;
     const fastEnough = Date.now() - startT < 800;
-    if(!fastEnough || Math.abs(dx) < 55 || Math.abs(dx) < Math.abs(dy)*1.35) return;
+
+    // Only treat it as tab navigation when the gesture is clearly horizontal.
+    if(!fastEnough || Math.abs(dx) < 65 || Math.abs(dx) < Math.abs(dy)*1.6) return;
+
     const i = tabs.indexOf(state.tab);
     const next = dx < 0 ? Math.min(i+1, tabs.length-1) : Math.max(i-1, 0);
     if(next !== i) switchTab(tabs[next]);
