@@ -148,13 +148,15 @@ function representativeDailyCode(date, fallbackRows=[]){
    ===================================================================== */
 const epochHour = iso => Math.floor(Date.parse(iso)/3600000);
 
-/* ---- 1. Open-Meteo multi-model (5 independent models, one call) ---- */
+/* ---- 1. Open-Meteo multi-model (7 independent models, one call) ---- */
 const OM_MODELS = [
   {key:'ecmwf_ifs025',        name:'ECMWF'},
   {key:'gfs_seamless',        name:'NOAA GFS'},
   {key:'icon_seamless',       name:'DWD ICON'},
   {key:'ukmo_seamless',       name:'UK Met Office'},
-  {key:'meteofrance_seamless',name:'Météo-France'}
+  {key:'meteofrance_seamless',name:'Météo-France'},
+  {key:'gem_seamless',        name:'Env. Canada GEM'},
+  {key:'jma_seamless',        name:'JMA Japan'}
 ];
 async function fetchOpenMeteo(lat, lon){
   const models = OM_MODELS.map(m=>m.key).join(',');
@@ -184,7 +186,7 @@ async function fetchOpenMeteo(lat, lon){
       if(hi==null&&lo==null) return;
       daily.set(date, {
         hiC:hi, loC:lo, precip:(gd('precipitation_probability_max')[i] ?? null), code:(gd('weather_code')[i] ?? null),
-        sunrise:(d.daily.sunrise?.[i] ?? null), sunset:(d.daily.sunset?.[i] ?? null)
+        sunrise:(gd('sunrise')[i] ?? d.daily.sunrise?.[i] ?? null), sunset:(gd('sunset')[i] ?? d.daily.sunset?.[i] ?? null)
       });
     });
     const cur = {
@@ -641,19 +643,79 @@ function flash(msg){
   clearTimeout(window.__lemonsToast);
   window.__lemonsToast = setTimeout(()=>t.classList.remove('show'), 1800);
 }
+/* ---------- sky strip: sunrise / sunset / moon, up by the location ---------- */
+function skyTime(iso){
+  if(!iso) return '—';
+  const d = iso instanceof Date ? iso : new Date(iso);
+  return new Intl.DateTimeFormat('en-US', {hour:'numeric', minute:'2-digit', timeZone:state.tz||undefined})
+    .format(d).replace(' AM','a').replace(' PM','p');
+}
+/* pure-math backup so the strip never goes missing (±2 min) */
+function solarTimes(lat, lon){
+  const rad = Math.PI/180, now = new Date();
+  const doy = Math.floor((Date.now() - Date.UTC(now.getUTCFullYear(),0,0)) / 86400000);
+  const decl = -23.44 * Math.cos(rad*(360/365)*(doy+10));
+  const cosHA = Math.cos(rad*90.833)/(Math.cos(rad*lat)*Math.cos(rad*decl)) - Math.tan(rad*lat)*Math.tan(rad*decl);
+  if(cosHA < -1 || cosHA > 1) return null; // polar day/night
+  const ha = Math.acos(cosHA)/rad;
+  const B = rad*(360/365)*(doy-81);
+  const eot = 9.87*Math.sin(2*B) - 7.53*Math.cos(B) - 1.5*Math.sin(B);
+  const noonMin = 720 - 4*lon - eot;
+  const dayUTC = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  return { sunrise: new Date(dayUTC + (noonMin - 4*ha)*60000), sunset: new Date(dayUTC + (noonMin + 4*ha)*60000) };
+}
+function moonPhase(){
+  const synodic = 29.530588853;
+  const days = Date.now()/86400000 - Date.UTC(2000,0,6,18,14)/86400000;
+  const age = ((days % synodic) + synodic) % synodic;
+  const frac = (1 - Math.cos(2*Math.PI*age/synodic)) / 2;
+  const waxing = age < synodic/2;
+  const name = frac<0.06 ? 'New moon' : frac<0.35 ? (waxing?'Waxing crescent':'Waning crescent')
+    : frac<0.65 ? (waxing?'First quarter':'Last quarter')
+    : frac<0.94 ? (waxing?'Waxing gibbous':'Waning gibbous') : 'Full moon';
+  return {frac, waxing, name};
+}
+function sunHalfIcon(rise){
+  /* top half of the lemon slice over the horizon for rise, bottom half under it for set */
+  const half = rise
+    ? `<path d="M4.5 14a7.5 7.5 0 0 1 15 0Z" fill="var(--zest)" stroke="var(--ink)" stroke-width="1.5" stroke-linejoin="round"/>
+       <path d="M12 8v5.2M8.6 9.4l3.4 3.8M15.4 9.4L12 13.2" stroke="var(--pith)" stroke-width="1.2" stroke-linecap="round"/>`
+    : `<path d="M19.5 14a7.5 7.5 0 0 1-15 0Z" fill="var(--zest)" stroke="var(--ink)" stroke-width="1.5" stroke-linejoin="round"/>
+       <path d="M12 20v-5.2M8.6 18.6l3.4-3.8M15.4 18.6L12 14.8" stroke="var(--pith)" stroke-width="1.2" stroke-linecap="round"/>`;
+  return `<svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">${half}
+    <path d="M2.5 14h19" stroke="var(--ink)" stroke-width="1.5" stroke-linecap="round"/></svg>`;
+}
+function moonIcon(frac, waxing){
+  let lit = '';
+  if(frac >= 0.94) lit = `<circle cx="12" cy="12" r="8" fill="var(--zest)"/>`;
+  else if(frac >= 0.65) lit = `<path d="M12 4 A8 8 0 0 1 12 20 A4.5 8 0 0 1 12 4 Z" fill="var(--zest)"/>`;
+  else if(frac >= 0.35) lit = `<path d="M12 4 A8 8 0 0 1 12 20 Z" fill="var(--zest)"/>`;
+  else if(frac >= 0.06) lit = `<path d="M12 4 A8 8 0 0 1 12 20 A4.5 8 0 0 0 12 4 Z" fill="var(--zest)"/>`;
+  const flip = waxing ? '' : ' transform="scale(-1 1) translate(-24 0)"';
+  return `<svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+    <g${flip}>${lit}</g>
+    <circle cx="12" cy="12" r="8" fill="none" stroke="var(--ink)" stroke-width="1.5"/></svg>`;
+}
+function renderSkyStrip(today){
+  let sunrise = today?.sunrise, sunset = today?.sunset;
+  if((!sunrise || !sunset) && state.loc){
+    const calc = solarTimes(state.loc.lat, state.loc.lon);
+    if(calc){ sunrise = sunrise || calc.sunrise; sunset = sunset || calc.sunset; }
+  }
+  const moon = moonPhase();
+  const bits = [];
+  if(sunrise) bits.push(`<span title="Sunrise">${sunHalfIcon(true)}${skyTime(sunrise)}</span>`);
+  if(sunset)  bits.push(`<span title="Sunset">${sunHalfIcon(false)}${skyTime(sunset)}</span>`);
+  bits.push(`<span title="${esc(moon.name)}">${moonIcon(moon.frac, moon.waxing)}${Math.round(moon.frac*100)}%</span>`);
+  return `<div class="skystrip">${bits.join('')}</div>`;
+}
+
 function formatTime(iso){
   if(!iso) return '—';
   return new Intl.DateTimeFormat('en-US', {hour:'numeric', minute:'2-digit', timeZone:state.tz||undefined}).format(new Date(iso));
 }
 function lemonMark(label){
   return `<span class="lemonmark" aria-label="${esc(label)}"><svg viewBox="0 0 22 22" aria-hidden="true"><ellipse cx="11" cy="11" rx="8" ry="10" fill="var(--zest)" stroke="currentColor" stroke-width="1.4"/><path d="M11 4.5v13M5.3 11h11.4M7.2 6.7l7.6 8.6M14.8 6.7l-7.6 8.6" stroke="var(--pith)" stroke-width="1.35" stroke-linecap="round"/></svg></span>`;
-}
-function renderSunStrip(day){
-  if(!day || (!day.sunrise && !day.sunset)) return '';
-  return `<div class="sunstrip">
-    <span>${lemonMark('Lemonrise')} Lemonrise <b>${formatTime(day.sunrise)}</b></span>
-    <span>${lemonMark('Lemonset')} Lemonset <b>${formatTime(day.sunset)}</b></span>
-  </div>`;
 }
 function alertUntil(a){ return a.expires ? `until ${formatTime(a.expires)}` : ''; }
 function renderAlerts(){
@@ -667,40 +729,101 @@ function renderAlerts(){
 function firstRainWindow(hours){
   return hours.find(h => h.precip != null && h.precip >= 35);
 }
+/* Deterministic daily pick — same line all day, new line tomorrow. */
+function pickLine(arr, slot=0){
+  const seed = new Date().toISOString().slice(0,10) + (state.loc?.name||'') + slot;
+  let h = 0;
+  for(const ch of seed) h = (h*31 + ch.charCodeAt(0)) >>> 0;
+  return arr[h % arr.length];
+}
 function lemonsSays(cur, today){
   const hours = consensusHourly(18);
   const rain = firstRainWindow(hours);
   const aqi = state.air?.ok && state.air.aqi!=null ? state.air.aqi : null;
+  const feels = cur.feelsC ?? cur.tempC;
   const lines = [];
 
   if(state.alerts?.length){
     const alertText = (state.alerts[0].event || '').toLowerCase();
-    if(alertText.includes('heat')) lines.push('Keep it breezy and shaded; the peel is running hot.');
-    else if(alertText.includes('storm') || alertText.includes('thunder')) lines.push('Storm energy is on the peel, so keep the moves flexible.');
-    else if(alertText.includes('flood')) lines.push('Water might get bold out there; cruise smart.');
-    else lines.push('There is an alert on the peel, so stay casually aware.');
+    if(alertText.includes('heat')) lines.push(pickLine([
+      'Actual heat advisory today — this one isn\u2019t a joke. Water, shade, repeat.',
+      'Heat alert is live. The sun is not your friend today, it\u2019s your landlord.'
+    ], 1));
+    else if(alertText.includes('winter') || alertText.includes('snow') || alertText.includes('ice') || alertText.includes('blizzard')) lines.push(pickLine([
+      'Winter alert\u2019s up. Give the car ten minutes and every other driver a hundred feet.',
+      'Ice-adjacent alert today. Walk like a penguin, park like a coward.'
+    ], 1));
+    else if(alertText.includes('storm') || alertText.includes('thunder') || alertText.includes('tornado')) lines.push(pickLine([
+      'Real storm warning up. Charge the phone, keep the plans loose.',
+      'The weather service is officially worried, which means you should be at least mildly.'
+    ], 1));
+    else if(alertText.includes('flood')) lines.push(pickLine([
+      'Flood alert\u2019s live. Do not test puddles of unknown depth.',
+      'Flood warning today. That\u2019s not a shortcut, that\u2019s a lake now.'
+    ], 1));
+    else lines.push('There\u2019s an official alert up — worth an actual glance before heading out.');
   }else if(cur.code>=95){
-    lines.push('Thunder has a little attitude today; keep one eye on the sky.');
+    lines.push(pickLine([
+      'Sky\u2019s throwing hands today. Maybe don\u2019t be the tallest thing outside.',
+      'Thunderstorms around. Free light show, terrible seating.'
+    ], 1));
+  }else if((cur.code>=71&&cur.code<=77)||cur.code===85||cur.code===86){
+    lines.push(pickLine([
+      'Snow\u2019s doing its thing. Drive like your deductible depends on it, because it does.',
+      'Snow day energy. The shovel knows what it did.'
+    ], 1));
   }else if(cur.code>=61){
-    lines.push('Soft rain mode is around; not a panic, just a bring-a-layer type beat.');
+    lines.push(pickLine([
+      'It\u2019s wet out. The ground has called dibs on your socks.',
+      'Rain\u2019s here. The wipers are finally earning their keep.',
+      'Proper rain today. Good day to be a duck, decent day to be indoors.'
+    ], 1));
+  }else if(cur.code>=51){
+    lines.push(pickLine([
+      'Not real rain, just the sky being passive-aggressive.',
+      'Drizzle. Too wet to ignore, too weak to respect.'
+    ], 1));
+  }else if(cur.code===45||cur.code===48){
+    lines.push(pickLine([
+      'Foggy out. Headlights on, main character mode off.',
+      'Visibility\u2019s doing that spooky thing. Drive like everyone else can\u2019t see either, because they can\u2019t.'
+    ], 1));
   }else if(cur.code<=1){
-    lines.push('Golden and easy out there. Smooth little lemon day.');
+    lines.push(pickLine([
+      'Zero excuses out there. The sky did its job — your turn.',
+      'Sun\u2019s out doing overtime. Go stand in it like a lizard.',
+      'Not a cloud with a job in sight.'
+    ], 1));
   }else if(cur.code===2){
-    lines.push('Partly bright and still smooth. Good outside energy.');
-  }else if(cur.code===3){
-    lines.push('Clouds are hanging around, but the vibe stays composed.');
+    lines.push(pickLine([
+      'Sun and clouds are splitting custody today.',
+      'A few clouds loitering, nothing organized.'
+    ], 1));
   }else{
-    lines.push('A clean little read for the day. Nothing too dramatic.');
+    lines.push(pickLine([
+      'The sky picked gray and committed to the bit.',
+      'Full blanket mode up there. Cozy or bleak — dealer\u2019s choice.'
+    ], 1));
   }
 
-  if(rain){
+  /* temperature commentary, only when it actually earns a comment */
+  if(feels!=null){
+    if(feels>=33) lines.push('And it\u2019s stupid hot — hydrate before you evaporate.');
+    else if(feels<=-12) lines.push('It\u2019s the kind of cold your car audibly complains about.');
+    else if(feels<=-4) lines.push('Genuinely cold. Gloves are not a fashion statement today.');
+  }
+
+  if(rain && cur.code<51){
     const when = new Intl.DateTimeFormat('en-US',{hour:'numeric', timeZone:state.tz||undefined}).format(new Date(rain.epochH*3600000));
-    lines.push(`Rain might slide through around ${when}.`);
-  }else{
-    lines.push('Rain is not really pressing in the next few hours.');
+    lines.push(`Dry for now, but rain shows up around ${when} — plan the errands accordingly.`);
+  }else if(!rain && cur.code<51){
+    lines.push(pickLine([
+      'No rain on the radar for a while. The lawn is on its own.',
+      'Nothing wet in the pipeline for the next few hours.'
+    ], 2));
   }
 
-  if(aqi!=null) lines.push(`Air is ${aqiLabel(aqi).toLowerCase()}, pretty low-key.`);
+  if(aqi!=null && aqi>100) lines.push('Also the air\u2019s a bit chewy today — details on the Air tab.');
   return lines.join(' ');
 }
 function renderApp(){
@@ -716,6 +839,7 @@ function renderApp(){
   app.innerHTML = `
     <div class="locrow">
       <div class="locname">${esc(state.loc.name)}${state.loc.admin?`<span class="sub">${esc(state.loc.admin)}</span>`:''}</div>
+      ${renderSkyStrip(today)}
       <button class="linkish" id="changeloc">change location</button>
     </div>
     <div id="placesPanel" class="placespanel hidden"></div>
@@ -730,6 +854,10 @@ function renderApp(){
     <section id="view-radar" class="panelview" role="tabpanel">
       <div class="radarwrap">
         <div id="map" aria-label="Precipitation radar map"></div>
+        <div class="modetoggle" role="group" aria-label="Radar layer">
+          <button id="modeRain" aria-pressed="true">Rain</button>
+          <button id="modeSat" aria-pressed="false">Satellite</button>
+        </div>
         <div class="radarui">
           <button class="playbtn" id="radarplay" aria-label="Play radar animation">
             <svg id="playicon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l13-7.5z"/></svg>
@@ -769,7 +897,6 @@ function renderCurrent(cur, today){
       <div class="bigtemp">${T(cur.tempC)}<sup>°${state.unit}</sup></div>
       <div class="cond">${iconFor(cur.code,22)} ${codeLabel(cur.code)}</div>
       ${today?`<div class="hilo">H ${T(today.hiC)}° · L ${T(today.loC)}°</div>`:''}
-      ${renderSunStrip(today)}
       <div class="lemonsays"><span>Lemons says</span><p>${esc(lemonsSays(cur, today))}</p></div>
       <div class="statrow">
         <div class="stat"><div class="k">Feels like</div><div class="v">${T(cur.feelsC ?? cur.tempC)}°</div></div>
@@ -860,6 +987,43 @@ function pollenLabel(v){
   if(v<=50) return 'medium';
   return 'high';
 }
+function airSays(a){
+  const cur = consensusCurrent();
+  const aqi = a.aqi;
+  const lines = [];
+  if(aqi==null){
+    lines.push('No score came back, so officially the air is a mystery. Breathe at your own pace.');
+  }else if(aqi<=50){
+    lines.push(pickLine([
+      'Air\u2019s basically filtered today. Breathe as much as you want, it\u2019s free.',
+      'Clean air, no notes.',
+      'The air passed inspection. Lungs may proceed.'
+    ], 7));
+  }else if(aqi<=100){
+    lines.push(pickLine([
+      'Air\u2019s mid but breathable. You\u2019ve inhaled worse at a bonfire.',
+      'Not spa-grade air, but it\u2019ll do the job.'
+    ], 7));
+  }else if(aqi<=150){
+    lines.push(pickLine([
+      'A bit chewy out there — sensitive lungs get a heads-up, everyone else carry on.',
+      'The air has texture today. If your lungs are picky, keep the hard cardio inside.'
+    ], 7));
+  }else{
+    lines.push(pickLine([
+      'Air\u2019s genuinely junky right now. Great day for indoor hobbies.',
+      'The air is doing crimes. Windows shut, blender on, make lemonade instead.'
+    ], 7));
+  }
+  /* tie it to what the sky is doing */
+  if(cur.code!=null && cur.code>=61 && cur.code<95) lines.push('Upside: the rain is rinsing the air as we speak.');
+  else if(cur.windKmh!=null && cur.windKmh>=22) lines.push('The wind\u2019s out here doing free duct cleaning, so it should keep moving.');
+  else if(aqi!=null && aqi>100 && cur.code!=null && cur.code<=1) lines.push('Still air and sunshine means it\u2019ll probably sit like this a while.');
+  /* pollen callout only when it matters */
+  const loud = (a.pollen||[]).find(([,v]) => v!=null && v>50);
+  if(loud) lines.push(`Pollen-wise, ${loud[0].toLowerCase()} is the loudest one out today — allergies, brace.`);
+  return lines.join(' ');
+}
 function renderAir(){
   const a = state.air;
   if(!a || !a.ok){
@@ -875,6 +1039,7 @@ function renderAir(){
         <div class="airlabel">Air quality</div>
         <div class="bigtemp airscore">${a.aqi!=null?Math.round(a.aqi):'—'}<sup>AQI</sup></div>
         <div class="cond">${lemonMark('Air quality')} ${esc(aqiLabel(a.aqi))}</div>
+        <div class="lemonsays"><span>Lemons says</span><p>${esc(airSays(a))}</p></div>
         <div class="hilo"></div>
         <div class="statrow airstats">
           <div class="stat"><div class="k">PM2.5</div><div class="v">${a.pm25!=null?Math.round(a.pm25):'—'}<small> µg/m³</small></div></div>
@@ -885,7 +1050,7 @@ function renderAir(){
       </div>
 
       <div class="airsection">
-        <h3>Pollen vibe</h3>
+        <h3>Pollen count</h3>
         <div class="airrows">
           ${topPollen.length ? topPollen.map(([name,val])=>`<div class="airrowline"><span>${esc(name)}</span><b>${esc(pollenLabel(val))}</b><small>${Math.round(val)} grains/m³</small></div>`).join('') : '<p class="airnone">No pollen data for this spot right now.</p>'}
         </div>
@@ -961,22 +1126,37 @@ function initRadar(){
     destroy(){ clearInterval(this.timer); this.map.remove(); } };
 
   fetchJSON('https://api.rainviewer.com/public/weather-maps.json').then(d=>{
-    radar.frames = [...(d.radar?.past||[]), ...(d.radar?.nowcast||[])];
+    radar.sets = {
+      rain: { frames: [...(d.radar?.past||[]), ...(d.radar?.nowcast||[])], startIdx: Math.max(0,(d.radar?.past||[]).length-1) },
+      sat:  { frames: [...(d.satellite?.infrared||[])], startIdx: Math.max(0,(d.satellite?.infrared||[]).length-1) }
+    };
     radar.host = d.host || 'https://tilecache.rainviewer.com';
-    if(!radar.frames.length){ $('#radartime').textContent = 'no data'; return; }
     const scrub = $('#radarscrub');
-    scrub.max = radar.frames.length-1;
-    radar.idx = Math.max(0, (d.radar?.past||[]).length-1); // most recent observed frame
-    scrub.value = radar.idx;
-    showFrame(radar.idx);
     scrub.addEventListener('input', ()=>{ stopRadar(); showFrame(+scrub.value); });
     $('#radarplay').addEventListener('click', ()=> radar.playing ? stopRadar() : playRadar());
+    $('#modeRain').addEventListener('click', ()=>setMode('rain'));
+    $('#modeSat').addEventListener('click', ()=>setMode('sat'));
+    setMode('rain');
   }).catch(()=>{ $('#radartime').textContent = 'radar offline'; });
 
+  function setMode(mode){
+    stopRadar();
+    radar.mode = mode;
+    $('#modeRain').setAttribute('aria-pressed', mode==='rain');
+    $('#modeSat').setAttribute('aria-pressed', mode==='sat');
+    Object.values(radar.layers).forEach(l=>l.setOpacity(0));
+    radar.frames = radar.sets[mode].frames;
+    const scrub = $('#radarscrub');
+    if(!radar.frames.length){ $('#radartime').textContent = 'no data'; scrub.max = 0; return; }
+    scrub.max = radar.frames.length-1;
+    showFrame(radar.sets[mode].startIdx);
+  }
   function layerFor(i){
     const f = radar.frames[i];
     if(!radar.layers[f.path]){
-      radar.layers[f.path] = L.tileLayer(`${radar.host}${f.path}/256/{z}/{x}/{y}/2/1_1.png`, {opacity:0, maxZoom:12, tileSize:256, crossOrigin:true, attribution:'Radar &copy; RainViewer'});
+      const isSat = f.path.includes('satellite');
+      const style = isSat ? '0/0_0' : '2/1_1'; // satellite: infrared palette · radar: universal blue w/ smoothing
+      radar.layers[f.path] = L.tileLayer(`${radar.host}${f.path}/256/{z}/{x}/{y}/${style}.png`, {opacity:0, maxZoom:12, tileSize:256, crossOrigin:true, attribution:'Imagery &copy; RainViewer'});
     }
     return radar.layers[f.path];
   }
@@ -984,7 +1164,7 @@ function initRadar(){
     radar.idx = i;
     const active = layerFor(i);
     if(!radar.map.hasLayer(active)) active.addTo(radar.map);
-    active.setOpacity(0.75);
+    active.setOpacity(radar.mode==='sat' ? 0.55 : 0.75);
     Object.values(radar.layers).forEach(l=>{ if(l!==active) l.setOpacity(0); });
     layerFor(Math.min(i+1, radar.frames.length-1)); // preload next
     $('#radarscrub').value = i;

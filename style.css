@@ -42,14 +42,21 @@ header.site{
 .brand svg{display:block}
 .wordmark{font-family:var(--display);font-weight:640;font-size:1.35rem;letter-spacing:.01em}
 .wordmark .dot{color:var(--rind)}
-.unit-toggle{display:flex;border:1px solid var(--ink);border-radius:999px;overflow:hidden;font-size:.8rem;font-weight:600}
+.unit-toggle,.modetoggle{display:flex;border:1px solid var(--ink);border-radius:999px;overflow:hidden;font-size:.8rem;font-weight:600}
+.modetoggle{width:max-content;margin:0 0 12px}
+.modetoggle button{padding:6px 16px;color:var(--muted)}
+.modetoggle button[aria-pressed="true"]{background:var(--ink);color:var(--pith)}
 .unit-toggle button{padding:5px 12px;color:var(--muted)}
 .unit-toggle button[aria-pressed="true"]{background:var(--ink);color:var(--pith)}
 
 /* ---------- location row ---------- */
 .locrow{
-  display:flex;align-items:baseline;justify-content:space-between;gap:12px;
+  display:flex;align-items:center;justify-content:flex-start;gap:16px;
   padding:20px 0 4px;flex-wrap:wrap;
+}
+.locrow .linkish{flex:none}
+@media (max-width:560px){
+  .skystrip{order:3;width:100%;margin-left:0;justify-content:flex-start;gap:16px}
 }
 .locname{font-family:var(--display);font-weight:560;font-size:1.15rem}
 .locname .sub{font-family:var(--body);font-weight:400;color:var(--muted);font-size:.85rem;margin-left:8px}
@@ -294,9 +301,12 @@ footer.site b{color:var(--ink);font-weight:600}
 .lemonsays{max-width:520px;margin:14px auto -10px;text-align:center;color:var(--muted);font-size:.79rem;line-height:1.45;letter-spacing:.01em}
 .lemonsays span{font-size:.68rem;text-transform:uppercase;letter-spacing:.14em;font-weight:600;color:rgba(109,109,87,.78);margin-right:6px}
 .lemonsays p{display:inline;font-size:.79rem;line-height:1.45;font-weight:400;color:var(--muted)}
-.sunstrip{display:flex;justify-content:center;gap:18px;flex-wrap:wrap;margin:16px auto 0;color:var(--muted);font-size:.84rem}
-.sunstrip span{display:inline-flex;align-items:center;gap:7px}
-.sunstrip b{font-family:var(--display);font-size:1rem;color:var(--ink);font-weight:560}
+.skystrip{
+  display:flex;align-items:center;gap:14px;margin-left:auto;
+  color:var(--muted);font-size:.78rem;font-weight:500;font-variant-numeric:tabular-nums;
+}
+.skystrip span{display:inline-flex;align-items:center;gap:5px;cursor:default}
+.skystrip svg{display:block;flex:none}
 .lemonmark{width:22px;height:22px;display:inline-grid;place-items:center;color:var(--ink)}
 .lemonmark svg{width:22px;height:22px;display:block}
 
