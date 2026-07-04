@@ -163,7 +163,7 @@ async function fetchOpenMeteo(lat, lon){
   const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`
     + `&hourly=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation_probability,weather_code,wind_speed_10m`
     + `&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code`
-    + `&models=${models}&timezone=auto&forecast_days=16&wind_speed_unit=kmh`;
+    + `&models=${models}&timezone=auto&forecast_days=10&wind_speed_unit=kmh`;
   let d;
   try{
     d = await fetchJSON(url);
@@ -260,10 +260,10 @@ function nwsCode(txt=''){
 async function fetchNWS(lat, lon){
   const base = {id:'nws', name:'NWS · weather.gov'};
   try{
-    const pt = await fetchJSON(`https://api.weather.gov/points/${lat.toFixed(4)},${lon.toFixed(4)}`);
+    const pt = await fetchJSON(`https://api.weather.gov/points/${lat.toFixed(4)},${lon.toFixed(4)}`, {}, 8000);
     const [hf, df] = await Promise.all([
-      fetchJSON(pt.properties.forecastHourly),
-      fetchJSON(pt.properties.forecast)
+      fetchJSON(pt.properties.forecastHourly, {}, 9000),
+      fetchJSON(pt.properties.forecast, {}, 9000)
     ]);
     const hourly = new Map();
     (hf.properties.periods||[]).forEach(p=>{
@@ -694,9 +694,9 @@ function skyTime(iso){
     .format(d).replace(' AM','a').replace(' PM','p');
 }
 /* pure-math backup so the strip never goes missing (±2 min) */
-function solarTimes(lat, lon){
-  const rad = Math.PI/180, now = new Date();
-  const doy = Math.floor((Date.now() - Date.UTC(now.getUTCFullYear(),0,0)) / 86400000);
+function solarTimes(lat, lon, offsetDays=0){
+  const rad = Math.PI/180, now = new Date(Date.now() + offsetDays*86400000);
+  const doy = Math.floor((now.getTime() - Date.UTC(now.getUTCFullYear(),0,0)) / 86400000);
   const decl = -23.44 * Math.cos(rad*(360/365)*(doy+10));
   const cosHA = Math.cos(rad*90.833)/(Math.cos(rad*lat)*Math.cos(rad*decl)) - Math.tan(rad*lat)*Math.tan(rad*decl);
   if(cosHA < -1 || cosHA > 1) return null; // polar day/night
@@ -758,8 +758,8 @@ function renderSkyStrip(today){
   }
   const moon = moonPhase();
   const bits = [];
-  if(sunrise) bits.push(`<span title="Sunrise">${sunHalfIcon(true)}${skyTime(sunrise)}</span>`);
-  if(sunset)  bits.push(`<span title="Sunset">${sunHalfIcon(false)}${skyTime(sunset)}</span>`);
+  if(sunrise) bits.push(`<span class="sunpeek" title="Sunrise">${sunHalfIcon(true)}${skyTime(sunrise)}</span>`);
+  if(sunset)  bits.push(`<span class="sunpeek" title="Sunset">${sunHalfIcon(false)}${skyTime(sunset)}</span>`);
   bits.push(`<span id="moonpeek" title="${esc(moon.name)}">${moonIcon(moon.frac, moon.waxing)}${Math.round(moon.frac*100)}%</span>`);
   return `<div class="skystrip">${bits.join('')}</div>`;
 }
@@ -888,7 +888,7 @@ function lemonsSays(cur, today){
 }
 function renderApp(){
   const cur = consensusCurrent();
-  const daily = consensusDaily(16);
+  const daily = consensusDaily(10);
   const today = daily[0];
   const app = $('#app');
   setTopActions(`
@@ -961,6 +961,13 @@ function todayHiLo(today){
       if(hi==null) hi = Math.max(...temps);
       if(lo==null) lo = Math.min(...temps);
     }
+  }
+  /* reality clamp: the day's High can never sit below what it is right now,
+     and the Low can never sit above it */
+  const nowT = consensusCurrent().tempC;
+  if(nowT!=null){
+    if(hi!=null) hi = Math.max(hi, nowT);
+    if(lo!=null) lo = Math.min(lo, nowT);
   }
   return {hi, lo};
 }
@@ -1468,10 +1475,387 @@ function msWin(){
   const m = $('#msmsg'); if(m) m.textContent = `Grove cleared in ${secs}s. Not a single lemon squeezed.`;
 }
 
+/* =====================================================================
+   SECRET DOOR #3: LEMONRISE. (click sunrise or sunset in the sky strip)
+   ===================================================================== */
+function fmtDur(ms){
+  const m = Math.round(ms/60000);
+  return `${Math.floor(m/60)}h ${String(m%60).padStart(2,'0')}m`;
+}
+function fmtDelta(ms){
+  const s = Math.round(Math.abs(ms)/1000), sign = ms>=0?'+':'\u2212';
+  const mm = Math.floor(s/60), ss = s%60;
+  return `${sign}${mm?mm+'m ':''}${ss}s`;
+}
+function sunArcSVG(riseMs, setMs){
+  const P0=[34,142], P1=[160,16], P2=[286,142];
+  const t = Math.max(-0.08, Math.min(1.08, (Date.now()-riseMs)/(setMs-riseMs)));
+  const up = t>=0 && t<=1;
+  const tt = Math.max(0, Math.min(1, t));
+  const bx = (1-tt)*(1-tt)*P0[0] + 2*(1-tt)*tt*P1[0] + tt*tt*P2[0];
+  const by = up ? (1-tt)*(1-tt)*P0[1] + 2*(1-tt)*tt*P1[1] + tt*tt*P2[1] : 160;
+  const rays = up ? [...Array(8)].map((_,i)=>{
+    const a = i*Math.PI/4 + Math.PI/8, r1=17, r2=22;
+    return `M ${(bx+Math.cos(a)*r1).toFixed(1)} ${(by+Math.sin(a)*r1).toFixed(1)} L ${(bx+Math.cos(a)*r2).toFixed(1)} ${(by+Math.sin(a)*r2).toFixed(1)}`;
+  }).join(' ') : '';
+  return `<svg class="sunarc" viewBox="0 0 320 178" role="img" aria-label="Sun position">
+    <path d="M ${P0[0]} ${P0[1]} Q ${P1[0]} ${P1[1]} ${P2[0]} ${P2[1]}" fill="none" stroke="var(--hairline)" stroke-width="1.6" stroke-dasharray="1 6" stroke-linecap="round"/>
+    <path d="M14 142 H306" stroke="var(--ink)" stroke-width="2" stroke-linecap="round"/>
+    <g opacity="${up?1:.35}">
+      ${rays?`<path d="${rays}" stroke="var(--rind)" stroke-width="2" stroke-linecap="round"/>`:''}
+      <circle cx="${bx.toFixed(1)}" cy="${by.toFixed(1)}" r="13" fill="var(--zest)" stroke="var(--ink)" stroke-width="2.4"/>
+      <circle cx="${bx.toFixed(1)}" cy="${by.toFixed(1)}" r="8.5" fill="var(--pith)"/>
+      <path d="M ${bx.toFixed(1)} ${(by-7).toFixed(1)} v14 M ${(bx-7).toFixed(1)} ${by.toFixed(1)} h14 M ${(bx-5).toFixed(1)} ${(by-5).toFixed(1)} l10 10 M ${(bx+5).toFixed(1)} ${(by-5).toFixed(1)} l-10 10" stroke="var(--zest)" stroke-width="1.8" stroke-linecap="round"/>
+    </g>
+    <path d="M ${P0[0]} 136 v12 M ${P2[0]} 136 v12" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round"/>
+  </svg>`;
+}
+function sunFactLine(){
+  return pickLine([
+    'The sun has not missed a single morning in 4.5 billion years. Insane streak.',
+    'Day length is decided by orbital mechanics, not by how early you get up.',
+    'Technically the sun neither rises nor sets. Legally, we let it slide.',
+    'Every sunset is the sun going to bother somebody else for a while.'
+  ], 21);
+}
+function openSunScreen(){
+  closeMoonScreen();
+  const api = state.sun;
+  const calcToday = solarTimes(state.loc.lat, state.loc.lon, 0);
+  const calcTomorrow = solarTimes(state.loc.lat, state.loc.lon, 1);
+  const rise = api?.sunrise ? new Date(api.sunrise) : calcToday?.sunrise;
+  const set  = api?.sunset  ? new Date(api.sunset)  : calcToday?.sunset;
+  if(!rise || !set) return;
+  const dayLen = set - rise;
+  /* compare today/tomorrow with the same method so any bias cancels out */
+  const delta = (calcToday && calcTomorrow) ? ((calcTomorrow.sunset-calcTomorrow.sunrise) - (calcToday.sunset-calcToday.sunrise)) : null;
+  const noon = new Date((rise.getTime()+set.getTime())/2);
+  const el = document.createElement('div');
+  el.id = 'moonmodal'; el.className = 'moonmodal';
+  el.setAttribute('role','dialog'); el.setAttribute('aria-label','Lemonrise and lemonset');
+  el.innerHTML = `
+    <button class="modalclose" id="mooncloseX" aria-label="Close">&times;</button>
+    <div class="mooncontent">
+      ${sunArcSVG(rise.getTime(), set.getTime())}
+      <h2 class="moonname">${esc(fmtDur(dayLen))} of daylight</h2>
+      <div class="statrow moonstats">
+        <div class="stat"><div class="k">Lemonrise</div><div class="v moondate">${esc(skyTime(rise))}</div></div>
+        <div class="stat"><div class="k">Lemonset</div><div class="v moondate" id="sunsetsecret">${esc(skyTime(set))}</div></div>
+        <div class="stat"><div class="k">Solar noon</div><div class="v moondate">${esc(skyTime(noon))}</div></div>
+        <div class="stat"><div class="k">Tomorrow</div><div class="v moondate">${delta!=null?esc(fmtDelta(delta)):'\u2014'}</div></div>
+      </div>
+      <div class="lemonsays moonsays"><span>Lemons says</span><p>${esc(sunFactLine())}</p></div>
+    </div>`;
+  document.body.appendChild(el);
+  document.body.style.overflow = 'hidden';
+  $('#mooncloseX').addEventListener('click', closeMoonScreen);
+  el.addEventListener('click', e=>{ if(e.target === el) closeMoonScreen(); });
+  document.addEventListener('keydown', moonEsc);
+}
+
+/* =====================================================================
+   SECRET DOOR #4: LEMONCRAFT. (click the Lemonset time)
+   A tiny creative-mode voxel sandbox. Superflat grove, six lemon blocks,
+   fly around, build whatever. Desktop + touch.
+   ===================================================================== */
+const LC = { open:false, three:null, raf:0, blocks:new Map(), sel:0, cap:6000,
+  yaw:0, pitch:-0.15, keys:{}, joy:null, look:null, vy:0, saveT:null };
+const LC_BLOCKS = [
+  {name:'Zest',  color:0xF4CE3E}, {name:'Rind',  color:0xDDB32A},
+  {name:'Flesh', color:0xFBF0B2}, {name:'Pith',  color:0xFFFDF4},
+  {name:'Leaf',  color:0x4E7A3A}, {name:'Ink',   color:0x23241B}
+];
+function loadThree(){
+  if(window.THREE) return Promise.resolve();
+  if(LC.threeP) return LC.threeP;
+  LC.threeP = new Promise((res, rej)=>{
+    const s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js';
+    s.onload = res; s.onerror = ()=>rej(new Error('three failed'));
+    document.head.appendChild(s);
+  });
+  return LC.threeP;
+}
+function openLemoncraft(){
+  if(LC.open) return;
+  closeMoonScreen();
+  LC.open = true;
+  const touch = 'ontouchstart' in window;
+  const el = document.createElement('div');
+  el.id = 'lcmodal';
+  el.innerHTML = `
+    <div class="lcload">${lemonSpinner()}<h2>Planting the grove\u2026</h2></div>
+    <div class="lctop">
+      <span class="mstitle">LEMONCRAFT<span class="dot">.</span></span>
+      <span class="lccount" id="lccount"></span>
+      <span style="flex:1"></span>
+      <button class="linkish" id="lcreset">clear grove</button>
+      <button class="modalclose lcclose" id="lcclose" aria-label="Close">&times;</button>
+    </div>
+    <div class="lccross" id="lccross"></div>
+    <div class="lchotbar" id="lchotbar">
+      ${LC_BLOCKS.map((b,i)=>`<button class="lcswatch${i===0?' sel':''}" data-b="${i}" style="--c:#${b.color.toString(16).padStart(6,'0')}" aria-label="${esc(b.name)}"><i></i></button>`).join('')}
+    </div>
+    <p class="lchint">${touch
+      ? 'left thumb to move \u00b7 drag to look \u00b7 tap to place \u00b7 hold to break \u00b7 buttons to fly'
+      : 'click to lock in \u00b7 WASD + Space/Shift to fly \u00b7 right-click place \u00b7 left-click break \u00b7 1\u20136 blocks'}</p>
+    ${touch?`<div class="lcfly"><button id="lcup" aria-label="Fly up">&#9650;</button><button id="lcdown" aria-label="Fly down">&#9660;</button></div>
+    <div class="lcjoy" id="lcjoy"><i id="lcjoynub"></i></div>`:''}`;
+  document.body.appendChild(el);
+  document.body.style.overflow = 'hidden';
+  $('#lcclose').addEventListener('click', closeLemoncraft);
+  loadThree().then(()=>lcStart(el, touch)).catch(()=>{
+    el.querySelector('.lcload h2').textContent = 'The grove failed to load \u2014 check the connection.';
+  });
+}
+function lcKey(x,y,z){ return x+'|'+y+'|'+z; }
+function lcStart(el, touch){
+  const T = window.THREE;
+  const load = el.querySelector('.lcload'); if(load) load.remove();
+  const renderer = new T.WebGLRenderer({antialias:true});
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio||1, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.domElement.id = 'lccanvas';
+  el.prepend(renderer.domElement);
+
+  const scene = new T.Scene();
+  scene.background = new T.Color(0xFFFDF4);
+  scene.fog = new T.Fog(0xFFFDF4, 34, 110);
+
+  scene.add(new T.HemisphereLight(0xFFFDF4, 0xC9C39A, 0.95));
+  const dir = new T.DirectionalLight(0xFFF3BE, 0.55);
+  dir.position.set(1.2, 1.8, 0.8); scene.add(dir);
+
+  const ground = new T.Mesh(new T.PlaneGeometry(100,100), new T.MeshLambertMaterial({color:0xA9BF7D}));
+  ground.rotation.x = -Math.PI/2; scene.add(ground);
+  const grid = new T.GridHelper(100, 50, 0x93A96B, 0x9FB575);
+  grid.position.y = 0.01; scene.add(grid);
+
+  const camera = new T.PerspectiveCamera(72, window.innerWidth/window.innerHeight, 0.1, 240);
+  const pos = new T.Vector3(0, 3.4, 9);
+  LC.yaw = 0; LC.pitch = -0.12;
+
+  const geo = new T.BoxGeometry(1,1,1);
+  const edgeGeo = new T.EdgesGeometry(geo);
+  const mats = LC_BLOCKS.map(b=>new T.MeshLambertMaterial({color:b.color}));
+  const edgeDark = new T.LineBasicMaterial({color:0x23241B, transparent:true, opacity:0.32});
+  const edgeLight = new T.LineBasicMaterial({color:0xFFFDF4, transparent:true, opacity:0.35});
+  const blockGroup = new T.Group(); scene.add(blockGroup);
+
+  function addBlock(x,y,z,type,skipSave){
+    const k = lcKey(x,y,z);
+    if(LC.blocks.has(k) || LC.blocks.size>=LC.cap) return;
+    if(Math.abs(x)>48 || Math.abs(z)>48 || y<0 || y>30) return;
+    const m = new T.Mesh(geo, mats[type]);
+    m.position.set(x+0.5, y+0.5, z+0.5);
+    m.userData = {x,y,z,type};
+    m.add(new T.LineSegments(edgeGeo, type===5?edgeLight:edgeDark));
+    blockGroup.add(m);
+    LC.blocks.set(k, m);
+    lcCount(); if(!skipSave) lcSave();
+  }
+  function removeBlock(m){
+    const {x,y,z} = m.userData;
+    blockGroup.remove(m);
+    LC.blocks.delete(lcKey(x,y,z));
+    lcCount(); lcSave();
+  }
+  function lcCount(){ const c=$('#lccount'); if(c) c.textContent = LC.blocks.size ? LC.blocks.size+' blocks' : ''; }
+  function lcSave(){
+    clearTimeout(LC.saveT);
+    LC.saveT = setTimeout(()=>{
+      store.set('lemons.craft', [...LC.blocks.values()].map(m=>[m.userData.x,m.userData.y,m.userData.z,m.userData.type]));
+    }, 700);
+  }
+  (store.get('lemons.craft')||[]).forEach(([x,y,z,t])=>{ if(typeof t==='number' && mats[t]) addBlock(x,y,z,t,true); });
+  lcCount();
+
+  /* a little welcome tree if the grove is empty */
+  if(!LC.blocks.size && !store.get('lemons.craft')){
+    [[0,0],[0,1],[0,2]].forEach(([,y])=>addBlock(0,y,0,1,true));
+    [[-1,3,0],[1,3,0],[0,3,-1],[0,3,1],[0,3,0],[0,4,0]].forEach(([x,y,z])=>addBlock(x,y,z,4,true));
+    addBlock(1,4,0,0,true); addBlock(-1,4,-1,0,true);
+  }
+
+  const ray = new T.Raycaster(); ray.far = 11;
+  function castFrom(nx, ny){
+    ray.setFromCamera({x:nx, y:ny}, camera);
+    const hitB = ray.intersectObjects(blockGroup.children, false)[0];
+    const hitG = ray.intersectObject(ground, false)[0];
+    if(hitB && (!hitG || hitB.distance <= hitG.distance)) return {type:'block', hit:hitB};
+    if(hitG) return {type:'ground', hit:hitG};
+    return null;
+  }
+  function doPlace(nx, ny){
+    const r = castFrom(nx, ny); if(!r) return;
+    if(r.type==='ground'){
+      addBlock(Math.floor(r.hit.point.x), 0, Math.floor(r.hit.point.z), LC.sel);
+    }else{
+      const m = r.hit.object, n = r.hit.face.normal;
+      addBlock(Math.round(m.position.x-0.5+n.x), Math.round(m.position.y-0.5+n.y), Math.round(m.position.z-0.5+n.z), LC.sel);
+    }
+  }
+  function doBreak(nx, ny){
+    const r = castFrom(nx, ny);
+    if(r && r.type==='block') removeBlock(r.hit.object);
+  }
+
+  /* hotbar */
+  $('#lchotbar').addEventListener('click', e=>{
+    const b = e.target.closest('.lcswatch'); if(!b) return;
+    LC.sel = +b.dataset.b;
+    document.querySelectorAll('.lcswatch').forEach(s=>s.classList.toggle('sel', s===b));
+  });
+  $('#lcreset').addEventListener('click', ()=>{
+    if(!confirm('Clear the whole grove?')) return;
+    [...LC.blocks.values()].forEach(m=>blockGroup.remove(m));
+    LC.blocks.clear(); lcCount(); store.set('lemons.craft', []);
+  });
+
+  /* ---------- desktop controls ---------- */
+  const cv = renderer.domElement;
+  LC.onKeyDown = e=>{
+    if(e.code==='Escape' && !document.pointerLockElement){ closeLemoncraft(); return; }
+    if(e.code.startsWith('Digit')){ const i=+e.code.slice(5)-1; if(LC_BLOCKS[i]){ LC.sel=i;
+      document.querySelectorAll('.lcswatch').forEach((s,j)=>s.classList.toggle('sel', j===i)); } }
+    LC.keys[e.code] = true;
+    if(['Space','ShiftLeft','ArrowUp','ArrowDown'].includes(e.code)) e.preventDefault();
+  };
+  LC.onKeyUp = e=>{ LC.keys[e.code] = false; };
+  if(!touch){
+    window.addEventListener('keydown', LC.onKeyDown);
+    window.addEventListener('keyup', LC.onKeyUp);
+    cv.addEventListener('click', ()=>{ if(document.pointerLockElement!==cv) cv.requestPointerLock(); });
+    cv.addEventListener('mousedown', e=>{
+      if(document.pointerLockElement!==cv) return;
+      if(e.button===0) doBreak(0,0);
+      if(e.button===2) doPlace(0,0);
+    });
+    document.addEventListener('mousemove', LC.onMouseMove = e=>{
+      if(document.pointerLockElement!==cv) return;
+      LC.yaw -= e.movementX*0.0024;
+      LC.pitch = Math.max(-1.45, Math.min(1.45, LC.pitch - e.movementY*0.0024));
+    });
+    cv.addEventListener('contextmenu', e=>e.preventDefault());
+  }
+
+  /* ---------- touch controls ---------- */
+  if(touch){
+    const joyEl = $('#lcjoy'), nub = $('#lcjoynub');
+    let holdT = null;
+    el.addEventListener('touchstart', e=>{
+      for(const t of e.changedTouches){
+        if(t.target.closest('.lctop,.lchotbar,.lcfly')) continue;
+        if(t.clientX < window.innerWidth*0.42 && t.clientY > window.innerHeight*0.5 && !LC.joy){
+          LC.joy = {id:t.identifier, x0:t.clientX, y0:t.clientY, dx:0, dy:0};
+          joyEl.style.left = (t.clientX-52)+'px'; joyEl.style.top = (t.clientY-52)+'px';
+          joyEl.classList.add('on');
+        }else if(!LC.look){
+          LC.look = {id:t.identifier, x:t.clientX, y:t.clientY, x0:t.clientX, y0:t.clientY, t0:Date.now(), moved:0};
+          holdT = setTimeout(()=>{
+            if(LC.look && LC.look.moved<10){
+              const nx = (LC.look.x0/window.innerWidth)*2-1, ny = -(LC.look.y0/window.innerHeight)*2+1;
+              doBreak(nx, ny); if(navigator.vibrate) navigator.vibrate(16);
+              LC.look.consumed = true;
+            }
+          }, 430);
+        }
+      }
+    }, {passive:true});
+    el.addEventListener('touchmove', e=>{
+      for(const t of e.changedTouches){
+        if(LC.joy && t.identifier===LC.joy.id){
+          LC.joy.dx = Math.max(-46, Math.min(46, t.clientX-LC.joy.x0));
+          LC.joy.dy = Math.max(-46, Math.min(46, t.clientY-LC.joy.y0));
+          nub.style.transform = `translate(${LC.joy.dx}px,${LC.joy.dy}px)`;
+        }else if(LC.look && t.identifier===LC.look.id){
+          const dx = t.clientX-LC.look.x, dy = t.clientY-LC.look.y;
+          LC.look.moved += Math.abs(dx)+Math.abs(dy);
+          LC.look.x = t.clientX; LC.look.y = t.clientY;
+          LC.yaw -= dx*0.005;
+          LC.pitch = Math.max(-1.45, Math.min(1.45, LC.pitch - dy*0.005));
+        }
+      }
+    }, {passive:true});
+    el.addEventListener('touchend', e=>{
+      for(const t of e.changedTouches){
+        if(LC.joy && t.identifier===LC.joy.id){
+          LC.joy = null; joyEl.classList.remove('on'); nub.style.transform = '';
+        }else if(LC.look && t.identifier===LC.look.id){
+          clearTimeout(holdT);
+          if(!LC.look.consumed && LC.look.moved<10 && Date.now()-LC.look.t0<260){
+            const nx = (t.clientX/window.innerWidth)*2-1, ny = -(t.clientY/window.innerHeight)*2+1;
+            doPlace(nx, ny);
+          }
+          LC.look = null;
+        }
+      }
+    }, {passive:true});
+    const hold = (id, dir)=>{ const b=$(id); let iv=null;
+      b.addEventListener('touchstart', e=>{ e.preventDefault(); LC.vy=dir; }, {passive:false});
+      b.addEventListener('touchend', ()=>{ LC.vy=0; });
+    };
+    hold('#lcup', 1); hold('#lcdown', -1);
+  }
+
+  LC.onResize = ()=>{
+    camera.aspect = window.innerWidth/window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  };
+  window.addEventListener('resize', LC.onResize);
+
+  /* ---------- loop ---------- */
+  const clock = new T.Clock();
+  LC.renderer = renderer; LC.scene = scene;
+  function tick(){
+    LC.raf = requestAnimationFrame(tick);
+    const dt = Math.min(clock.getDelta(), 0.05), sp = 7.5*dt;
+    let f = 0, s = 0, v = LC.vy;
+    if(!touch){
+      f = (LC.keys.KeyW||LC.keys.ArrowUp?1:0) - (LC.keys.KeyS||LC.keys.ArrowDown?1:0);
+      s = (LC.keys.KeyD?1:0) - (LC.keys.KeyA?1:0);
+      v = (LC.keys.Space?1:0) - (LC.keys.ShiftLeft?1:0);
+    }else if(LC.joy){
+      f = -LC.joy.dy/46; s = LC.joy.dx/46;
+    }
+    pos.x += (Math.sin(LC.yaw)*-f + Math.cos(LC.yaw)*s) * sp;
+    pos.z += (Math.cos(LC.yaw)*-f - Math.sin(LC.yaw)*s) * sp;
+    pos.y = Math.max(0.6, Math.min(34, pos.y + v*sp));
+    pos.x = Math.max(-49, Math.min(49, pos.x));
+    pos.z = Math.max(-49, Math.min(49, pos.z));
+    camera.position.copy(pos);
+    camera.rotation.set(0,0,0);
+    camera.rotateY(LC.yaw); camera.rotateX(LC.pitch);
+    renderer.render(scene, camera);
+  }
+  tick();
+}
+function closeLemoncraft(){
+  if(!LC.open) return;
+  LC.open = false;
+  cancelAnimationFrame(LC.raf);
+  clearTimeout(LC.saveT);
+  if(LC.blocks.size || store.get('lemons.craft')) {
+    store.set('lemons.craft', [...LC.blocks.values()].map(m=>[m.userData.x,m.userData.y,m.userData.z,m.userData.type]));
+  }
+  window.removeEventListener('keydown', LC.onKeyDown);
+  window.removeEventListener('keyup', LC.onKeyUp);
+  window.removeEventListener('resize', LC.onResize);
+  if(LC.onMouseMove) document.removeEventListener('mousemove', LC.onMouseMove);
+  if(document.pointerLockElement) document.exitPointerLock();
+  if(LC.renderer){ LC.renderer.dispose(); LC.renderer = null; }
+  LC.blocks.clear(); LC.keys = {}; LC.joy = null; LC.look = null; LC.vy = 0;
+  const el = $('#lcmodal'); if(el) el.remove();
+  document.body.style.overflow = '';
+}
+
 /* secret-door wiring — delegation survives every re-render */
 document.addEventListener('click', e=>{
   if(e.target.closest('#moonpeek')) openMoonScreen();
   else if(e.target.closest('#moonpct')) openLemonsweeper();
+  else if(e.target.closest('.sunpeek')) openSunScreen();
+  else if(e.target.closest('#sunsetsecret')) openLemoncraft();
 });
 
 /* ---------- boot ---------- */

@@ -2,7 +2,8 @@
   --pith:#FFFDF4;        /* paper cream */
   --flesh:#FBF0B2;       /* pale lemon flesh */
   --zest:#F4CE3E;        /* lemon yellow */
-  --rind:#DDB32A;        /* deep rind */
+  --rind:#DDB32A;        /* deep rind — decorative use only (dots, underlines, icons) */
+  --rind-text:#8F6608;   /* same gold family, darkened to clear 4.5:1 on cream for real text */
   --leaf:#4E7A3A;        /* leaf green */
   --ink:#23241B;         /* olive black */
   --muted:#6D6D57;       /* readable olive gray */
@@ -119,7 +120,7 @@ nav.tabs button[aria-selected="true"]{color:var(--ink);border-bottom-color:var(-
   font-family:var(--display);font-weight:560;font-optical-sizing:auto;
   font-size:clamp(4.5rem,22vw,7.5rem);line-height:.95;letter-spacing:-.02em;
 }
-.bigtemp sup{font-size:.35em;font-weight:400;color:var(--rind);vertical-align:.9em}
+.bigtemp sup{font-size:.35em;font-weight:400;color:var(--rind-text);vertical-align:.9em}
 .cond{font-size:1.1rem;font-weight:500;margin-top:6px;display:flex;align-items:center;justify-content:center;gap:8px}
 .cond svg{color:var(--rind)}
 .hilo{color:var(--muted);margin-top:4px;font-size:.95rem}
@@ -321,7 +322,7 @@ footer.site b{color:var(--ink);font-weight:600}
 .aircurrent{padding:28px 0 0;text-align:center}
 .airlabel{font-size:.72rem;text-transform:uppercase;letter-spacing:.16em;color:var(--muted);font-weight:700;margin-bottom:4px}
 .airscore{font-size:clamp(4.5rem,20vw,7rem)}
-.airscore sup{font-size:.22em;font-weight:500;color:var(--rind);vertical-align:1.35em;letter-spacing:.04em;margin-left:4px}
+.airscore sup{font-size:.22em;font-weight:500;color:var(--rind-text);vertical-align:1.35em;letter-spacing:.04em;margin-left:4px}
 .aircurrent .cond .lemonmark{color:var(--rind)}
 .airstats{margin-top:30px}
 .airstats .stat{min-width:0}
@@ -401,5 +402,58 @@ footer.site b{color:var(--ink);font-weight:600}
 .mscell.open{background:transparent;border-color:rgba(35,36,27,.08)}
 .mscell.boom{background:var(--zest);border-color:var(--ink)}
 .mscell .n{font-family:var(--display);font-weight:640;font-size:.95rem;line-height:1}
-.n1{color:var(--leaf)} .n2{color:var(--rind)} .n3{color:var(--ink)} .n4{color:var(--muted)} .n5{color:var(--ink)}
+.n1{color:var(--leaf)} .n2{color:var(--rind-text)} .n3{color:var(--ink)} .n4{color:var(--muted)} .n5{color:var(--ink)}
 .mshint{margin-top:12px;font-size:.74rem;color:var(--muted);text-align:center}
+
+/* ---------- LEMONRISE. (secret door #3) ---------- */
+.sunarc{display:block;margin:0 auto;width:min(80vw,340px);height:auto}
+
+/* ---------- LEMONCRAFT. (secret door #4) ---------- */
+#lcmodal{
+  position:fixed;inset:0;z-index:90;background:var(--pith);
+  touch-action:none;overscroll-behavior:none;user-select:none;-webkit-user-select:none;
+}
+#lccanvas{position:absolute;inset:0;display:block}
+.lcload{position:absolute;inset:0;display:grid;place-items:center;z-index:3;text-align:center;color:var(--muted)}
+.lcload h2{font-family:var(--display);font-weight:560;color:var(--ink);font-size:1.2rem;margin-top:14px}
+.lctop{
+  position:absolute;top:0;left:0;right:0;z-index:2;
+  display:flex;align-items:center;gap:14px;padding:13px 18px;
+}
+.lctop .lcclose{position:static;font-size:1.7rem;padding:2px 8px}
+.lccount{font-size:.75rem;color:var(--muted);font-variant-numeric:tabular-nums}
+.lccross{
+  position:absolute;left:50%;top:50%;width:5px;height:5px;margin:-2.5px 0 0 -2.5px;
+  background:var(--ink);border-radius:50%;opacity:.55;z-index:2;pointer-events:none;
+}
+@media (pointer:coarse){.lccross{display:none}}
+.lchotbar{
+  position:absolute;left:50%;bottom:16px;transform:translateX(-50%);z-index:2;
+  display:flex;gap:8px;padding:7px 10px;border:1px solid var(--ink);border-radius:999px;
+  background:rgba(255,253,244,.88);backdrop-filter:blur(5px);
+}
+.lcswatch{
+  width:33px;height:33px;border-radius:8px;border:1px solid rgba(35,36,27,.28);
+  background:var(--c);padding:0;transition:transform .12s cubic-bezier(.16,1,.3,1);
+}
+.lcswatch:hover{transform:translateY(-2px)}
+.lcswatch.sel{outline:2px solid var(--ink);outline-offset:2px}
+.lchint{
+  position:absolute;left:50%;bottom:64px;transform:translateX(-50%);z-index:2;
+  font-size:.7rem;color:var(--muted);text-align:center;max-width:92vw;pointer-events:none;
+}
+.lcfly{position:absolute;right:16px;bottom:96px;z-index:2;display:flex;flex-direction:column;gap:10px}
+.lcfly button{
+  width:46px;height:46px;border-radius:50%;border:1px solid var(--ink);
+  background:rgba(255,253,244,.88);color:var(--ink);font-size:.85rem;
+}
+.lcfly button:active{background:var(--zest)}
+.lcjoy{
+  position:absolute;width:104px;height:104px;border-radius:50%;z-index:2;
+  border:1.5px solid rgba(35,36,27,.35);display:none;pointer-events:none;
+}
+.lcjoy.on{display:block}
+.lcjoy i{
+  position:absolute;left:50%;top:50%;width:34px;height:34px;margin:-17px 0 0 -17px;
+  background:rgba(35,36,27,.45);border-radius:50%;display:block;
+}
