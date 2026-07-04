@@ -875,7 +875,7 @@ function renderAir(){
         <div class="airlabel">Air quality</div>
         <div class="bigtemp airscore">${a.aqi!=null?Math.round(a.aqi):'—'}<sup>AQI</sup></div>
         <div class="cond">${lemonMark('Air quality')} ${esc(aqiLabel(a.aqi))}</div>
-        <div class="hilo">Clean little read for the lungs</div>
+        <div class="hilo"></div>
         <div class="statrow airstats">
           <div class="stat"><div class="k">PM2.5</div><div class="v">${a.pm25!=null?Math.round(a.pm25):'—'}<small> µg/m³</small></div></div>
           <div class="stat"><div class="k">PM10</div><div class="v">${a.pm10!=null?Math.round(a.pm10):'—'}<small> µg/m³</small></div></div>
