@@ -673,7 +673,29 @@ function moonPhase(){
   const name = frac<0.06 ? 'New moon' : frac<0.35 ? (waxing?'Waxing crescent':'Waning crescent')
     : frac<0.65 ? (waxing?'First quarter':'Last quarter')
     : frac<0.94 ? (waxing?'Waxing gibbous':'Waning gibbous') : 'Full moon';
-  return {frac, waxing, name};
+  const toFull = waxing ? (synodic/2 - age) : (synodic - age + synodic/2);
+  const toNew = synodic - age;
+  return { frac, waxing, name, age, synodic,
+    nextFull: new Date(Date.now() + toFull*86400000),
+    nextNew:  new Date(Date.now() + toNew*86400000) };
+}
+/* Shadow region for the un-lit part of the disc (waxing orientation: shadow on the left).
+   The terminator is a half-ellipse whose x-radius follows the phase — this is the
+   geometrically accurate shape, not a canned glyph. Mirror the group for waning. */
+function moonShadowPath(cx, cy, r, frac){
+  if(frac >= 0.99) return '';
+  if(frac <= 0.01) return `M ${cx-r} ${cy} a ${r} ${r} 0 1 0 ${r*2} 0 a ${r} ${r} 0 1 0 ${-r*2} 0 Z`;
+  const rx = (Math.abs(Math.cos(Math.PI*frac)) * r).toFixed(2);
+  const innerSweep = frac < 0.5 ? 0 : 1;
+  return `M ${cx} ${cy-r} A ${r} ${r} 0 0 0 ${cx} ${cy+r} A ${rx} ${r} 0 0 ${innerSweep} ${cx} ${cy-r} Z`;
+}
+function moonIcon(frac, waxing){
+  const shadow = moonShadowPath(12, 12, 8, frac);
+  const flip = waxing ? '' : ' transform="scale(-1 1) translate(-24 0)"';
+  return `<svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+    <circle cx="12" cy="12" r="8" fill="var(--zest)"/>
+    ${shadow?`<g${flip}><path d="${shadow}" fill="rgba(35,36,27,.8)"/></g>`:''}
+    <circle cx="12" cy="12" r="8" fill="none" stroke="var(--ink)" stroke-width="1.5"/></svg>`;
 }
 function sunHalfIcon(rise){
   /* top half of the lemon slice over the horizon for rise, bottom half under it for set */
@@ -685,17 +707,6 @@ function sunHalfIcon(rise){
   return `<svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">${half}
     <path d="M2.5 14h19" stroke="var(--ink)" stroke-width="1.5" stroke-linecap="round"/></svg>`;
 }
-function moonIcon(frac, waxing){
-  let lit = '';
-  if(frac >= 0.94) lit = `<circle cx="12" cy="12" r="8" fill="var(--zest)"/>`;
-  else if(frac >= 0.65) lit = `<path d="M12 4 A8 8 0 0 1 12 20 A4.5 8 0 0 1 12 4 Z" fill="var(--zest)"/>`;
-  else if(frac >= 0.35) lit = `<path d="M12 4 A8 8 0 0 1 12 20 Z" fill="var(--zest)"/>`;
-  else if(frac >= 0.06) lit = `<path d="M12 4 A8 8 0 0 1 12 20 A4.5 8 0 0 0 12 4 Z" fill="var(--zest)"/>`;
-  const flip = waxing ? '' : ' transform="scale(-1 1) translate(-24 0)"';
-  return `<svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
-    <g${flip}>${lit}</g>
-    <circle cx="12" cy="12" r="8" fill="none" stroke="var(--ink)" stroke-width="1.5"/></svg>`;
-}
 function renderSkyStrip(today){
   let sunrise = today?.sunrise, sunset = today?.sunset;
   if((!sunrise || !sunset) && state.loc){
@@ -706,7 +717,7 @@ function renderSkyStrip(today){
   const bits = [];
   if(sunrise) bits.push(`<span title="Sunrise">${sunHalfIcon(true)}${skyTime(sunrise)}</span>`);
   if(sunset)  bits.push(`<span title="Sunset">${sunHalfIcon(false)}${skyTime(sunset)}</span>`);
-  bits.push(`<span title="${esc(moon.name)}">${moonIcon(moon.frac, moon.waxing)}${Math.round(moon.frac*100)}%</span>`);
+  bits.push(`<span id="moonpeek" title="${esc(moon.name)}">${moonIcon(moon.frac, moon.waxing)}${Math.round(moon.frac*100)}%</span>`);
   return `<div class="skystrip">${bits.join('')}</div>`;
 }
 
@@ -1212,6 +1223,188 @@ $('#unitC').addEventListener('click', ()=>setUnit('C'));
     setTimeout(()=>el.remove(), 300);
   }
 })();
+
+/* =====================================================================
+   SECRET DOOR #1: the moon screen (click the moon in the sky strip)
+   ===================================================================== */
+function bigMoonLemon(moon, size){
+  /* a proper lemon slice standing in for the moon — seeds as craters,
+     shadow side accurately carved by the terminator */
+  const shadow = moonShadowPath(120, 120, 104, moon.frac);
+  const flip = moon.waxing ? '' : ' transform="scale(-1 1) translate(-240 0)"';
+  const seg = a => { const r1=14, r2=88, x=Math.cos(a), y=Math.sin(a);
+    return `M ${120+x*r1} ${120+y*r1} L ${120+x*r2} ${120+y*r2}`; };
+  const segs = [...Array(8)].map((_,i)=>seg(i*Math.PI/4 + Math.PI/8)).join(' ');
+  return `<svg class="bigmoon" viewBox="0 0 240 240" width="${size}" height="${size}" role="img" aria-label="${esc(moon.name)}, ${Math.round(moon.frac*100)}% illuminated">
+    <circle cx="120" cy="120" r="104" fill="var(--zest)"/>
+    <circle cx="120" cy="120" r="92" fill="var(--pith)"/>
+    <circle cx="120" cy="120" r="84" fill="var(--flesh)"/>
+    <path d="${segs}" stroke="var(--pith)" stroke-width="6" stroke-linecap="round"/>
+    <circle cx="120" cy="120" r="7" fill="var(--pith)"/>
+    <ellipse cx="88" cy="82" rx="5" ry="9" fill="var(--rind)" transform="rotate(-28 88 82)"/>
+    <ellipse cx="158" cy="140" rx="5" ry="9" fill="var(--rind)" transform="rotate(38 158 140)"/>
+    <ellipse cx="104" cy="164" rx="4.5" ry="8" fill="var(--rind)" transform="rotate(-8 104 164)"/>
+    ${shadow?`<g${flip}><path d="${shadow}" fill="rgba(35,36,27,.85)"/></g>`:''}
+    <circle cx="120" cy="120" r="104" fill="none" stroke="var(--ink)" stroke-width="4"/>
+  </svg>`;
+}
+function moonFactLine(moon){
+  const pool = [
+    'Same moon everybody else gets, but this one\u2019s yours.',
+    'No weather up there. Ever. Forecast accuracy: 100%.',
+    'The moon has no idea it looks like a lemon tonight.',
+    'It\u2019s been doing this exact routine for 4.5 billion years without a day off.',
+    'Technically it\u2019s drifting away 1.5 inches a year. Take it personally.'
+  ];
+  return pickLine(pool, 13);
+}
+function openMoonScreen(){
+  closeMoonScreen();
+  const moon = moonPhase();
+  const dFmt = new Intl.DateTimeFormat('en-US', {month:'short', day:'numeric'});
+  const el = document.createElement('div');
+  el.id = 'moonmodal'; el.className = 'moonmodal';
+  el.setAttribute('role','dialog'); el.setAttribute('aria-label','Moon');
+  el.innerHTML = `
+    <button class="modalclose" id="mooncloseX" aria-label="Close">&times;</button>
+    <div class="mooncontent" id="mooncontent">
+      ${bigMoonLemon(moon, 'min(60vmin, 300px)')}
+      <h2 class="moonname">${esc(moon.name)}</h2>
+      <div class="statrow moonstats">
+        <div class="stat"><div class="k">Illuminated</div><div class="v" id="moonpct">${Math.round(moon.frac*100)}<small>%</small></div></div>
+        <div class="stat"><div class="k">Moon age</div><div class="v">${moon.age.toFixed(1)}<small> / ${moon.synodic.toFixed(1)}d</small></div></div>
+        <div class="stat"><div class="k">Next full</div><div class="v moondate">${esc(dFmt.format(moon.nextFull))}</div></div>
+        <div class="stat"><div class="k">Next new</div><div class="v moondate">${esc(dFmt.format(moon.nextNew))}</div></div>
+      </div>
+      <div class="lemonsays moonsays"><span>Lemons says</span><p>${esc(moonFactLine(moon))}</p></div>
+    </div>`;
+  document.body.appendChild(el);
+  document.body.style.overflow = 'hidden';
+  $('#mooncloseX').addEventListener('click', closeMoonScreen);
+  el.addEventListener('click', e=>{ if(e.target === el) closeMoonScreen(); });
+  document.addEventListener('keydown', moonEsc);
+}
+function moonEsc(e){ if(e.key === 'Escape') closeMoonScreen(); }
+function closeMoonScreen(){
+  const el = $('#moonmodal');
+  if(el){ msStop(); el.remove(); }
+  document.body.style.overflow = '';
+  document.removeEventListener('keydown', moonEsc);
+}
+
+/* =====================================================================
+   SECRET DOOR #2: LEMONSWEEPER (click the percentage inside the moon screen)
+   ===================================================================== */
+const MS = { w:9, h:9, lemons:10, grid:[], placed:false, over:false, opened:0, flags:0, t0:0, timer:null };
+const msTinyLemon = `<svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="var(--zest)" stroke="var(--ink)" stroke-width="2"/><circle cx="12" cy="12" r="5.5" fill="var(--pith)"/><path d="M12 7v10M7 12h10M8.5 8.5l7 7M15.5 8.5l-7 7" stroke="var(--zest)" stroke-width="1.6" stroke-linecap="round"/></svg>`;
+const msLeafFlag = `<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M5 19C5 10 11 5 19 5c0 8-5 14-14 14Z" fill="var(--leaf)" stroke="var(--ink)" stroke-width="1.8" stroke-linejoin="round"/><path d="M7.5 16.5C10 13 13 10 16.5 7.5" stroke="var(--pith)" stroke-width="1.4" stroke-linecap="round"/></svg>`;
+function msStop(){ clearInterval(MS.timer); MS.timer = null; }
+function openLemonsweeper(){
+  msNew();
+}
+function msNew(){
+  msStop();
+  Object.assign(MS, {grid:[], placed:false, over:false, opened:0, flags:0, t0:0});
+  for(let i=0;i<MS.w*MS.h;i++) MS.grid.push({lemon:false, adj:0, open:false, flag:false});
+  const c = $('#mooncontent'); if(!c) return;
+  c.innerHTML = `
+    <div class="mshead">
+      <button class="linkish" id="msback">&larr; moon</button>
+      <span class="mstitle">LEMONSWEEPER<span class="dot">.</span></span>
+      <button class="linkish" id="msreset">new squeeze</button>
+    </div>
+    <div class="msbar">
+      <span class="msstat">${msTinyLemon}<b id="mscount">${MS.lemons}</b></span>
+      <span class="mssub" id="msmsg">${MS.lemons} lemons hiding. Clear the grove without squeezing one.</span>
+      <span class="msstat"><b id="mstime">0</b>s</span>
+    </div>
+    <div class="msgrid" id="msgrid" style="--cols:${MS.w}">
+      ${MS.grid.map((_,i)=>`<button class="mscell" data-i="${i}" aria-label="cell"></button>`).join('')}
+    </div>
+    <p class="mshint">Tap to squeeze a cell &middot; hold (or right-click) to plant a leaf</p>`;
+  $('#msback').addEventListener('click', openMoonScreen);
+  $('#msreset').addEventListener('click', msNew);
+  const grid = $('#msgrid');
+  grid.addEventListener('contextmenu', e=>{ e.preventDefault(); const b=e.target.closest('.mscell'); if(b) msFlag(+b.dataset.i); });
+  grid.addEventListener('click', e=>{ const b=e.target.closest('.mscell'); if(b && !b.dataset.held) msOpen(+b.dataset.i); b&&delete b.dataset.held; });
+  let holdT=null;
+  grid.addEventListener('touchstart', e=>{ const b=e.target.closest('.mscell'); if(!b) return;
+    holdT = setTimeout(()=>{ b.dataset.held='1'; msFlag(+b.dataset.i); if(navigator.vibrate) navigator.vibrate(18); }, 420);
+  }, {passive:true});
+  ['touchend','touchmove','touchcancel'].forEach(ev=>grid.addEventListener(ev, ()=>clearTimeout(holdT), {passive:true}));
+}
+function msNeighbors(i){
+  const x=i%MS.w, y=Math.floor(i/MS.w), out=[];
+  for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){
+    if(!dx&&!dy) continue;
+    const nx=x+dx, ny=y+dy;
+    if(nx>=0&&nx<MS.w&&ny>=0&&ny<MS.h) out.push(ny*MS.w+nx);
+  }
+  return out;
+}
+function msPlace(safe){
+  const banned = new Set([safe, ...msNeighbors(safe)]);
+  let placed=0;
+  while(placed<MS.lemons){
+    const i = Math.floor(Math.random()*MS.grid.length);
+    if(banned.has(i) || MS.grid[i].lemon) continue;
+    MS.grid[i].lemon = true; placed++;
+  }
+  MS.grid.forEach((c,i)=>{ c.adj = msNeighbors(i).filter(n=>MS.grid[n].lemon).length; });
+  MS.placed = true; MS.t0 = Date.now();
+  MS.timer = setInterval(()=>{ const t=$('#mstime'); if(t) t.textContent = Math.floor((Date.now()-MS.t0)/1000); }, 1000);
+}
+function msOpen(i){
+  if(MS.over) return;
+  const c = MS.grid[i];
+  if(c.open || c.flag) return;
+  if(!MS.placed) msPlace(i);
+  if(c.lemon){ msLose(i); return; }
+  const stack=[i];
+  while(stack.length){
+    const j = stack.pop(), g = MS.grid[j];
+    if(g.open || g.flag) continue;
+    g.open = true; MS.opened++;
+    msPaint(j);
+    if(g.adj===0) msNeighbors(j).forEach(n=>{ if(!MS.grid[n].open) stack.push(n); });
+  }
+  if(MS.opened === MS.w*MS.h - MS.lemons) msWin();
+}
+function msFlag(i){
+  if(MS.over) return;
+  const c = MS.grid[i];
+  if(c.open) return;
+  c.flag = !c.flag;
+  MS.flags += c.flag ? 1 : -1;
+  msPaint(i);
+  const n = $('#mscount'); if(n) n.textContent = Math.max(MS.lemons - MS.flags, 0);
+}
+function msPaint(i){
+  const b = document.querySelector(`.mscell[data-i="${i}"]`); if(!b) return;
+  const c = MS.grid[i];
+  b.classList.toggle('open', c.open);
+  if(c.flag){ b.innerHTML = msLeafFlag; return; }
+  if(!c.open){ b.innerHTML=''; return; }
+  b.innerHTML = c.adj ? `<span class="n n${Math.min(c.adj,5)}">${c.adj}</span>` : '';
+}
+function msLose(hit){
+  MS.over = true; msStop();
+  MS.grid.forEach((c,i)=>{ if(c.lemon){ const b=document.querySelector(`.mscell[data-i="${i}"]`); if(b){ b.classList.add('open'); b.innerHTML = msTinyLemon; } } });
+  const hb = document.querySelector(`.mscell[data-i="${hit}"]`); if(hb) hb.classList.add('boom');
+  const m = $('#msmsg'); if(m) m.textContent = 'You found a lemon the hard way.';
+}
+function msWin(){
+  MS.over = true; msStop();
+  const secs = Math.floor((Date.now()-MS.t0)/1000);
+  MS.grid.forEach((c,i)=>{ if(c.lemon && !c.flag){ const b=document.querySelector(`.mscell[data-i="${i}"]`); if(b) b.innerHTML = msLeafFlag; } });
+  const m = $('#msmsg'); if(m) m.textContent = `Grove cleared in ${secs}s. Not a single lemon squeezed.`;
+}
+
+/* secret-door wiring — delegation survives every re-render */
+document.addEventListener('click', e=>{
+  if(e.target.closest('#moonpeek')) openMoonScreen();
+  else if(e.target.closest('#moonpct')) openLemonsweeper();
+});
 
 /* ---------- boot ---------- */
 if(state.loc) loadWeather(); else renderLocationScreen();

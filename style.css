@@ -10,7 +10,7 @@
   --display:'Fraunces',Georgia,serif;
   --body:'Instrument Sans',system-ui,-apple-system,sans-serif;
   /* z scale */
-  --z-sticky:10; --z-map:1; --z-mapui:20; --z-intro:100;
+  --z-sticky:10; --z-map:1; --z-mapui:20; --z-modal:60; --z-intro:100;
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth}
@@ -349,3 +349,51 @@ footer.site b{color:var(--ink);font-weight:600}
   .lemonsays{font-size:.76rem;margin-top:12px}
   .lemonsays p{font-size:.76rem}
 }
+
+/* ---------- moon screen (secret door #1) ---------- */
+.moonmodal{
+  position:fixed;inset:0;z-index:var(--z-modal);background:var(--pith);
+  display:grid;place-items:center;overflow-y:auto;padding:32px 20px;
+  animation:moonin .22s cubic-bezier(.16,1,.3,1);
+}
+@keyframes moonin{from{opacity:0}to{opacity:1}}
+.modalclose{
+  position:fixed;top:16px;right:20px;font-size:1.9rem;line-height:1;color:var(--muted);
+  padding:6px 10px;z-index:1;transition:color .15s ease;
+}
+.modalclose:hover{color:var(--ink)}
+.mooncontent{max-width:440px;width:100%;text-align:center}
+.bigmoon{display:block;margin:0 auto 8px;filter:drop-shadow(0 16px 34px rgba(35,36,27,.14))}
+.moonname{font-family:var(--display);font-weight:640;font-size:clamp(1.5rem,5vw,2rem);margin:14px 0 4px}
+.moonstats{margin-top:22px}
+.moonstats .v.moondate{font-size:1.05rem}
+.moonsays{margin-top:20px}
+#moonpct{cursor:default}
+
+/* ---------- LEMONSWEEPER (secret door #2) ---------- */
+.mshead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:6px}
+.mstitle{font-family:var(--display);font-weight:640;font-size:1.15rem;letter-spacing:.01em}
+.mstitle .dot{color:var(--rind)}
+.msbar{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+  border-top:1px solid var(--hairline);border-bottom:1px solid var(--hairline);
+  padding:9px 2px;margin-bottom:14px;font-size:.8rem;color:var(--muted);
+}
+.msstat{display:inline-flex;align-items:center;gap:6px;flex:none}
+.msstat b{font-family:var(--display);font-weight:560;font-size:1rem;color:var(--ink);font-variant-numeric:tabular-nums}
+.mssub{flex:1;text-align:center;line-height:1.35}
+.msgrid{
+  display:grid;grid-template-columns:repeat(var(--cols),1fr);gap:3px;
+  width:100%;max-width:390px;margin:0 auto;touch-action:manipulation;
+}
+.mscell{
+  aspect-ratio:1;border-radius:6px;background:rgba(251,240,178,.55);
+  border:1px solid var(--hairline);display:grid;place-items:center;
+  padding:0;user-select:none;-webkit-user-select:none;transition:background .12s ease;
+}
+.mscell:hover{background:rgba(244,206,62,.45)}
+.mscell.open{background:transparent;border-color:rgba(35,36,27,.08)}
+.mscell.boom{background:var(--zest);border-color:var(--ink)}
+.mscell .n{font-family:var(--display);font-weight:640;font-size:.95rem;line-height:1}
+.n1{color:var(--leaf)} .n2{color:var(--rind)} .n3{color:var(--ink)} .n4{color:var(--muted)} .n5{color:var(--ink)}
+.mshint{margin-top:12px;font-size:.74rem;color:var(--muted);text-align:center}
