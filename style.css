@@ -292,11 +292,19 @@ footer.site b{color:var(--ink);font-weight:600}
 #toast.show{opacity:1;transform:translate(-50%,0)}
 
 .alertstack{display:grid;gap:8px;margin:14px 0 0}
-.lemonalert{display:grid;grid-template-columns:30px 1fr;gap:10px;align-items:start;border:1px solid rgba(221,179,42,.55);background:linear-gradient(180deg,rgba(221,179,42,.16),rgba(251,240,178,.28));border-radius:14px;padding:12px;color:var(--ink)}
-.alertdot{width:24px;height:24px;border-radius:50%;display:grid;place-items:center;background:var(--rind);color:var(--pith);font-weight:900;font-family:var(--display)}
-.lemonalert b{font-family:var(--display);font-weight:640}
-.lemonalert span{color:var(--muted);font-size:.86rem;font-weight:650}
-.lemonalert small{display:block;color:var(--muted);font-size:.78rem;line-height:1.35;margin-top:2px}
+.lemonalert{
+  border:1px solid var(--hairline);border-left:3px solid var(--rind);
+  border-radius:10px;padding:10px 14px;text-align:left;
+  background:rgba(251,240,178,.38);
+}
+.alerthead{display:flex;align-items:center;gap:8px}
+.alerthead svg{flex:none;width:17px;height:17px}
+.alertkind{font-family:var(--display);font-weight:640;font-size:.88rem;color:var(--ink)}
+.alertwhen{font-size:.72rem;color:var(--muted);flex:none}
+.alertline{
+  margin:2px 0 0 25px;font-size:.75rem;line-height:1.4;color:var(--muted);
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;
+}
 
 .lemonsays{max-width:520px;margin:14px auto -10px;text-align:center;color:var(--muted);font-size:.79rem;line-height:1.45;letter-spacing:.01em}
 .lemonsays span{font-size:.68rem;text-transform:uppercase;letter-spacing:.14em;font-weight:600;color:rgba(109,109,87,.78);margin-right:6px}
@@ -307,8 +315,6 @@ footer.site b{color:var(--ink);font-weight:600}
 }
 .skystrip span{display:inline-flex;align-items:center;gap:5px;cursor:default}
 .skystrip svg{display:block;flex:none}
-.lemonmark{width:22px;height:22px;display:inline-grid;place-items:center;color:var(--ink)}
-.lemonmark svg{width:22px;height:22px;display:block}
 
 /* ---------- air + pollen ---------- */
 .airwrap{padding:28px 0 44px}

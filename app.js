@@ -162,9 +162,16 @@ async function fetchOpenMeteo(lat, lon){
   const models = OM_MODELS.map(m=>m.key).join(',');
   const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`
     + `&hourly=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation_probability,weather_code,wind_speed_10m`
-    + `&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code,sunrise,sunset`
+    + `&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code`
     + `&models=${models}&timezone=auto&forecast_days=16&wind_speed_unit=kmh`;
-  const d = await fetchJSON(url);
+  let d;
+  try{
+    d = await fetchJSON(url);
+  }catch(e){
+    /* if the multi-model request is rejected for any reason, fall back to a
+       single best_match call so the blend never loses Open-Meteo entirely */
+    return [await fetchOpenMeteoSingle(lat, lon)];
+  }
   state.tz = d.timezone || state.tz;
   const times = d.hourly.time.map(epochHour);
   const nowH = Math.floor(Date.now()/3600000);
@@ -185,8 +192,7 @@ async function fetchOpenMeteo(lat, lon){
       const hi = gd('temperature_2m_max')[i], lo = gd('temperature_2m_min')[i];
       if(hi==null&&lo==null) return;
       daily.set(date, {
-        hiC:hi, loC:lo, precip:(gd('precipitation_probability_max')[i] ?? null), code:(gd('weather_code')[i] ?? null),
-        sunrise:(gd('sunrise')[i] ?? d.daily.sunrise?.[i] ?? null), sunset:(gd('sunset')[i] ?? d.daily.sunset?.[i] ?? null)
+        hiC:hi, loC:lo, precip:(gd('precipitation_probability_max')[i] ?? null), code:(gd('weather_code')[i] ?? null)
       });
     });
     const cur = {
@@ -198,6 +204,42 @@ async function fetchOpenMeteo(lat, lon){
     };
     return {id:m.key, name:m.name, ok:true, current:cur, hourly, daily};
   });
+}
+/* single best_match fallback — used only if the multi-model call is rejected */
+async function fetchOpenMeteoSingle(lat, lon){
+  const base = {id:'om_best', name:'Open-Meteo blend'};
+  try{
+    const d = await fetchJSON(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`
+      + `&hourly=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation_probability,weather_code,wind_speed_10m`
+      + `&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code`
+      + `&timezone=auto&forecast_days=16&wind_speed_unit=kmh`);
+    state.tz = d.timezone || state.tz;
+    const times = d.hourly.time.map(epochHour);
+    const nowH = Math.floor(Date.now()/3600000);
+    const nowIdx = Math.max(0, times.findIndex(t=>t>=nowH));
+    const hourly = new Map();
+    times.forEach((t,i)=>{
+      if(d.hourly.temperature_2m[i]==null) return;
+      hourly.set(t, { tempC:d.hourly.temperature_2m[i], precip:(d.hourly.precipitation_probability?.[i] ?? null), code:(d.hourly.weather_code?.[i] ?? null) });
+    });
+    const daily = new Map();
+    (d.daily.time||[]).forEach((date,i)=>{
+      daily.set(date, { hiC:d.daily.temperature_2m_max?.[i] ?? null, loC:d.daily.temperature_2m_min?.[i] ?? null,
+        precip:d.daily.precipitation_probability_max?.[i] ?? null, code:d.daily.weather_code?.[i] ?? null });
+    });
+    const cur = { tempC:d.hourly.temperature_2m[nowIdx], feelsC:d.hourly.apparent_temperature?.[nowIdx] ?? null,
+      humidity:d.hourly.relative_humidity_2m?.[nowIdx] ?? null, windKmh:d.hourly.wind_speed_10m?.[nowIdx] ?? null,
+      code:d.hourly.weather_code?.[nowIdx] ?? null, precip:d.hourly.precipitation_probability?.[nowIdx] ?? null };
+    return {...base, ok:true, current:cur, hourly, daily};
+  }catch(e){ return {...base, ok:false}; }
+}
+/* dedicated lightweight sunrise/sunset fetch — no models param, nothing to fight with */
+async function fetchSunTimes(lat, lon){
+  try{
+    const d = await fetchJSON(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&daily=sunrise,sunset&timezone=auto&forecast_days=1`);
+    state.tz = state.tz || d.timezone;
+    state.sun = { sunrise: d.daily?.sunrise?.[0] ?? null, sunset: d.daily?.sunset?.[0] ?? null };
+  }catch(e){ state.sun = null; }
 }
 
 /* ---- 2. NWS / weather.gov (US only) ---- */
@@ -384,7 +426,8 @@ async function loadWeather(){
   const [weatherResults, alertResult, airResult] = await Promise.all([
     Promise.allSettled([fetchOpenMeteo(lat, lon), fetchNWS(lat, lon), fetchMetNo(lat, lon), fetchBrightSky(lat, lon)]),
     fetchNWSAlerts(lat, lon).then(v=>({ok:true, value:v})).catch(()=>({ok:false, value:[]})),
-    fetchAirQuality(lat, lon).then(v=>({ok:true, value:v})).catch(()=>({ok:false, value:{ok:false}}))
+    fetchAirQuality(lat, lon).then(v=>({ok:true, value:v})).catch(()=>({ok:false, value:{ok:false}})),
+    fetchSunTimes(lat, lon)
   ]);
   let sources = [];
   weatherResults.forEach(r=>{
@@ -708,7 +751,7 @@ function sunHalfIcon(rise){
     <path d="M2.5 14h19" stroke="var(--ink)" stroke-width="1.5" stroke-linecap="round"/></svg>`;
 }
 function renderSkyStrip(today){
-  let sunrise = today?.sunrise, sunset = today?.sunset;
+  let sunrise = state.sun?.sunrise || today?.sunrise, sunset = state.sun?.sunset || today?.sunset;
   if((!sunrise || !sunset) && state.loc){
     const calc = solarTimes(state.loc.lat, state.loc.lon);
     if(calc){ sunrise = sunrise || calc.sunrise; sunset = sunset || calc.sunset; }
@@ -725,16 +768,22 @@ function formatTime(iso){
   if(!iso) return '—';
   return new Intl.DateTimeFormat('en-US', {hour:'numeric', minute:'2-digit', timeZone:state.tz||undefined}).format(new Date(iso));
 }
-function lemonMark(label){
-  return `<span class="lemonmark" aria-label="${esc(label)}"><svg viewBox="0 0 22 22" aria-hidden="true"><ellipse cx="11" cy="11" rx="8" ry="10" fill="var(--zest)" stroke="currentColor" stroke-width="1.4"/><path d="M11 4.5v13M5.3 11h11.4M7.2 6.7l7.6 8.6M14.8 6.7l-7.6 8.6" stroke="var(--pith)" stroke-width="1.35" stroke-linecap="round"/></svg></span>`;
+function lemonFruit(size=22, label=''){
+  return `<svg viewBox="0 0 24 24" width="${size}" height="${size}" role="img" aria-label="${esc(label)}">
+    <path d="M2.4 12 C2.4 10.9 3.2 9.9 4.3 9.6 C5.7 6.8 8.6 5 12 5 C15.4 5 18.3 6.8 19.7 9.6 C20.8 9.9 21.6 10.9 21.6 12 C21.6 13.1 20.8 14.1 19.7 14.4 C18.3 17.2 15.4 19 12 19 C8.6 19 5.7 17.2 4.3 14.4 C3.2 14.1 2.4 13.1 2.4 12 Z"
+      fill="var(--zest)" stroke="var(--ink)" stroke-width="1.6" stroke-linejoin="round"/>
+    <path d="M13.6 5.4 C13.2 3.3 14.9 1.9 17.1 2.1 C17.2 4.1 15.7 5.5 13.6 5.4 Z"
+      fill="var(--leaf)" stroke="var(--ink)" stroke-width="1.3" stroke-linejoin="round"/>
+    <path d="M5.6 10.6 C6.6 8.9 8.1 7.8 9.9 7.3" fill="none" stroke="var(--pith)" stroke-width="1.3" stroke-linecap="round"/>
+  </svg>`;
 }
 function alertUntil(a){ return a.expires ? `until ${formatTime(a.expires)}` : ''; }
 function renderAlerts(){
   if(!state.alerts || !state.alerts.length) return '';
   return `<div class="alertstack">${state.alerts.map(a=>`
     <div class="lemonalert">
-      <span class="alertdot">!</span>
-      <div><b>${esc(a.event)}</b>${alertUntil(a)?` <span>${esc(alertUntil(a))}</span>`:''}<small>${esc(a.headline || '')}</small></div>
+      <div class="alerthead">${lemonFruit(18)}<span class="alertkind">${esc(a.event)}</span>${alertUntil(a)?`<span class="alertwhen">${esc(alertUntil(a))}</span>`:''}</div>
+      ${a.headline?`<p class="alertline">${esc(a.headline)}</p>`:''}
     </div>`).join('')}</div>`;
 }
 function firstRainWindow(hours){
@@ -896,6 +945,25 @@ function renderApp(){
   switchTab(state.tab);
 }
 
+/* Today's H/L with a fallback: if no source gave a daily number (common in the
+   evening once forecasts roll to "tonight"), derive it from today's hourly blend. */
+function todayHiLo(today){
+  let hi = today?.hiC ?? null, lo = today?.loC ?? null;
+  if(hi==null || lo==null){
+    const todayStr = new Intl.DateTimeFormat('en-CA',{timeZone:state.tz||undefined}).format(new Date());
+    const dFmt = new Intl.DateTimeFormat('en-CA',{timeZone:state.tz||undefined});
+    const temps = consensusHourly(24)
+      .filter(h => dFmt.format(new Date(h.epochH*3600000)) === todayStr)
+      .map(h => h.tempC).filter(t => t!=null);
+    const cur = consensusCurrent().tempC;
+    if(cur!=null) temps.push(cur);
+    if(temps.length){
+      if(hi==null) hi = Math.max(...temps);
+      if(lo==null) lo = Math.min(...temps);
+    }
+  }
+  return {hi, lo};
+}
 function renderCurrent(cur, today){
   const chips = state.sources.map(s=>{
     if(s.ok===false) return `<span class="chip err">${esc(s.name)}</span>`;
@@ -907,7 +975,7 @@ function renderCurrent(cur, today){
     <div class="current">
       <div class="bigtemp">${T(cur.tempC)}<sup>°${state.unit}</sup></div>
       <div class="cond">${iconFor(cur.code,22)} ${codeLabel(cur.code)}</div>
-      ${today?`<div class="hilo">H ${T(today.hiC)}° · L ${T(today.loC)}°</div>`:''}
+      ${(()=>{ const hl = todayHiLo(today); return (hl.hi!=null||hl.lo!=null) ? `<div class="hilo">H ${T(hl.hi)}° · L ${T(hl.lo)}°</div>` : ''; })()}
       <div class="lemonsays"><span>Lemons says</span><p>${esc(lemonsSays(cur, today))}</p></div>
       <div class="statrow">
         <div class="stat"><div class="k">Feels like</div><div class="v">${T(cur.feelsC ?? cur.tempC)}°</div></div>
@@ -1049,7 +1117,7 @@ function renderAir(){
       <div class="aircurrent">
         <div class="airlabel">Air quality</div>
         <div class="bigtemp airscore">${a.aqi!=null?Math.round(a.aqi):'—'}<sup>AQI</sup></div>
-        <div class="cond">${lemonMark('Air quality')} ${esc(aqiLabel(a.aqi))}</div>
+        <div class="cond">${lemonFruit(22, 'Air quality')} ${esc(aqiLabel(a.aqi))}</div>
         <div class="lemonsays"><span>Lemons says</span><p>${esc(airSays(a))}</p></div>
         <div class="hilo"></div>
         <div class="statrow airstats">
