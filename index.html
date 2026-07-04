@@ -32,8 +32,11 @@
       <svg class="half l" viewBox="0 0 200 400" aria-hidden="true">
         <!-- left half body -->
         <path d="M200 60 C120 60 46 110 24 170 C10 178 2 192 2 200 C2 208 10 222 24 230 C46 290 120 340 200 340 Z" fill="var(--zest)" stroke="var(--ink)" stroke-width="5" stroke-linejoin="round"/>
-        <!-- leaf rides with left half -->
-        <path d="M158 62 C150 26 176 4 214 8 C216 40 192 62 158 62 Z" fill="var(--leaf)" stroke="var(--ink)" stroke-width="5" stroke-linejoin="round" transform="translate(-38,-4) rotate(-14 180 40)"/>
+        <!-- leaf rides with left half — symmetric shape so the tip actually comes to a point -->
+        <g transform="translate(160,60) rotate(-42)">
+          <path d="M0,0 Q23.1,-14 68,0 Q23.1,14 0,0 Z" fill="var(--leaf)" stroke="var(--ink)" stroke-width="4.5" stroke-linejoin="round"/>
+          <path d="M7,0 Q30,-1.5 60,0" fill="none" stroke="var(--ink)" stroke-width="1.6" stroke-linecap="round" opacity=".4"/>
+        </g>
         <!-- cut face (hidden until the cut) -->
         <g class="face">
           <rect x="186" y="60" width="14" height="280" fill="#FFFDF4" stroke="var(--ink)" stroke-width="5"/>

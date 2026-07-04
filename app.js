@@ -526,15 +526,22 @@ function renderLocationScreen(){
         <input id="citysearch" type="search" placeholder="City, town, or ZIP…" autocomplete="off" aria-label="Search for a city, town, or ZIP code">
         <ul class="results" id="cityresults"></ul>
       </div>
-      <div class="lowkeyrow"><button class="ghostlink" id="savedplacesbtn">saved places</button></div>
-      <div id="placesPanel" class="placespanel hidden"></div>
+      <div id="savedstrip"></div>
       <p class="lochelp">Search checks Open-Meteo/GeoNames first, then OpenStreetMap for smaller US towns and ZIPs. Try things like <b>Detroit MI</b>, <b>Lakewood OH</b>, or <b>48220</b>.</p>
     </div>`;
   $('#geobtn').addEventListener('click', geolocate);
-  $('#savedplacesbtn').addEventListener('click', ()=>togglePlacesPanel());
+  renderSavedStrip();
   const input = $('#citysearch');
   let deb;
   input.addEventListener('input', ()=>{ clearTimeout(deb); deb = setTimeout(()=>searchCity(input.value.trim()), 700); });
+}
+function renderSavedStrip(){
+  const el = $('#savedstrip'); if(!el) return;
+  if(!state.savedPlaces.length){ el.innerHTML = ''; return; }
+  el.innerHTML = `<div class="savedstrip">${state.savedPlaces.map((p,i)=>`
+    <span class="savedplace"><button data-place="${i}">${esc(p.name)}</button><button class="saveditsx" data-remove="${i}" aria-label="Remove ${esc(p.name)}">×</button></span>`).join('')}</div>`;
+  el.querySelectorAll('[data-place]').forEach(b=>b.addEventListener('click', ()=>setLocation(state.savedPlaces[+b.dataset.place])));
+  el.querySelectorAll('[data-remove]').forEach(b=>b.addEventListener('click', e=>{ e.stopPropagation(); removeSavedPlace(+b.dataset.remove); }));
 }
 function setLocError(msg){ const el = $('#locerror'); if(el) el.textContent = msg || ''; }
 async function geolocate(){
@@ -640,28 +647,12 @@ function saveCurrentPlace(){
   state.savedPlaces = [state.loc, ...state.savedPlaces].slice(0,12);
   store.set('lemons.savedPlaces', state.savedPlaces);
   flash('saved to the little lemon list');
+  renderSavedStrip();
 }
 function removeSavedPlace(i){
   state.savedPlaces.splice(i,1);
   store.set('lemons.savedPlaces', state.savedPlaces);
-  togglePlacesPanel(true);
-}
-function togglePlacesPanel(forceOpen=false){
-  const panel = $('#placesPanel'); if(!panel) return;
-  const shouldOpen = forceOpen || panel.classList.contains('hidden');
-  if(!shouldOpen){ panel.classList.add('hidden'); return; }
-  if(!state.savedPlaces.length){
-    panel.innerHTML = `<p class="emptyplaces">No saved places yet. Once you pick a spot, hit <b>save</b>.</p>`;
-  }else{
-    panel.innerHTML = `<div class="placeshead">saved spots</div>` + state.savedPlaces.map((p,i)=>`
-      <div class="placeitem">
-        <button class="placego" data-place="${i}">${esc(p.name)}<span>${esc(p.admin||'')}</span></button>
-        <button class="placeremove" data-remove="${i}" aria-label="Remove ${esc(p.name)}">×</button>
-      </div>`).join('');
-  }
-  panel.classList.remove('hidden');
-  panel.querySelectorAll('[data-place]').forEach(b=>b.addEventListener('click', ()=>setLocation(state.savedPlaces[+b.dataset.place])));
-  panel.querySelectorAll('[data-remove]').forEach(b=>b.addEventListener('click', e=>{ e.stopPropagation(); removeSavedPlace(+b.dataset.remove); }));
+  renderSavedStrip();
 }
 function shareCurrentLocation(){
   if(!state.loc) return;
@@ -1608,6 +1599,71 @@ function openLemoncraft(){
     el.querySelector('.lcload h2').textContent = 'The grove failed to load \u2014 check the connection.';
   });
 }
+function lcMakeGrassTexture(){
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#A9BF7D'; ctx.fillRect(0,0,256,256);
+  /* two-tone blade strokes, seeded so it tiles without visible repetition at this scale */
+  let seed = 42;
+  const rnd = () => { seed = (seed*1664525+1013904223)>>>0; return seed/4294967296; };
+  const blade = (x,y,h,tone)=>{
+    ctx.strokeStyle = tone; ctx.lineWidth = 2.4; ctx.lineCap = 'round';
+    const lean = (rnd()-0.5)*10;
+    ctx.beginPath(); ctx.moveTo(x,y);
+    ctx.quadraticCurveTo(x+lean*0.5, y-h*0.6, x+lean, y-h);
+    ctx.stroke();
+  };
+  for(let i=0;i<420;i++){
+    const x = rnd()*256, y = rnd()*256, h = 8+rnd()*13;
+    blade(x,y,h, i%3===0 ? '#8FA968' : (i%3===1 ? '#B7CC8E' : '#9FB575'));
+  }
+  return new window.THREE.CanvasTexture(c);
+}
+function lcMakeSunCanvas(){
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const ctx = c.getContext('2d'), cx=64, cy=64;
+  ctx.strokeStyle = '#DDB32A'; ctx.lineWidth = 6; ctx.lineCap = 'round';
+  for(let i=0;i<8;i++){
+    const a = i*Math.PI/4 + Math.PI/8;
+    ctx.beginPath();
+    ctx.moveTo(cx+Math.cos(a)*39, cy+Math.sin(a)*39);
+    ctx.lineTo(cx+Math.cos(a)*53, cy+Math.sin(a)*53);
+    ctx.stroke();
+  }
+  ctx.beginPath(); ctx.arc(cx,cy,33,0,Math.PI*2); ctx.fillStyle='#F4CE3E'; ctx.fill();
+  ctx.lineWidth=5; ctx.strokeStyle='#23241B'; ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx,cy,23,0,Math.PI*2); ctx.fillStyle='#FFFDF4'; ctx.fill();
+  ctx.strokeStyle='#F4CE3E'; ctx.lineWidth=5; ctx.lineCap='round';
+  ctx.beginPath();
+  ctx.moveTo(cx,cy-19); ctx.lineTo(cx,cy+19);
+  ctx.moveTo(cx-19,cy); ctx.lineTo(cx+19,cy);
+  ctx.moveTo(cx-13,cy-13); ctx.lineTo(cx+13,cy+13);
+  ctx.moveTo(cx+13,cy-13); ctx.lineTo(cx-13,cy+13);
+  ctx.stroke();
+  return c;
+}
+function lcMakeMoonCanvas(frac, waxing){
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const ctx = c.getContext('2d'), cx=64, cy=64, r=33;
+  ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.fillStyle='#F4CE3E'; ctx.fill();
+  ctx.fillStyle = '#DDB32A';
+  const seed = (x,y,rx,ry,rot)=>{ ctx.save(); ctx.translate(x,y); ctx.rotate(rot);
+    ctx.beginPath(); ctx.ellipse(0,0,rx,ry,0,0,Math.PI*2); ctx.fill(); ctx.restore(); };
+  seed(cx-15,cy-9,4,7,-0.5); seed(cx+13,cy+11,4,7,0.6); seed(cx-3,cy+15,3.5,6,-0.15);
+  if(frac < 0.99){
+    const d = moonShadowPath(cx, cy, r, frac);
+    if(d){
+      ctx.save();
+      if(!waxing){ ctx.translate(cx*2, 0); ctx.scale(-1,1); }
+      ctx.fillStyle = 'rgba(35,36,27,.85)';
+      ctx.fill(new Path2D(d));
+      ctx.restore();
+    }
+  }
+  ctx.lineWidth=5; ctx.strokeStyle='#23241B';
+  ctx.beginPath(); ctx.arc(cx,cy,r,0,Math.PI*2); ctx.stroke();
+  return c;
+}
 function lcKey(x,y,z){ return x+'|'+y+'|'+z; }
 function lcStart(el, touch){
   const T = window.THREE;
@@ -1626,10 +1682,36 @@ function lcStart(el, touch){
   const dir = new T.DirectionalLight(0xFFF3BE, 0.55);
   dir.position.set(1.2, 1.8, 0.8); scene.add(dir);
 
-  const ground = new T.Mesh(new T.PlaneGeometry(100,100), new T.MeshLambertMaterial({color:0xA9BF7D}));
+  /* lemongrass ground — a tileable hand-drawn texture instead of a technical grid,
+     so the grove floor actually looks like grass rather than graph paper */
+  const grassTex = lcMakeGrassTexture();
+  grassTex.wrapS = grassTex.wrapT = T.RepeatWrapping;
+  grassTex.repeat.set(26, 26);
+  grassTex.anisotropy = 4;
+  const ground = new T.Mesh(new T.PlaneGeometry(100,100), new T.MeshLambertMaterial({map:grassTex}));
   ground.rotation.x = -Math.PI/2; scene.add(ground);
-  const grid = new T.GridHelper(100, 50, 0x93A96B, 0x9FB575);
-  grid.position.y = 0.01; scene.add(grid);
+
+  /* the sky: a lemon-sun and a lemon-moon, positioned along an arc using this
+     location's actual sunrise/sunset — not decorative placeholders */
+  const skyRise = (state.sun?.sunrise ? new Date(state.sun.sunrise) : solarTimes(state.loc.lat, state.loc.lon)?.sunrise) || new Date(Date.now()-6*3600000);
+  const skySet  = (state.sun?.sunset  ? new Date(state.sun.sunset)  : solarTimes(state.loc.lat, state.loc.lon)?.sunset)  || new Date(Date.now()+6*3600000);
+  const moon = moonPhase();
+  const sunMat = new T.SpriteMaterial({map:new T.CanvasTexture(lcMakeSunCanvas()), transparent:true});
+  const moonMat = new T.SpriteMaterial({map:new T.CanvasTexture(lcMakeMoonCanvas(moon.frac, moon.waxing)), transparent:true});
+  const sunSprite = new T.Sprite(sunMat); sunSprite.scale.set(24,24,1); scene.add(sunSprite);
+  const moonSprite = new T.Sprite(moonMat); moonSprite.scale.set(7,7,1); scene.add(moonSprite);
+  const SKY_R = 74, SKY_Y0 = 6;
+  function placeSky(sprite, angle){
+    sprite.position.set(Math.cos(angle)*SKY_R, SKY_Y0 + Math.sin(angle)*SKY_R, -Math.sin(angle*0.4)*20 - 30);
+  }
+  function updateSky(){
+    const now = Date.now(), dayLen = skySet - skyRise;
+    const sunPhase = (now - skyRise.getTime()) / dayLen;
+    const sunAngle = Math.PI * (1 - sunPhase);
+    placeSky(sunSprite, sunAngle);
+    placeSky(moonSprite, sunAngle + Math.PI);
+  }
+  updateSky();
 
   const camera = new T.PerspectiveCamera(72, window.innerWidth/window.innerHeight, 0.1, 240);
   const pos = new T.Vector3(0, 3.4, 9);
@@ -1811,6 +1893,8 @@ function lcStart(el, touch){
   function tick(){
     LC.raf = requestAnimationFrame(tick);
     const dt = Math.min(clock.getDelta(), 0.05), sp = 7.5*dt;
+    LC.skyClock = (LC.skyClock||0) + dt;
+    if(LC.skyClock > 5){ LC.skyClock = 0; updateSky(); }
     let f = 0, s = 0, v = LC.vy;
     if(!touch){
       f = (LC.keys.KeyW||LC.keys.ArrowUp?1:0) - (LC.keys.KeyS||LC.keys.ArrowDown?1:0);
