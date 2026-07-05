@@ -1340,7 +1340,7 @@ function openMoonScreen(){
         <div class="stat"><div class="k">Illuminated</div><div class="v" id="moonpct">${Math.round(moon.frac*100)}<small>%</small></div></div>
         <div class="stat"><div class="k">Moon age</div><div class="v">${moon.age.toFixed(1)}<small> / ${moon.synodic.toFixed(1)}d</small></div></div>
         <div class="stat"><div class="k">Next full</div><div class="v moondate">${esc(dFmt.format(moon.nextFull))}</div></div>
-        <div class="stat"><div class="k">Next new</div><div class="v moondate">${esc(dFmt.format(moon.nextNew))}</div></div>
+        <div class="stat"><div class="k">Next new</div><div class="v moondate" id="nextnewsecret">${esc(dFmt.format(moon.nextNew))}</div></div>
       </div>
       <div class="lemonsays moonsays"><span>Lemons says</span><p>${esc(moonFactLine(moon))}</p></div>
     </div>`;
@@ -1350,7 +1350,7 @@ function openMoonScreen(){
   el.addEventListener('click', e=>{ if(e.target === el) closeMoonScreen(); });
   document.addEventListener('keydown', moonEsc);
 }
-function moonEsc(e){ if(e.key === 'Escape') closeMoonScreen(); }
+function moonEsc(e){ if(e.key === 'Escape'){ closeMoonScreen(); closeSolitaire(); closeAscent(); } }
 function closeMoonScreen(){
   const el = $('#moonmodal');
   if(el){ msStop(); el.remove(); }
@@ -1533,7 +1533,7 @@ function openSunScreen(){
         <div class="stat"><div class="k">Lemonrise</div><div class="v moondate">${esc(skyTime(rise))}</div></div>
         <div class="stat"><div class="k">Lemonset</div><div class="v moondate" id="sunsetsecret">${esc(skyTime(set))}</div></div>
         <div class="stat"><div class="k">Solar noon</div><div class="v moondate">${esc(skyTime(noon))}</div></div>
-        <div class="stat"><div class="k">Tomorrow</div><div class="v moondate">${delta!=null?esc(fmtDelta(delta)):'\u2014'}</div></div>
+        <div class="stat"><div class="k">Tomorrow</div><div class="v moondate" id="tomorrowsecret">${delta!=null?esc(fmtDelta(delta)):'\u2014'}</div></div>
       </div>
       <div class="lemonsays moonsays"><span>Lemons says</span><p>${esc(sunFactLine())}</p></div>
     </div>`;
@@ -1934,12 +1934,874 @@ function closeLemoncraft(){
   document.body.style.overflow = '';
 }
 
+/* =====================================================================
+   SECRET DOOR #5: LEMON SOLITAIRE (click "Tomorrow" in the Lemonrise screen)
+   Standard Klondike rules, reskinned as four lemon-orchard suits.
+   Two "warm" suits (Zest, Rind) and two "cool" suits (Leaf, Seed) stand in
+   for red/black so classic alternating-color tableau rules still apply.
+   ===================================================================== */
+const SOL_SUITS = [
+  {id:'zest', warm:true,  glyph:'\u25CF', name:'Zest'},   // filled dot
+  {id:'rind', warm:true,  glyph:'\u25C6', name:'Rind'},   // diamond
+  {id:'leaf', warm:false, glyph:'\u2663', name:'Leaf'},   // clover-ish
+  {id:'seed', warm:false, glyph:'\u2660', name:'Seed'}    // seed/spade-ish
+];
+const SOL_RANKS = ['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
+const SOL = { tab:[], stock:[], waste:[], found:{zest:[],rind:[],leaf:[],seed:[]}, sel:null, open:false, moves:0, t0:0, timer:null };
+
+function solNewDeck(){
+  const deck = [];
+  SOL_SUITS.forEach(s => SOL_RANKS.forEach((r,i)=> deck.push({suit:s.id, rank:r, val:i+1, warm:s.warm, up:false})));
+  for(let i=deck.length-1; i>0; i--){ const j = Math.floor(Math.random()*(i+1)); [deck[i],deck[j]] = [deck[j],deck[i]]; }
+  return deck;
+}
+function solDeal(){
+  const deck = solNewDeck();
+  const tab = [[],[],[],[],[],[],[]];
+  for(let col=0; col<7; col++){
+    for(let row=0; row<=col; row++){
+      const c = deck.pop();
+      c.up = (row===col);
+      tab[col].push(c);
+    }
+  }
+  Object.assign(SOL, { tab, stock:deck, waste:[], found:{zest:[],rind:[],leaf:[],seed:[]}, sel:null, moves:0, t0:Date.now() });
+}
+function solColor(c){ return c.warm; } // true = warm family, false = cool family
+function solCanStackTableau(card, onto){
+  if(!onto) return card.val === 13; // empty column only takes a King
+  return onto.up && onto.val === card.val+1 && onto.warm !== card.warm;
+}
+function solCanStackFoundation(card, pileArr, suitId){
+  if(card.suit !== suitId) return false;
+  const top = pileArr[pileArr.length-1];
+  return top ? card.val === top.val+1 : card.val === 1;
+}
+function solWon(){ return SOL_SUITS.every(s => SOL.found[s.id].length === 13); }
+function solAutoFoundationTarget(card){
+  const s = SOL_SUITS.find(s=>s.id===card.suit);
+  return solCanStackFoundation(card, SOL.found[s.id], s.id) ? s.id : null;
+}
+
+function solCardFace(c){
+  const suit = SOL_SUITS.find(s=>s.id===c.suit);
+  const tone = c.warm ? 'warm' : 'cool';
+  return `<div class="solcard ${tone}"><span class="solrank">${c.rank}</span><span class="solglyph">${suit.glyph}</span></div>`;
+}
+function solCardBack(){ return `<div class="solcard solback"><svg viewBox="0 0 24 24" width="16" height="16"><circle cx="12" cy="12" r="8" fill="var(--zest)" stroke="var(--pith)" stroke-width="1.6"/></svg></div>`; }
+
+function openSolitaire(){
+  closeMoonScreen();
+  SOL.open = true;
+  solDeal();
+  const el = document.createElement('div');
+  el.id = 'solmodal'; el.className = 'gamemodal';
+  el.setAttribute('role','dialog'); el.setAttribute('aria-label','Lemon Solitaire');
+  el.innerHTML = `
+    <button class="modalclose" id="solcloseX" aria-label="Close">&times;</button>
+    <div class="solwrap">
+      <div class="mshead">
+        <span class="mstitle">LEMON SOLITAIRE<span class="dot">.</span></span>
+        <button class="linkish" id="solnew">new deal</button>
+      </div>
+      <div class="soltop">
+        <div class="solpile" id="solstock"></div>
+        <div class="solpile" id="solwaste"></div>
+        <div style="flex:1"></div>
+        <div class="solfound" id="solfound"></div>
+      </div>
+      <div class="soltableau" id="soltableau"></div>
+      <p class="mshint" id="solmsg">Tap a card to lift it, tap where it lands. Tap the stock to draw.</p>
+    </div>`;
+  document.body.appendChild(el);
+  document.body.style.overflow = 'hidden';
+  $('#solcloseX').addEventListener('click', closeSolitaire);
+  $('#solnew').addEventListener('click', ()=>{ solDeal(); solRender(); });
+  el.addEventListener('click', e=>{ if(e.target === el) closeSolitaire(); });
+  document.addEventListener('keydown', moonEsc);
+  $('#solstock').addEventListener('click', solDrawStock);
+  solRender();
+}
+function closeSolitaire(){
+  if(!SOL.open) return;
+  SOL.open = false;
+  const el = $('#solmodal'); if(el) el.remove();
+  document.body.style.overflow = '';
+}
+function solDrawStock(){
+  if(!SOL.stock.length){
+    if(!SOL.waste.length) return;
+    SOL.stock = SOL.waste.reverse().map(c=>({...c, up:false}));
+    SOL.waste = [];
+  }else{
+    const c = SOL.stock.pop(); c.up = true; SOL.waste.push(c);
+  }
+  SOL.sel = null;
+  solRender();
+}
+function solSelect(src){
+  if(SOL.sel && SOL.sel.src.col===src.col && SOL.sel.src.pile===src.pile){ SOL.sel = null; solRender(); return; }
+  SOL.sel = {src};
+  solRender();
+}
+function solMsg(t){ const m = $('#solmsg'); if(m) m.textContent = t; }
+function solTryMoveTo(destCol){
+  if(!SOL.sel) return;
+  const {src} = SOL.sel;
+  let cards;
+  if(src.pile === 'waste') cards = [SOL.waste[SOL.waste.length-1]];
+  else if(src.pile === 'found') cards = [SOL.found[src.suit][SOL.found[src.suit].length-1]];
+  else cards = SOL.tab[src.col].slice(src.idx);
+  if(!cards.length || !cards[0]) return;
+  const lead = cards[0];
+  const destTop = SOL.tab[destCol][SOL.tab[destCol].length-1];
+  if(!solCanStackTableau(lead, destTop)){ solMsg('That one won\u2019t sit there.'); SOL.sel=null; solRender(); return; }
+  if(src.pile==='waste') SOL.waste.pop();
+  else if(src.pile==='found') SOL.found[src.suit].pop();
+  else SOL.tab[src.col].splice(src.idx);
+  SOL.tab[destCol].push(...cards);
+  const remain = src.pile==='tab' ? SOL.tab[src.col] : null;
+  if(remain && remain.length) remain[remain.length-1].up = true;
+  SOL.sel = null; SOL.moves++;
+  solMsg('Nice.'); solRender();
+}
+function solTryMoveToFoundation(suitId){
+  if(!SOL.sel) return;
+  const {src} = SOL.sel;
+  let card;
+  if(src.pile==='waste') card = SOL.waste[SOL.waste.length-1];
+  else card = SOL.tab[src.col]?.[SOL.tab[src.col].length-1];
+  if(!card || !solCanStackFoundation(card, SOL.found[suitId], suitId)){ solMsg('Not the right lemon for that pile.'); SOL.sel=null; solRender(); return; }
+  if(src.pile==='waste') SOL.waste.pop(); else { SOL.tab[src.col].pop(); const t=SOL.tab[src.col]; if(t.length) t[t.length-1].up=true; }
+  SOL.found[suitId].push(card);
+  SOL.sel = null; SOL.moves++;
+  solRender();
+  if(solWon()) setTimeout(()=>solMsg('Full grove! Every lemon sorted. \uD83C\uDF4B'), 50);
+}
+function solClickTableauCard(col, idx){
+  const card = SOL.tab[col][idx];
+  if(!card.up){
+    if(idx === SOL.tab[col].length-1){ card.up = true; solRender(); }
+    return;
+  }
+  if(SOL.sel){
+    if(SOL.sel.src.pile==='tab' && SOL.sel.src.col===col){ SOL.sel=null; solRender(); return; }
+    solTryMoveTo(col); return;
+  }
+  /* double-tap-like convenience: tapping the very top card of a column tries the foundation first */
+  if(idx === SOL.tab[col].length-1){
+    const target = solAutoFoundationTarget(card);
+    if(target){ SOL.found[target].push(card); SOL.tab[col].pop(); const t=SOL.tab[col]; if(t.length) t[t.length-1].up=true; SOL.moves++; solRender();
+      if(solWon()) setTimeout(()=>solMsg('Full grove! Every lemon sorted. \uD83C\uDF4B'), 50); return; }
+  }
+  solSelect({pile:'tab', col, idx});
+}
+function solClickWaste(){
+  if(!SOL.waste.length) return;
+  if(SOL.sel && SOL.sel.src.pile==='waste'){ SOL.sel=null; solRender(); return; }
+  const card = SOL.waste[SOL.waste.length-1];
+  const target = solAutoFoundationTarget(card);
+  if(target && !SOL.sel){ /* offer selection either way; clicking waste just selects, foundation click confirms */ }
+  solSelect({pile:'waste'});
+}
+function solClickFoundation(suitId){
+  if(SOL.sel){ solTryMoveToFoundation(suitId); return; }
+  const pile = SOL.found[suitId];
+  if(pile.length) solSelect({pile:'found', suit:suitId});
+}
+function solRender(){
+  const stockEl = $('#solstock'), wasteEl = $('#solwaste'), foundEl = $('#solfound'), tabEl = $('#soltableau');
+  if(!stockEl) return;
+  stockEl.innerHTML = SOL.stock.length ? solCardBack() : `<div class="solcard solempty">&#8635;</div>`;
+  wasteEl.innerHTML = SOL.waste.length ? solCardFace(SOL.waste[SOL.waste.length-1]) : `<div class="solcard solempty"></div>`;
+  wasteEl.classList.toggle('sel', !!(SOL.sel && SOL.sel.src.pile==='waste'));
+  wasteEl.onclick = solClickWaste;
+  foundEl.innerHTML = SOL_SUITS.map(s=>{
+    const pile = SOL.found[s.id], top = pile[pile.length-1];
+    const sel = SOL.sel && SOL.sel.src.pile==='found' && SOL.sel.src.suit===s.id;
+    return `<div class="solfoundslot${sel?' sel':''}" data-suit="${s.id}">${top ? solCardFace(top) : `<div class="solcard solempty">${s.glyph}</div>`}</div>`;
+  }).join('');
+  foundEl.querySelectorAll('[data-suit]').forEach(elx=>elx.addEventListener('click', ()=>solClickFoundation(elx.dataset.suit)));
+  tabEl.innerHTML = SOL.tab.map((col,ci)=>{
+    const sel = SOL.sel && SOL.sel.src.pile==='tab' && SOL.sel.src.col===ci;
+    return `<div class="solcol" data-col="${ci}">${col.map((c,ri)=>{
+      const lifted = sel && ri >= SOL.sel.src.idx;
+      return `<div class="solslot${lifted?' lifted':''}" style="--i:${ri}" data-idx="${ri}">${c.up ? solCardFace(c) : solCardBack()}</div>`;
+    }).join('') || '<div class="solslot solemptycol" data-idx="0"></div>'}</div>`;
+  }).join('');
+  tabEl.querySelectorAll('.solcol').forEach(colEl=>{
+    const ci = +colEl.dataset.col;
+    colEl.addEventListener('click', e=>{
+      const slot = e.target.closest('.solslot');
+      const idx = slot ? +slot.dataset.idx : SOL.tab[ci].length-1;
+      if(SOL.tab[ci].length && slot && idx < SOL.tab[ci].length) solClickTableauCard(ci, idx);
+      else solTryMoveTo(ci);
+    });
+  });
+}
+
+/* =====================================================================
+   SECRET DOOR #6: SOUR ASCENT v2 (click "Next new" in the Moon screen)
+   An original charged-jump vertical climber. Lemons — a ridiculously
+   beefy dude with a lemon for a head — scales the Citric Tower.
+   Walk while grounded. Hold to charge, release to leap. No air control.
+   Wall bounces carry your angle. No checkpoints: gravity is the save file.
+   Deterministic world (seeded) so autosaved positions are always valid.
+   ===================================================================== */
+const ASC_C = { G:1800, MAX_CHARGE:0.6, WALK:150, VY:[620,1400], VX:[210,470],
+  REST:0.55, PW:34, PH:54, STEP:1/120, WORLD_V:2 };
+const ASC = { open:false, world:null, cam:0, raf:0, keys:{}, touchDir:0,
+  p:null, stats:null, anim:{landT:0, flexT:0, walkPhase:0, t:0}, quip:null,
+  actx:undefined, chargeOsc:null, saveT:null, acc:0 };
+
+function ascRng(seed){ /* mulberry32 — deterministic decor & layout */
+  return function(){ seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+
+/* ---------- zones ---------- */
+const ASC_ZONES = [
+  { i:0, name:'The Lemon Grove',   y0:0,    y1:1600, skyTop:'#BFE3EE', skyBot:'#FFF6D8',
+    plat:'#8A6B33', platTop:'#B7E07A', wallC:'#6B5228', dust:'rgba(255,253,244,.7)' },
+  { i:1, name:'The Juice Factory', y0:1600, y1:3300, skyTop:'#E8D9B8', skyBot:'#FFE9C2',
+    plat:'#5C5648', platTop:'#F4CE3E', wallC:'#4A4438', dust:'rgba(35,36,27,.14)' },
+  { i:2, name:'The Pulp Caves',    y0:3300, y1:5400, skyTop:'#7A4A22', skyBot:'#C97B2E',
+    plat:'#E0972C', platTop:'#FBF0B2', wallC:'#B5651D', dust:'rgba(244,206,62,.75)' }
+];
+function ascZoneFor(y){ return ASC_ZONES.find(z=> y>=z.y0 && y<z.y1) || ASC_ZONES[ASC_ZONES.length-1]; }
+
+/* ---------- world: deterministic + intentional ---------- */
+function ascBuildWorld(){
+  const plats = [];
+  const P = (x,y,w,opts={})=>plats.push({x:x-w/2, y, w, h:14, ...opts});
+  const WALL = (x,y,h)=>plats.push({x:x-8, y, w:16, h, wall:true});
+
+  /* floor + tower side bounds (bouncy, keeps every fall inside the world) */
+  plats.push({x:-340, y:-20, w:680, h:20, floor:true});
+  WALL(-348, -20, 5600); WALL(348, -20, 5600);
+
+  /* --- teaching steps: authored by hand, each one demonstrates a skill --- */
+  P(   0, 240, 120);            // straight up: pure charge read
+  P( 190, 450, 104);            // angled hop
+  P( -40, 700, 190, {rest:true}); // first earned rest
+  P(-210, 930, 96);             // commit left
+  P(  40, 1160, 92);            // long diagonal
+  P( 220, 1420, 100);           // grove exit
+
+  /* --- generated climb, seeded so it is identical every single load --- */
+  const rnd = ascRng(7);
+  let x = 220, y = 1420;
+  const zoneParams = [
+    null, /* grove is hand-authored above */
+    { until:3300, dyMin:210, dyMax:330, wMin:60, wMax:78, drift:230, wallEvery:6, rests:[2350, 3140] },
+    { until:5150, dyMin:240, dyMax:360, wMin:46, wMax:60, drift:150, wallEvery:4, rests:[4050, 4900] }
+  ];
+  for(const zp of zoneParams){
+    if(!zp) continue;
+    let i = 0;
+    while(y < zp.until){
+      i++;
+      y += zp.dyMin + rnd()*(zp.dyMax - zp.dyMin);
+      x += (rnd()*2-1) * zp.drift;
+      x = Math.max(-270, Math.min(270, x));
+      const w = zp.wMin + rnd()*(zp.wMax - zp.wMin);
+      P(x, y, w);
+      if(i % zp.wallEvery === 2){
+        /* a bounce corridor: two walls flanking the route with a mid ledge */
+        const gap = 130 + rnd()*40;
+        WALL(x-gap, y+40, 300); WALL(x+gap, y+40, 300);
+        P(x + (rnd()>0.5?60:-60), y+170, 50);
+        y += 170;
+      }
+      const restY = zp.rests.find(r=> y>=r && y < r+80);
+      if(restY){ y += 120; x *= 0.4; P(x, y, 180, {rest:true}); }
+    }
+  }
+  /* --- the summit --- */
+  const topY = y + 300;
+  P(0, topY, 240, {rest:true, summit:true});
+
+  /* --- painted backdrop shapes, per zone, parallax layers --- */
+  const decor = [];
+  const drnd = ascRng(23);
+  for(const z of ASC_ZONES){
+    const span = z.y1 - z.y0;
+    if(z.i===0){ /* grove: canopy blobs + curvy trunks */
+      for(let k=0;k<26;k++) decor.push({zone:0, t:'blob', par:0.45+drnd()*0.25,
+        x:(drnd()*2-1)*560, y:z.y0+drnd()*span, r:60+drnd()*110,
+        c:`rgba(${52+drnd()*30|0},${92+drnd()*40|0},${44+drnd()*20|0},${0.5+drnd()*0.4})`});
+      for(let k=0;k<4;k++) decor.push({zone:0, t:'trunk', par:0.6,
+        x:(drnd()*2-1)*420, y:z.y0, h:span, sway:40+drnd()*70, c:'rgba(90,66,38,.55)'});
+      for(let k=0;k<12;k++) decor.push({zone:0, t:'lemon', par:0.62,
+        x:(drnd()*2-1)*480, y:z.y0+drnd()*span, r:7+drnd()*5, c:'#F4CE3E'});
+    }
+    if(z.i===1){ /* factory: pipes from the walls + vat silhouettes */
+      for(let k=0;k<12;k++){ const left = drnd()>0.5;
+        decor.push({zone:1, t:'pipe', par:0.55+drnd()*0.2, left,
+          x:left?-560:160, y:z.y0+drnd()*span, w:400+drnd()*160, h:26+drnd()*18,
+          c:`rgba(${60+drnd()*24|0},${54+drnd()*20|0},${70+drnd()*30|0},.6)`}); }
+      for(let k=0;k<5;k++) decor.push({zone:1, t:'vat', par:0.4,
+        x:(drnd()*2-1)*380, y:z.y0+drnd()*span, w:150+drnd()*120, h:220+drnd()*160,
+        c:'rgba(58,52,44,.5)'});
+      for(let k=0;k<8;k++) decor.push({zone:1, t:'lemon', par:0.6,
+        x:(drnd()*2-1)*440, y:z.y0+drnd()*span, r:6+drnd()*4, c:'#DDB32A'});
+    }
+    if(z.i===2){ /* caves: pulp membrane arcs + drips */
+      for(let k=0;k<20;k++) decor.push({zone:2, t:'membrane', par:0.45+drnd()*0.25,
+        x:(drnd()*2-1)*560, y:z.y0+drnd()*span, r:90+drnd()*160,
+        c:`rgba(${150+drnd()*60|0},${70+drnd()*40|0},${20+drnd()*20|0},${0.35+drnd()*0.3})`});
+      for(let k=0;k<10;k++) decor.push({zone:2, t:'drip', par:0.7,
+        x:(drnd()*2-1)*480, y:z.y0+drnd()*span, h:40+drnd()*90, c:'rgba(224,151,44,.5)'});
+    }
+  }
+  decor.sort((a,b)=>a.par-b.par);
+
+  /* ambient particles */
+  const parts = [];
+  const prnd = ascRng(99);
+  for(let k=0;k<36;k++) parts.push({x:(prnd()*2-1)*400, y:prnd()*5600, vy:8+prnd()*16, r:1.5+prnd()*2});
+
+  return { v:ASC_C.WORLD_V, plats, decor, parts, topY, spawn:{x:0, y:0} };
+}
+
+/* ---------- physics: pure, fixed-step, prev-position collision ---------- */
+function ascAabbOverlap(a,b){ return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y; }
+function ascRectFor(p){ return {x:p.x-ASC_C.PW/2, y:p.y, w:ASC_C.PW, h:ASC_C.PH}; }
+function ascChargeToVelocity(chargeT, facing){
+  const t = Math.max(0, Math.min(1, chargeT/ASC_C.MAX_CHARGE));
+  return { vx: facing * (ASC_C.VX[0] + (ASC_C.VX[1]-ASC_C.VX[0])*t) * (facing?1:0),
+           vy: ASC_C.VY[0] + (ASC_C.VY[1]-ASC_C.VY[0])*t };
+}
+function ascLaunch(p){
+  const {vx, vy} = ascChargeToVelocity(p.chargeT, p.facing);
+  p.vx = vx; p.vy = vy; p.grounded = false; p.charging = false; p.chargeT = 0;
+  p.airPeakY = p.y;
+}
+function ascPhysStep(p, world, dt){
+  const ev = {landed:false, bounced:false, bonked:false};
+  const prevBottom = p.y, prevTop = p.y + ASC_C.PH;
+  p.vy -= ASC_C.G*dt;
+  p.x += p.vx*dt;
+  p.y += p.vy*dt;
+  const r = ascRectFor(p);
+  for(const pl of world.plats){
+    if(!ascAabbOverlap(r, pl)) continue;
+    const platTop = pl.y + pl.h, platBottom = pl.y;
+    if(!pl.wall && p.vy <= 0 && prevBottom >= platTop - 3){
+      p.y = platTop; p.vy = 0; p.vx = 0; p.grounded = true; ev.landed = true;
+    }else if(!pl.wall && p.vy > 0 && prevTop <= platBottom + 3){
+      p.y = platBottom - ASC_C.PH; p.vy = Math.min(p.vy, 0) - 60; ev.bonked = true;
+    }else{
+      /* side hit → wall bounce; the angle carries: vy is preserved and a
+         fast horizontal impact adds a small upward kick, so hard hits climb */
+      const impact = Math.abs(p.vx);
+      p.vx = -p.vx * ASC_C.REST;
+      if(p.vy < 0) p.vy += Math.min(impact*0.12, 90);
+      p.x = p.vx > 0 ? pl.x + pl.w + ASC_C.PW/2 + 0.5 : pl.x - ASC_C.PW/2 - 0.5;
+      ev.bounced = true;
+    }
+    r.x = p.x - ASC_C.PW/2; r.y = p.y;
+  }
+  return ev;
+}
+function ascGroundedStep(p, world, dt, dir){
+  /* walking + edge detection + wall stop while grounded */
+  if(dir !== 0 && !p.charging){
+    p.facing = dir;
+    p.x += dir * ASC_C.WALK * dt;
+    const r = ascRectFor(p);
+    for(const pl of world.plats){
+      if(!ascAabbOverlap(r, pl)) continue;
+      if(pl.y + pl.h <= p.y + 2) continue; /* the thing we stand on */
+      p.x = dir > 0 ? pl.x - ASC_C.PW/2 - 0.5 : pl.x + pl.w + ASC_C.PW/2 + 0.5;
+    }
+    const foot = {x:p.x-ASC_C.PW/2+4, y:p.y-4, w:ASC_C.PW-8, h:5};
+    if(!world.plats.some(pl=>!pl.wall && ascAabbOverlap(foot, pl))){
+      p.grounded = false; p.vy = 0; p.vx = dir * ASC_C.WALK * 0.55; p.airPeakY = p.y;
+    }
+  }else if(dir !== 0 && p.charging){
+    p.facing = dir; /* aim while charging */
+  }
+}
+
+/* ---------- tiny synth (no assets) ---------- */
+function ascAudio(){
+  if(ASC.actx === undefined){
+    try{ ASC.actx = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ ASC.actx = null; }
+  }
+  return ASC.actx;
+}
+function ascBeep(f0, f1, dur, type='square', gain=0.05){
+  const a = ascAudio(); if(!a) return;
+  try{
+    const o = a.createOscillator(), g = a.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f0, a.currentTime);
+    o.frequency.exponentialRampToValueAtTime(Math.max(f1,1), a.currentTime+dur);
+    g.gain.setValueAtTime(gain, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime+dur);
+    o.connect(g).connect(a.destination);
+    o.start(); o.stop(a.currentTime+dur+0.02);
+  }catch(e){}
+}
+function ascChargeSoundStart(){
+  const a = ascAudio(); if(!a) return;
+  try{
+    const o = a.createOscillator(), g = a.createGain();
+    o.type='sawtooth'; o.frequency.value=160;
+    g.gain.value=0.028;
+    o.connect(g).connect(a.destination); o.start();
+    ASC.chargeOsc = {o, g};
+  }catch(e){}
+}
+function ascChargeSoundUpdate(t){ if(ASC.chargeOsc) try{ ASC.chargeOsc.o.frequency.value = 160 + 420*t; }catch(e){} }
+function ascChargeSoundStop(){
+  if(!ASC.chargeOsc) return;
+  try{ ASC.chargeOsc.g.gain.exponentialRampToValueAtTime(0.0001, ASC.actx.currentTime+0.05); ASC.chargeOsc.o.stop(ASC.actx.currentTime+0.08); }catch(e){}
+  ASC.chargeOsc = null;
+}
+
+/* ---------- quips ---------- */
+const ASC_FALL_QUIPS = ['MY GAINS!','totally planned that','the tower fights dirty','gravity is a hater','warm-up rep','I meant to scout down here'];
+const ASC_SUMMIT_QUIP = 'THE GOLDEN SQUEEZER IS MINE. DESTINY: JUICED.';
+function ascSetQuip(text){ ASC.quip = {text, t:1.8}; }
+
+/* ---------- character: Lemons, the beefiest lemon alive ---------- */
+function ascDrawLemons(ctx, sx, sy, p, now){
+  const a = ASC.anim;
+  const chargeT = p.charging ? Math.min(1, p.chargeT/ASC_C.MAX_CHARGE) : 0;
+  const panic = !p.grounded && p.vy < -720;
+  const rising = !p.grounded && p.vy > 60;
+  const landSquash = Math.max(0, a.landT) / 0.14;
+  const crouch = chargeT*0.30;
+  const breathe = p.grounded && !p.charging ? 1 + 0.014*Math.sin(now*2.2) : 1;
+  const flexing = p.grounded && !p.charging && (now % 3.1) > 2.55;
+  const walkSwing = Math.sin(a.walkPhase*10) * (a.walking?1:0);
+  const sYs = (1 - crouch*0.6) * (landSquash>0 ? 0.82 : 1) * breathe;
+  const sXs = landSquash>0 ? 1.16 : 1;
+  const SKIN='#E5A96B', SKIND='#C98A4E', SHORT='#4E7A3A', INK='#23241B', ZEST='#F4CE3E', SNK='#FFFDF4';
+
+  ctx.save();
+  ctx.translate(sx, sy);
+  if(chargeT > 0.85) ctx.translate((Math.random()-0.5)*3.2, 0);
+  ctx.scale(p.facing||1, 1);
+  ctx.scale(sXs, sYs);
+
+  /* charge aura */
+  if(p.charging && chargeT > 0.12){
+    ctx.globalAlpha = chargeT*0.4;
+    ctx.beginPath(); ctx.arc(0, -30, 24 + chargeT*14, 0, Math.PI*2);
+    ctx.fillStyle = ZEST; ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  /* sneakers */
+  ctx.fillStyle = SNK;
+  const lLeg = walkSwing*4, rLeg = -walkSwing*4;
+  ctx.fillRect(-15+lLeg, -7, 14, 7); ctx.fillRect(1+rLeg, -7, 14, 7);
+  ctx.strokeStyle = INK; ctx.lineWidth = 1.6;
+  ctx.strokeRect(-15+lLeg, -7, 14, 7); ctx.strokeRect(1+rLeg, -7, 14, 7);
+  ctx.fillStyle = ZEST; ctx.fillRect(-15+lLeg, -4.5, 14, 2); ctx.fillRect(1+rLeg, -4.5, 14, 2);
+  /* legs */
+  ctx.fillStyle = SKIN;
+  ctx.fillRect(-11+lLeg, -21, 9, 15); ctx.fillRect(2+rLeg, -21, 9, 15);
+  /* gym shorts */
+  ctx.fillStyle = SHORT;
+  ctx.beginPath();
+  ctx.moveTo(-14, -34); ctx.lineTo(14, -34); ctx.lineTo(16, -20); ctx.lineTo(3, -20);
+  ctx.lineTo(0, -26); ctx.lineTo(-3, -20); ctx.lineTo(-16, -20); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = INK; ctx.lineWidth = 1.4; ctx.stroke();
+  ctx.fillStyle = INK; ctx.fillRect(-14, -35, 28, 3); /* waistband */
+  /* torso: V-taper, shirtless, absolutely juiced */
+  ctx.fillStyle = SKIN;
+  ctx.beginPath();
+  ctx.moveTo(-10, -34); ctx.lineTo(-18, -56); ctx.lineTo(18, -56); ctx.lineTo(10, -34);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = INK; ctx.lineWidth = 1.6; ctx.stroke();
+  /* pec + ab lines */
+  ctx.strokeStyle = SKIND; ctx.lineWidth = 1.3;
+  ctx.beginPath(); ctx.moveTo(-9,-50); ctx.lineTo(-1,-48); ctx.moveTo(9,-50); ctx.lineTo(1,-48);
+  ctx.moveTo(-4,-44); ctx.lineTo(4,-44); ctx.moveTo(-3,-39); ctx.lineTo(3,-39); ctx.stroke();
+  /* arms: huge. pose depends on state */
+  const armPose = p.charging ? 'down' : panic ? 'flail' : rising ? 'up' : flexing ? 'flex' : 'idle';
+  ctx.fillStyle = SKIN; ctx.strokeStyle = INK; ctx.lineWidth = 1.6;
+  function arm(side){ /* side: -1 left, +1 right */
+    let sh = {x:side*16, y:-53};
+    let el, fi;
+    if(armPose==='down'){ el = {x:side*22, y:-40}; fi = {x:side*18, y:-27}; }
+    else if(armPose==='up'){ el = {x:side*23, y:-60}; fi = {x:side*17, y:-74}; }
+    else if(armPose==='flail'){ const w = Math.sin(performance.now()/60 + side); el = {x:side*(22+w*3), y:-52+w*8}; fi = {x:side*(26-w*4), y:-64+w*12}; }
+    else if(armPose==='flex'){ el = {x:side*25, y:-52}; fi = {x:side*18, y:-64}; }
+    else { el = {x:side*22, y:-46 + walkSwing*side*2}; fi = {x:side*20, y:-33 + walkSwing*side*3}; }
+    /* deltoid */
+    ctx.beginPath(); ctx.arc(sh.x, sh.y, 7.5, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+    /* bicep + forearm as thick strokes */
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = SKIN; ctx.lineWidth = 11;
+    ctx.beginPath(); ctx.moveTo(sh.x, sh.y); ctx.lineTo(el.x, el.y); ctx.stroke();
+    ctx.lineWidth = 8.5;
+    ctx.beginPath(); ctx.moveTo(el.x, el.y); ctx.lineTo(fi.x, fi.y); ctx.stroke();
+    ctx.strokeStyle = INK; ctx.lineWidth = 1.4;
+    /* fist */
+    ctx.beginPath(); ctx.arc(fi.x, fi.y, 5, 0, Math.PI*2); ctx.fillStyle = SKIN; ctx.fill(); ctx.stroke();
+    return {sh, el, fi};
+  }
+  const armR = arm(1); const armL = arm(-1);
+  /* tattoos: lemon slice on left bicep, bolt on right forearm, flame on right bicep */
+  ctx.save();
+  const mid = (a,b)=>({x:(a.x+b.x)/2, y:(a.y+b.y)/2});
+  const tatL = mid(armL.sh, armL.el);
+  ctx.beginPath(); ctx.arc(tatL.x, tatL.y, 3.2, 0, Math.PI*2); ctx.fillStyle = ZEST; ctx.fill();
+  ctx.strokeStyle = INK; ctx.lineWidth = 0.9; ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(tatL.x-2.2,tatL.y); ctx.lineTo(tatL.x+2.2,tatL.y); ctx.moveTo(tatL.x,tatL.y-2.2); ctx.lineTo(tatL.x,tatL.y+2.2); ctx.stroke();
+  const tatR = mid(armR.el, armR.fi);
+  ctx.strokeStyle = '#B5651D'; ctx.lineWidth = 1.6;
+  ctx.beginPath(); ctx.moveTo(tatR.x-2,tatR.y-3); ctx.lineTo(tatR.x+1,tatR.y); ctx.lineTo(tatR.x-1,tatR.y); ctx.lineTo(tatR.x+2,tatR.y+3); ctx.stroke();
+  ctx.restore();
+  /* sweat at high charge */
+  if(chargeT > 0.55){
+    ctx.fillStyle = '#9FD8E8';
+    ctx.beginPath(); ctx.arc(-14, -66 - chargeT*4, 2, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(15, -63 - chargeT*7, 1.6, 0, Math.PI*2); ctx.fill();
+  }
+  /* the lemon head */
+  const hy = -66;
+  ctx.beginPath(); ctx.ellipse(0, hy, 12.5, 10, 0, 0, Math.PI*2);
+  ctx.fillStyle = ZEST; ctx.fill();
+  ctx.strokeStyle = INK; ctx.lineWidth = 2; ctx.stroke();
+  /* nubs */
+  ctx.beginPath(); ctx.ellipse(-13.5, hy, 2.6, 1.9, 0, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(13.5, hy, 2.6, 1.9, 0, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+  /* leaf sprig */
+  ctx.fillStyle = SHORT;
+  ctx.beginPath(); ctx.moveTo(3, hy-9); ctx.quadraticCurveTo(9, hy-17, 16, hy-14);
+  ctx.quadraticCurveTo(11, hy-9, 3, hy-9); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = INK; ctx.lineWidth = 1.2; ctx.stroke();
+  /* face: determined vs panic */
+  ctx.fillStyle = INK; ctx.strokeStyle = INK;
+  if(panic){
+    ctx.fillStyle = '#FFFDF4';
+    ctx.beginPath(); ctx.arc(2, hy-2, 3.4, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(9, hy-2, 3.4, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = INK;
+    ctx.beginPath(); ctx.arc(2.6, hy-1.6, 1.4, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(9.6, hy-1.6, 1.4, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(6, hy+4.5, 2.6, 3.4, 0, 0, Math.PI*2); ctx.fill();
+  }else{
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(-1, hy-5.5); ctx.lineTo(4.5, hy-4); ctx.moveTo(11.5, hy-5.5); ctx.lineTo(6.5, hy-4); ctx.stroke();
+    ctx.fillRect(1.5, hy-2.5, 2.6, 3.2); ctx.fillRect(7.5, hy-2.5, 2.6, 3.2);
+    ctx.lineWidth = 1.8;
+    ctx.beginPath(); ctx.moveTo(2, hy+5); ctx.lineTo(10, hy+4.4); ctx.stroke();
+    ctx.lineWidth = 0.9;
+    ctx.beginPath(); ctx.moveTo(4.6, hy+3.6); ctx.lineTo(4.7, hy+5.8); ctx.moveTo(7.3, hy+3.4); ctx.lineTo(7.4, hy+5.6); ctx.stroke();
+  }
+  /* charge meter pill beside him */
+  if(p.charging){
+    ctx.setTransform(1,0,0,1,0,0); /* meter reads upright regardless of facing */
+    ctx.translate(sx - (p.facing===1? 34 : -34), sy - 44);
+    ctx.fillStyle = 'rgba(255,253,244,.85)';
+    ctx.strokeStyle = INK; ctx.lineWidth = 1.4;
+    ctx.beginPath(); ctx.roundRect(-4, -18, 8, 36, 4); ctx.fill(); ctx.stroke();
+    const fillH = 34 * chargeT;
+    ctx.fillStyle = chargeT > 0.95 ? '#B5651D' : ZEST;
+    ctx.beginPath(); ctx.roundRect(-3, 17 - fillH, 6, fillH, 3); ctx.fill();
+  }
+  ctx.restore();
+}
+
+/* ---------- rendering ---------- */
+function ascDrawPlatform(ctx, pl, sx, sy, zone, idx){
+  const h = ascRng(idx*13+zone.i);
+  if(pl.wall){
+    if(zone.i===0){ /* trunk strip */
+      ctx.fillStyle = zone.wallC; ctx.fillRect(sx, sy, pl.w, pl.h);
+      ctx.strokeStyle = 'rgba(35,36,27,.35)'; ctx.lineWidth = 1.5; ctx.strokeRect(sx, sy, pl.w, pl.h);
+      ctx.strokeStyle = 'rgba(255,253,244,.15)';
+      ctx.beginPath(); ctx.moveTo(sx+5, sy+6); ctx.lineTo(sx+5, sy+pl.h-6); ctx.stroke();
+    }else if(zone.i===1){ /* vertical pipe */
+      ctx.fillStyle = '#5A5468'; ctx.fillRect(sx, sy, pl.w, pl.h);
+      ctx.fillStyle = 'rgba(255,253,244,.18)'; ctx.fillRect(sx+2, sy, 4, pl.h);
+      ctx.strokeStyle = 'rgba(35,36,27,.5)'; ctx.lineWidth = 1.5; ctx.strokeRect(sx, sy, pl.w, pl.h);
+      for(let yy = sy+18; yy < sy+pl.h-10; yy += 46){ ctx.fillStyle='rgba(35,36,27,.4)'; ctx.fillRect(sx-2, yy, pl.w+4, 5); }
+    }else{ /* springy membrane */
+      ctx.fillStyle = '#D8842A'; ctx.fillRect(sx, sy, pl.w, pl.h);
+      ctx.strokeStyle = '#FBF0B2'; ctx.lineWidth = 2.2;
+      ctx.beginPath();
+      for(let yy = sy+8; yy < sy+pl.h-4; yy += 22){ ctx.moveTo(sx+3, yy); ctx.quadraticCurveTo(sx+pl.w/2, yy+8, sx+pl.w-3, yy); }
+      ctx.stroke();
+      ctx.strokeStyle = 'rgba(35,36,27,.4)'; ctx.lineWidth = 1.5; ctx.strokeRect(sx, sy, pl.w, pl.h);
+    }
+    return;
+  }
+  /* standable platform: strong bright top edge = "you can land here" */
+  ctx.fillStyle = zone.plat; ctx.fillRect(sx, sy, pl.w, pl.h);
+  ctx.strokeStyle = 'rgba(35,36,27,.4)'; ctx.lineWidth = 1.5; ctx.strokeRect(sx, sy, pl.w, pl.h);
+  ctx.fillStyle = zone.platTop; ctx.fillRect(sx, sy, pl.w, 4);
+  if(zone.i===0){ /* leaf tufts + a hanging lemon sometimes */
+    ctx.fillStyle = '#4E7A3A';
+    for(let xx = sx+6; xx < sx+pl.w-6; xx += 16){ ctx.beginPath(); ctx.arc(xx + h()*6, sy+1, 4+h()*2, Math.PI, 0); ctx.fill(); }
+    if(h() > 0.55){ ctx.fillStyle='#F4CE3E'; ctx.beginPath(); ctx.arc(sx+pl.w-8, sy+pl.h+6, 4.5, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle='rgba(35,36,27,.5)'; ctx.lineWidth=1; ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(sx+pl.w-8, sy+pl.h); ctx.lineTo(sx+pl.w-8, sy+pl.h+2); ctx.stroke(); }
+  }else if(zone.i===1){ /* rivets + hazard nick */
+    ctx.fillStyle = 'rgba(35,36,27,.5)';
+    for(let xx = sx+6; xx < sx+pl.w-4; xx += 18) ctx.fillRect(xx, sy+8, 2.5, 2.5);
+  }else{ /* pulp drips under the ledge */
+    ctx.fillStyle = zone.plat;
+    for(let xx = sx+8; xx < sx+pl.w-6; xx += 20){ ctx.beginPath(); ctx.arc(xx+h()*8, sy+pl.h, 3+h()*3, 0, Math.PI); ctx.fill(); }
+  }
+  if(pl.rest){ /* a little flag marks earned rest spots */
+    ctx.strokeStyle = '#23241B'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(sx+10, sy); ctx.lineTo(sx+10, sy-18); ctx.stroke();
+    ctx.fillStyle = pl.summit ? '#DDB32A' : '#F4CE3E';
+    ctx.beginPath(); ctx.moveTo(sx+11, sy-18); ctx.lineTo(sx+26, sy-14); ctx.lineTo(sx+11, sy-10); ctx.closePath(); ctx.fill();
+  }
+  if(pl.summit){ /* THE GOLDEN SQUEEZER */
+    const cx = sx + pl.w/2;
+    ctx.fillStyle = '#DDB32A';
+    ctx.beginPath(); ctx.ellipse(cx, sy-16, 16, 12, 0, Math.PI, 0); ctx.fill();
+    ctx.strokeStyle = '#23241B'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.beginPath();
+    for(let a = 0.35; a < Math.PI-0.3; a += 0.5){ ctx.moveTo(cx, sy-16); ctx.lineTo(cx+Math.cos(a)*15, sy-16-Math.sin(a)*11); }
+    ctx.strokeStyle = 'rgba(35,36,27,.55)'; ctx.lineWidth = 1.3; ctx.stroke();
+    ctx.fillRect(cx-20, sy-6, 40, 4);
+  }
+}
+function ascDrawDecor(ctx, d, sx, sy){
+  if(d.t==='blob' || d.t==='membrane'){ ctx.fillStyle = d.c; ctx.beginPath(); ctx.arc(sx, sy, d.r, 0, Math.PI*2); ctx.fill(); }
+  else if(d.t==='trunk'){ ctx.strokeStyle = d.c; ctx.lineWidth = 26; ctx.lineCap='round';
+    ctx.beginPath(); ctx.moveTo(sx, sy+400); ctx.quadraticCurveTo(sx+d.sway, sy-d.h*0.35, sx-d.sway*0.5, sy-d.h); ctx.stroke(); }
+  else if(d.t==='lemon'){ ctx.fillStyle = d.c; ctx.beginPath(); ctx.ellipse(sx, sy, d.r*1.15, d.r, 0.4, 0, Math.PI*2); ctx.fill();
+    ctx.strokeStyle='rgba(35,36,27,.3)'; ctx.lineWidth=1; ctx.stroke(); }
+  else if(d.t==='pipe'){ ctx.fillStyle = d.c; ctx.beginPath(); ctx.roundRect(sx, sy, d.w, d.h, d.h/2); ctx.fill(); }
+  else if(d.t==='vat'){ ctx.fillStyle = d.c; ctx.beginPath(); ctx.roundRect(sx-d.w/2, sy, d.w, d.h, 18); ctx.fill(); }
+  else if(d.t==='drip'){ ctx.strokeStyle = d.c; ctx.lineWidth = 7; ctx.lineCap='round';
+    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx, sy+d.h); ctx.stroke(); }
+}
+function ascRender(ctx, canvas, zone, now){
+  const W = canvas.width, H = canvas.height;
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, zone.skyTop); g.addColorStop(1, zone.skyBot);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  const camX = W/2, camY = H*0.6;
+  const toScreen = (x, y) => [camX + x, camY - (y - ASC.cam)];
+  for(const d of ASC.world.decor){
+    const sy = camY - d.par*(d.y - ASC.cam);
+    if(sy < -260 || sy > H+260) continue;
+    ascDrawDecor(ctx, d, camX + d.x*0.9, sy);
+  }
+  for(const pt of ASC.world.parts){
+    pt.y += pt.vy/60;
+    if(pt.y > 5600) pt.y = 0;
+    const [sx, sy] = toScreen(pt.x, pt.y);
+    if(sy < -10 || sy > H+10) continue;
+    ctx.fillStyle = zone.dust;
+    ctx.beginPath(); ctx.arc(sx, sy, pt.r, 0, Math.PI*2); ctx.fill();
+  }
+  ASC.world.plats.forEach((pl, i)=>{
+    if(pl.floor && pl.w > 600){ /* draw the grove floor as ground */
+      const [, fy] = toScreen(0, pl.y+pl.h);
+      if(fy > -20 && fy < H+40){ ctx.fillStyle = '#7BA05B'; ctx.fillRect(0, fy, W, H-fy+20);
+        ctx.fillStyle = '#B7E07A'; ctx.fillRect(0, fy, W, 5); }
+      return;
+    }
+    const [sx, sy] = toScreen(pl.x, pl.y+pl.h);
+    if(sy < -360 || sy > H+60) return;
+    ascDrawPlatform(ctx, pl, sx, sy, ascZoneFor(pl.y), i);
+  });
+  const [psx, psy] = toScreen(ASC.p.x, ASC.p.y);
+  ascDrawLemons(ctx, psx, psy, ASC.p, now);
+  if(ASC.quip && ASC.quip.t > 0){
+    ctx.globalAlpha = Math.min(1, ASC.quip.t);
+    ctx.font = '700 15px Instrument Sans, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#23241B';
+    ctx.fillText(ASC.quip.text, psx, psy - 96);
+    ctx.globalAlpha = 1;
+  }
+}
+
+/* ---------- lifecycle + input ---------- */
+function openAscent(){
+  if(ASC.open) return;
+  closeMoonScreen();
+  ASC.open = true;
+  ASC.world = ascBuildWorld();
+  const saved = store.get('lemons.ascent');
+  const validSave = saved && saved.v === ASC_C.WORLD_V && saved.p;
+  ASC.stats = (validSave && saved.stats) || {best:0, falls:0, worstFall:0};
+  ASC.p = validSave
+    ? {x:saved.p.x, y:saved.p.y, vx:0, vy:0, grounded:true, facing:1, chargeT:0, charging:false}
+    : {x:0, y:0, vx:0, vy:0, grounded:true, facing:1, chargeT:0, charging:false};
+  ASC.cam = ASC.p.y; ASC.acc = 0; ASC.quip = null;
+  ASC.anim = {landT:0, flexT:0, walkPhase:0, walking:false};
+  const touch = 'ontouchstart' in window;
+  const el = document.createElement('div');
+  el.id = 'ascmodal';
+  el.innerHTML = `
+    <canvas id="asccanvas"></canvas>
+    <div class="lctop">
+      <span class="mstitle">SOUR ASCENT<span class="dot">.</span></span>
+      <span class="asctag">The Citric Tower</span>
+      <span style="flex:1"></span>
+      <button class="linkish" id="ascreset">back to the grove</button>
+      <button class="modalclose lcclose" id="ascclose" aria-label="Close">&times;</button>
+    </div>
+    <div class="ascstats">
+      <span><b id="ascheight">0</b>m</span>
+      <span><b id="ascbest">${Math.round(ASC.stats.best/10)}</b>m best</span>
+      <span><b id="ascfalls">${ASC.stats.falls}</b> falls</span>
+      <span id="asczone">${ascZoneFor(ASC.p.y).name}</span>
+    </div>
+    <p class="lchint">${touch
+      ? 'hold \u25C0 \u25B6 to walk \u00b7 hold the lemon to charge, release to leap \u00b7 no steering mid-air'
+      : 'A/D or \u2190\u2192 to walk \u00b7 hold Space to charge (aim with A/D), release to leap \u00b7 no steering mid-air'}</p>
+    ${touch ? `<div class="ascpad">
+      <button id="ascleft" aria-label="Walk left">&#9664;</button>
+      <button id="ascjump" aria-label="Hold to charge, release to jump"><svg viewBox="0 0 24 24" width="28" height="28"><circle cx="12" cy="12" r="9" fill="var(--zest)" stroke="var(--ink)" stroke-width="2"/><path d="M12 6v12M6 12h12" stroke="var(--pith)" stroke-width="2" stroke-linecap="round"/></svg></button>
+      <button id="ascright" aria-label="Walk right">&#9654;</button>
+    </div>` : ''}`;
+  document.body.appendChild(el);
+  document.body.style.overflow = 'hidden';
+  $('#ascclose').addEventListener('click', closeAscent);
+  $('#ascreset').addEventListener('click', ()=>{
+    ASC.p = {x:0, y:0, vx:0, vy:0, grounded:true, facing:1, chargeT:0, charging:false};
+    ASC.cam = 0;
+  });
+  document.addEventListener('keydown', moonEsc);
+
+  ASC.onKeyDown = e=>{
+    if(e.code==='ArrowLeft'||e.code==='KeyA') ASC.keys.left = true;
+    if(e.code==='ArrowRight'||e.code==='KeyD') ASC.keys.right = true;
+    if((e.code==='Space'||e.code==='ArrowUp') && ASC.p.grounded && !ASC.p.charging){
+      ASC.p.charging = true; ASC.p.chargeT = 0; ascChargeSoundStart();
+    }
+    if(['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+  };
+  ASC.onKeyUp = e=>{
+    if(e.code==='ArrowLeft'||e.code==='KeyA') ASC.keys.left = false;
+    if(e.code==='ArrowRight'||e.code==='KeyD') ASC.keys.right = false;
+    if((e.code==='Space'||e.code==='ArrowUp') && ASC.p.charging){
+      ascChargeSoundStop(); ascBeep(240, 90, 0.13, 'square', 0.06); ascLaunch(ASC.p);
+    }
+  };
+  window.addEventListener('keydown', ASC.onKeyDown);
+  window.addEventListener('keyup', ASC.onKeyUp);
+
+  if(touch){
+    const hold = (id, dir)=>{
+      const b = $(id);
+      b.addEventListener('touchstart', e=>{ e.preventDefault(); ASC.touchDir = dir; }, {passive:false});
+      b.addEventListener('touchend', e=>{ e.preventDefault(); if(ASC.touchDir===dir) ASC.touchDir = 0; }, {passive:false});
+      b.addEventListener('touchcancel', ()=>{ if(ASC.touchDir===dir) ASC.touchDir = 0; });
+    };
+    hold('#ascleft', -1); hold('#ascright', 1);
+    const jb = $('#ascjump');
+    jb.addEventListener('touchstart', e=>{ e.preventDefault();
+      if(ASC.p.grounded && !ASC.p.charging){ ASC.p.charging = true; ASC.p.chargeT = 0; ascChargeSoundStart(); }
+    }, {passive:false});
+    jb.addEventListener('touchend', e=>{ e.preventDefault();
+      if(ASC.p.charging){ ascChargeSoundStop(); ascBeep(240, 90, 0.13, 'square', 0.06); ascLaunch(ASC.p); }
+    }, {passive:false});
+  }
+  ascStartLoop();
+}
+function ascStartLoop(){
+  const canvas = $('#asccanvas'), ctx = canvas.getContext('2d');
+  function resize(){ canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+  resize();
+  ASC.onResize = resize;
+  window.addEventListener('resize', resize);
+  let last = performance.now();
+  function tick(now){
+    ASC.raf = requestAnimationFrame(tick);
+    const dt = Math.min((now - last)/1000, 0.05); last = now;
+    const p = ASC.p;
+    const dir = (ASC.keys.right?1:0) - (ASC.keys.left?1:0) || ASC.touchDir;
+
+    if(p.charging){
+      p.chargeT = Math.min(ASC_C.MAX_CHARGE, p.chargeT + dt);
+      if(dir !== 0) p.facing = dir;
+      ascChargeSoundUpdate(p.chargeT/ASC_C.MAX_CHARGE);
+    }else if(p.grounded){
+      ASC.anim.walking = dir !== 0;
+      if(dir !== 0) ASC.anim.walkPhase += dt;
+      ascGroundedStep(p, ASC.world, dt, dir);
+    }
+    if(!p.grounded && !p.charging){
+      ASC.anim.walking = false;
+      ASC.acc += dt;
+      while(ASC.acc >= ASC_C.STEP){
+        ASC.acc -= ASC_C.STEP;
+        if(p.y > (p.airPeakY ?? p.y)) p.airPeakY = p.y;
+        const ev = ascPhysStep(p, ASC.world, ASC_C.STEP);
+        if(ev.bounced) ascBeep(300, 540, 0.1, 'sine', 0.05);
+        if(ev.bonked) ascBeep(140, 90, 0.07, 'sine', 0.05);
+        if(ev.landed){
+          ASC.anim.landT = 0.14;
+          const fell = Math.max(0, (p.airPeakY ?? p.y) - p.y);
+          ascBeep(fell > 350 ? 80 : 110, 55, 0.11, 'sine', fell > 350 ? 0.09 : 0.06);
+          if(fell > 350){
+            ASC.stats.falls++;
+            ASC.stats.worstFall = Math.max(ASC.stats.worstFall, fell);
+            ascSetQuip(pickLine(ASC_FALL_QUIPS, Math.floor(fell)));
+          }
+          const onSummit = ASC.world.plats.some(pl=>pl.summit && ascAabbOverlap({x:p.x-2,y:p.y-4,w:4,h:6}, {x:pl.x,y:pl.y,w:pl.w,h:pl.h+8}));
+          if(onSummit) ascSetQuip(ASC_SUMMIT_QUIP);
+          ASC.stats.best = Math.max(ASC.stats.best, p.y);
+          ascSave();
+          break;
+        }
+      }
+    }
+    if(ASC.anim.landT > 0) ASC.anim.landT -= dt;
+    if(ASC.quip) ASC.quip.t -= dt;
+    const camTarget = p.y + 110;
+    ASC.cam += (camTarget - ASC.cam) * Math.min(1, dt*4.5);
+    const zone = ascZoneFor(Math.max(0, p.y));
+    ascRender(ctx, canvas, zone, now/1000);
+    ascUpdateHUD(zone);
+  }
+  ASC.raf = requestAnimationFrame(tick);
+}
+function ascUpdateHUD(zone){
+  const h = $('#ascheight'); if(h) h.textContent = Math.max(0, Math.round(ASC.p.y/10));
+  const b = $('#ascbest'); if(b) b.textContent = Math.round(Math.max(ASC.stats.best, ASC.p.y)/10);
+  const f = $('#ascfalls'); if(f) f.textContent = ASC.stats.falls;
+  const z = $('#asczone'); if(z && z.textContent !== zone.name) z.textContent = zone.name;
+}
+function ascSave(){
+  clearTimeout(ASC.saveT);
+  ASC.saveT = setTimeout(()=>{
+    store.set('lemons.ascent', { v:ASC_C.WORLD_V, p:{x:ASC.p.x, y:ASC.p.y}, stats:ASC.stats });
+  }, 400);
+}
+function closeAscent(){
+  if(!ASC.open) return;
+  ASC.open = false;
+  cancelAnimationFrame(ASC.raf);
+  clearTimeout(ASC.saveT);
+  ascChargeSoundStop();
+  store.set('lemons.ascent', { v:ASC_C.WORLD_V, p:{x:ASC.p.x, y:ASC.p.y}, stats:ASC.stats });
+  window.removeEventListener('keydown', ASC.onKeyDown);
+  window.removeEventListener('keyup', ASC.onKeyUp);
+  window.removeEventListener('resize', ASC.onResize);
+  ASC.keys = {}; ASC.touchDir = 0;
+  const el = $('#ascmodal'); if(el) el.remove();
+  document.body.style.overflow = '';
+}
+
 /* secret-door wiring — delegation survives every re-render */
 document.addEventListener('click', e=>{
   if(e.target.closest('#moonpeek')) openMoonScreen();
   else if(e.target.closest('#moonpct')) openLemonsweeper();
   else if(e.target.closest('.sunpeek')) openSunScreen();
   else if(e.target.closest('#sunsetsecret')) openLemoncraft();
+  else if(e.target.closest('#tomorrowsecret')) openSolitaire();
+  else if(e.target.closest('#nextnewsecret')) openAscent();
 });
 
 /* ---------- boot ---------- */
