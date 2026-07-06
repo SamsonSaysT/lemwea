@@ -1269,6 +1269,34 @@ function setUnit(u){
   $('#unitC').setAttribute('aria-pressed', u==='C');
   if(state.loc && okSources().length) renderApp();
 }
+/* ---------- theme: applied before first render, persists forever ---------- */
+function themeIcon(dark){
+  /* light mode shows a crescent lemon-moon (tap → dark);
+     dark mode shows a rayed lemon-sun (tap → light) */
+  return dark
+    ? `<svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+        <g stroke="var(--rind)" stroke-width="1.8" stroke-linecap="round">
+          <path d="M12 3.2v2M12 18.8v2M3.2 12h2M18.8 12h2M5.8 5.8l1.4 1.4M16.8 16.8l1.4 1.4M18.2 5.8l-1.4 1.4M7.2 16.8l-1.4 1.4"/></g>
+        <circle cx="12" cy="12" r="4.6" fill="var(--zest)" stroke="var(--ink)" stroke-width="1.6"/></svg>`
+    : `<svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+        <circle cx="12" cy="12" r="7.5" fill="none" stroke="var(--ink)" stroke-width="1.6"/>
+        <path d="M12 4.5 A7.5 7.5 0 0 1 12 19.5 A5 7.5 0 0 0 12 4.5 Z" fill="var(--zest)"/></svg>`;
+}
+function applyTheme(t, save){
+  const dark = t === 'dark';
+  document.documentElement.dataset.theme = dark ? 'dark' : '';
+  const b = $('#themetoggle');
+  if(b){ b.innerHTML = themeIcon(dark); b.setAttribute('aria-pressed', dark); }
+  let meta = document.querySelector('meta[name="theme-color"]');
+  if(!meta){ meta = document.createElement('meta'); meta.name = 'theme-color'; document.head.appendChild(meta); }
+  meta.content = dark ? '#15150F' : '#FFFDF4';
+  if(save) store.set('lemons.theme', dark ? 'dark' : 'light');
+}
+applyTheme(store.get('lemons.theme') || 'light');
+$('#themetoggle').addEventListener('click', ()=>{
+  applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark', true);
+});
+
 $('#unitF').addEventListener('click', ()=>setUnit('F'));
 $('#unitC').addEventListener('click', ()=>setUnit('C'));
 
@@ -1339,7 +1367,7 @@ function openMoonScreen(){
       <div class="statrow moonstats">
         <div class="stat"><div class="k">Illuminated</div><div class="v" id="moonpct">${Math.round(moon.frac*100)}<small>%</small></div></div>
         <div class="stat"><div class="k">Moon age</div><div class="v">${moon.age.toFixed(1)}<small> / ${moon.synodic.toFixed(1)}d</small></div></div>
-        <div class="stat"><div class="k">Next full</div><div class="v moondate">${esc(dFmt.format(moon.nextFull))}</div></div>
+        <div class="stat"><div class="k">Next full</div><div class="v moondate" id="nextfullsecret">${esc(dFmt.format(moon.nextFull))}</div></div>
         <div class="stat"><div class="k">Next new</div><div class="v moondate" id="nextnewsecret">${esc(dFmt.format(moon.nextNew))}</div></div>
       </div>
       <div class="lemonsays moonsays"><span>Lemons says</span><p>${esc(moonFactLine(moon))}</p></div>
@@ -1350,7 +1378,7 @@ function openMoonScreen(){
   el.addEventListener('click', e=>{ if(e.target === el) closeMoonScreen(); });
   document.addEventListener('keydown', moonEsc);
 }
-function moonEsc(e){ if(e.key === 'Escape'){ closeMoonScreen(); closeSolitaire(); closeAscent(); } }
+function moonEsc(e){ if(e.key === 'Escape'){ closeMoonScreen(); closeSolitaire(); closeAscent(); closeBmx(); } }
 function closeMoonScreen(){
   const el = $('#moonmodal');
   if(el){ msStop(); el.remove(); }
@@ -2141,192 +2169,29 @@ function solRender(){
 }
 
 /* =====================================================================
-   SECRET DOOR #6: SOUR ASCENT v2 (click "Next new" in the Moon screen)
-   An original charged-jump vertical climber. Lemons — a ridiculously
-   beefy dude with a lemon for a head — scales the Citric Tower.
-   Walk while grounded. Hold to charge, release to leap. No air control.
-   Wall bounces carry your angle. No checkpoints: gravity is the save file.
-   Deterministic world (seeded) so autosaved positions are always valid.
+   SECRET DOOR #6: SOUR ASCENT v3 (click "Next new" in the Moon screen)
+   Endless bounce-climber. Lemons is always bouncing; steer him left and
+   right (tilt your phone, hold a side, or use arrow keys) onto platforms
+   and climb forever. Springs launch, brown ledges crumble, sour flies
+   want you dead unless you land on their heads. Fall off the bottom and
+   the run ends. Points = how high you got. Best score sticks around.
    ===================================================================== */
-const ASC_C = { G:1800, MAX_CHARGE:0.6, WALK:150, VY:[620,1400], VX:[210,470],
-  REST:0.55, PW:34, PH:54, STEP:1/120, WORLD_V:2 };
-const ASC = { open:false, world:null, cam:0, raf:0, keys:{}, touchDir:0,
-  p:null, stats:null, anim:{landT:0, flexT:0, walkPhase:0, t:0}, quip:null,
-  actx:undefined, chargeOsc:null, saveT:null, acc:0 };
+const JMP_C = { G:2400, BOUNCE:1120, SPRING:1800, VXMAX:440, STEER:9,
+  TILT_SENS:14, LOGICAL_W:500, DEATH_BELOW:640, STEP:1/120, PLAT_H:14 };
+const ASC = { open:false, raf:0, keys:{}, touchDir:0, gamma:null, tiltOn:false,
+  p:null, plats:[], foes:[], cam:0, genY:0, foeY:1200, dead:false,
+  score:0, best:0, anim:{landT:0}, quip:null, acc:0, rng:null, saveT:null };
 
-function ascRng(seed){ /* mulberry32 — deterministic decor & layout */
-  return function(){ seed |= 0; seed = seed + 0x6D2B79F5 | 0;
-    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
-    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
-    return ((t ^ t >>> 14) >>> 0) / 4294967296; };
-}
-
-/* ---------- zones ---------- */
+/* zone palettes cycle forever as you climb */
 const ASC_ZONES = [
-  { i:0, name:'The Lemon Grove',   y0:0,    y1:1600, skyTop:'#BFE3EE', skyBot:'#FFF6D8',
-    plat:'#8A6B33', platTop:'#B7E07A', wallC:'#6B5228', dust:'rgba(255,253,244,.7)' },
-  { i:1, name:'The Juice Factory', y0:1600, y1:3300, skyTop:'#E8D9B8', skyBot:'#FFE9C2',
-    plat:'#5C5648', platTop:'#F4CE3E', wallC:'#4A4438', dust:'rgba(35,36,27,.14)' },
-  { i:2, name:'The Pulp Caves',    y0:3300, y1:5400, skyTop:'#7A4A22', skyBot:'#C97B2E',
-    plat:'#E0972C', platTop:'#FBF0B2', wallC:'#B5651D', dust:'rgba(244,206,62,.75)' }
+  { name:'The Lemon Grove',   skyT:'#BFE3EE', skyB:'#FFF6D8', plat:'#8A6B33', platTop:'#B7E07A', dust:'rgba(255,253,244,.7)' },
+  { name:'The Juice Factory', skyT:'#E8D9B8', skyB:'#FFE9C2', plat:'#5C5648', platTop:'#F4CE3E', dust:'rgba(35,36,27,.14)' },
+  { name:'The Pulp Caves',    skyT:'#7A4A22', skyB:'#C97B2E', plat:'#E0972C', platTop:'#FBF0B2', dust:'rgba(244,206,62,.75)' },
+  { name:'The Freezer Aisle', skyT:'#274A5C', skyB:'#9FD8E8', plat:'#7FB6C9', platTop:'#FFFDF4', dust:'rgba(255,253,244,.8)' }
 ];
-function ascZoneFor(y){ return ASC_ZONES.find(z=> y>=z.y0 && y<z.y1) || ASC_ZONES[ASC_ZONES.length-1]; }
+function ascZoneFor(y){ return ASC_ZONES[Math.floor(Math.max(0,y)/1700) % ASC_ZONES.length]; }
 
-/* ---------- world: deterministic + intentional ---------- */
-function ascBuildWorld(){
-  const plats = [];
-  const P = (x,y,w,opts={})=>plats.push({x:x-w/2, y, w, h:14, ...opts});
-  const WALL = (x,y,h)=>plats.push({x:x-8, y, w:16, h, wall:true});
-
-  /* floor + tower side bounds (bouncy, keeps every fall inside the world) */
-  plats.push({x:-340, y:-20, w:680, h:20, floor:true});
-  WALL(-348, -20, 5600); WALL(348, -20, 5600);
-
-  /* --- teaching steps: authored by hand, each one demonstrates a skill --- */
-  P(   0, 240, 120);            // straight up: pure charge read
-  P( 190, 450, 104);            // angled hop
-  P( -40, 700, 190, {rest:true}); // first earned rest
-  P(-210, 930, 96);             // commit left
-  P(  40, 1160, 92);            // long diagonal
-  P( 220, 1420, 100);           // grove exit
-
-  /* --- generated climb, seeded so it is identical every single load --- */
-  const rnd = ascRng(7);
-  let x = 220, y = 1420;
-  const zoneParams = [
-    null, /* grove is hand-authored above */
-    { until:3300, dyMin:210, dyMax:330, wMin:60, wMax:78, drift:230, wallEvery:6, rests:[2350, 3140] },
-    { until:5150, dyMin:240, dyMax:360, wMin:46, wMax:60, drift:150, wallEvery:4, rests:[4050, 4900] }
-  ];
-  for(const zp of zoneParams){
-    if(!zp) continue;
-    let i = 0;
-    while(y < zp.until){
-      i++;
-      y += zp.dyMin + rnd()*(zp.dyMax - zp.dyMin);
-      x += (rnd()*2-1) * zp.drift;
-      x = Math.max(-270, Math.min(270, x));
-      const w = zp.wMin + rnd()*(zp.wMax - zp.wMin);
-      P(x, y, w);
-      if(i % zp.wallEvery === 2){
-        /* a bounce corridor: two walls flanking the route with a mid ledge */
-        const gap = 130 + rnd()*40;
-        WALL(x-gap, y+40, 300); WALL(x+gap, y+40, 300);
-        P(x + (rnd()>0.5?60:-60), y+170, 50);
-        y += 170;
-      }
-      const restY = zp.rests.find(r=> y>=r && y < r+80);
-      if(restY){ y += 120; x *= 0.4; P(x, y, 180, {rest:true}); }
-    }
-  }
-  /* --- the summit --- */
-  const topY = y + 300;
-  P(0, topY, 240, {rest:true, summit:true});
-
-  /* --- painted backdrop shapes, per zone, parallax layers --- */
-  const decor = [];
-  const drnd = ascRng(23);
-  for(const z of ASC_ZONES){
-    const span = z.y1 - z.y0;
-    if(z.i===0){ /* grove: canopy blobs + curvy trunks */
-      for(let k=0;k<26;k++) decor.push({zone:0, t:'blob', par:0.45+drnd()*0.25,
-        x:(drnd()*2-1)*560, y:z.y0+drnd()*span, r:60+drnd()*110,
-        c:`rgba(${52+drnd()*30|0},${92+drnd()*40|0},${44+drnd()*20|0},${0.5+drnd()*0.4})`});
-      for(let k=0;k<4;k++) decor.push({zone:0, t:'trunk', par:0.6,
-        x:(drnd()*2-1)*420, y:z.y0, h:span, sway:40+drnd()*70, c:'rgba(90,66,38,.55)'});
-      for(let k=0;k<12;k++) decor.push({zone:0, t:'lemon', par:0.62,
-        x:(drnd()*2-1)*480, y:z.y0+drnd()*span, r:7+drnd()*5, c:'#F4CE3E'});
-    }
-    if(z.i===1){ /* factory: pipes from the walls + vat silhouettes */
-      for(let k=0;k<12;k++){ const left = drnd()>0.5;
-        decor.push({zone:1, t:'pipe', par:0.55+drnd()*0.2, left,
-          x:left?-560:160, y:z.y0+drnd()*span, w:400+drnd()*160, h:26+drnd()*18,
-          c:`rgba(${60+drnd()*24|0},${54+drnd()*20|0},${70+drnd()*30|0},.6)`}); }
-      for(let k=0;k<5;k++) decor.push({zone:1, t:'vat', par:0.4,
-        x:(drnd()*2-1)*380, y:z.y0+drnd()*span, w:150+drnd()*120, h:220+drnd()*160,
-        c:'rgba(58,52,44,.5)'});
-      for(let k=0;k<8;k++) decor.push({zone:1, t:'lemon', par:0.6,
-        x:(drnd()*2-1)*440, y:z.y0+drnd()*span, r:6+drnd()*4, c:'#DDB32A'});
-    }
-    if(z.i===2){ /* caves: pulp membrane arcs + drips */
-      for(let k=0;k<20;k++) decor.push({zone:2, t:'membrane', par:0.45+drnd()*0.25,
-        x:(drnd()*2-1)*560, y:z.y0+drnd()*span, r:90+drnd()*160,
-        c:`rgba(${150+drnd()*60|0},${70+drnd()*40|0},${20+drnd()*20|0},${0.35+drnd()*0.3})`});
-      for(let k=0;k<10;k++) decor.push({zone:2, t:'drip', par:0.7,
-        x:(drnd()*2-1)*480, y:z.y0+drnd()*span, h:40+drnd()*90, c:'rgba(224,151,44,.5)'});
-    }
-  }
-  decor.sort((a,b)=>a.par-b.par);
-
-  /* ambient particles */
-  const parts = [];
-  const prnd = ascRng(99);
-  for(let k=0;k<36;k++) parts.push({x:(prnd()*2-1)*400, y:prnd()*5600, vy:8+prnd()*16, r:1.5+prnd()*2});
-
-  return { v:ASC_C.WORLD_V, plats, decor, parts, topY, spawn:{x:0, y:0} };
-}
-
-/* ---------- physics: pure, fixed-step, prev-position collision ---------- */
-function ascAabbOverlap(a,b){ return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y; }
-function ascRectFor(p){ return {x:p.x-ASC_C.PW/2, y:p.y, w:ASC_C.PW, h:ASC_C.PH}; }
-function ascChargeToVelocity(chargeT, facing){
-  const t = Math.max(0, Math.min(1, chargeT/ASC_C.MAX_CHARGE));
-  return { vx: facing * (ASC_C.VX[0] + (ASC_C.VX[1]-ASC_C.VX[0])*t) * (facing?1:0),
-           vy: ASC_C.VY[0] + (ASC_C.VY[1]-ASC_C.VY[0])*t };
-}
-function ascLaunch(p){
-  const {vx, vy} = ascChargeToVelocity(p.chargeT, p.facing);
-  p.vx = vx; p.vy = vy; p.grounded = false; p.charging = false; p.chargeT = 0;
-  p.airPeakY = p.y;
-}
-function ascPhysStep(p, world, dt){
-  const ev = {landed:false, bounced:false, bonked:false};
-  const prevBottom = p.y, prevTop = p.y + ASC_C.PH;
-  p.vy -= ASC_C.G*dt;
-  p.x += p.vx*dt;
-  p.y += p.vy*dt;
-  const r = ascRectFor(p);
-  for(const pl of world.plats){
-    if(!ascAabbOverlap(r, pl)) continue;
-    const platTop = pl.y + pl.h, platBottom = pl.y;
-    if(!pl.wall && p.vy <= 0 && prevBottom >= platTop - 3){
-      p.y = platTop; p.vy = 0; p.vx = 0; p.grounded = true; ev.landed = true;
-    }else if(!pl.wall && p.vy > 0 && prevTop <= platBottom + 3){
-      p.y = platBottom - ASC_C.PH; p.vy = Math.min(p.vy, 0) - 60; ev.bonked = true;
-    }else{
-      /* side hit → wall bounce; the angle carries: vy is preserved and a
-         fast horizontal impact adds a small upward kick, so hard hits climb */
-      const impact = Math.abs(p.vx);
-      p.vx = -p.vx * ASC_C.REST;
-      if(p.vy < 0) p.vy += Math.min(impact*0.12, 90);
-      p.x = p.vx > 0 ? pl.x + pl.w + ASC_C.PW/2 + 0.5 : pl.x - ASC_C.PW/2 - 0.5;
-      ev.bounced = true;
-    }
-    r.x = p.x - ASC_C.PW/2; r.y = p.y;
-  }
-  return ev;
-}
-function ascGroundedStep(p, world, dt, dir){
-  /* walking + edge detection + wall stop while grounded */
-  if(dir !== 0 && !p.charging){
-    p.facing = dir;
-    p.x += dir * ASC_C.WALK * dt;
-    const r = ascRectFor(p);
-    for(const pl of world.plats){
-      if(!ascAabbOverlap(r, pl)) continue;
-      if(pl.y + pl.h <= p.y + 2) continue; /* the thing we stand on */
-      p.x = dir > 0 ? pl.x - ASC_C.PW/2 - 0.5 : pl.x + pl.w + ASC_C.PW/2 + 0.5;
-    }
-    const foot = {x:p.x-ASC_C.PW/2+4, y:p.y-4, w:ASC_C.PW-8, h:5};
-    if(!world.plats.some(pl=>!pl.wall && ascAabbOverlap(foot, pl))){
-      p.grounded = false; p.vy = 0; p.vx = dir * ASC_C.WALK * 0.55; p.airPeakY = p.y;
-    }
-  }else if(dir !== 0 && p.charging){
-    p.facing = dir; /* aim while charging */
-  }
-}
-
-/* ---------- tiny synth (no assets) ---------- */
+/* ---------- audio (shared with CITRUS MX) ---------- */
 function ascAudio(){
   if(ASC.actx === undefined){
     try{ ASC.actx = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ ASC.actx = null; }
@@ -2346,141 +2211,165 @@ function ascBeep(f0, f1, dur, type='square', gain=0.05){
     o.start(); o.stop(a.currentTime+dur+0.02);
   }catch(e){}
 }
-function ascChargeSoundStart(){
-  const a = ascAudio(); if(!a) return;
-  try{
-    const o = a.createOscillator(), g = a.createGain();
-    o.type='sawtooth'; o.frequency.value=160;
-    g.gain.value=0.028;
-    o.connect(g).connect(a.destination); o.start();
-    ASC.chargeOsc = {o, g};
-  }catch(e){}
+
+/* ---------- world generation: pure + testable ---------- */
+function jmpRng(seed){
+  return function(){ seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296; };
 }
-function ascChargeSoundUpdate(t){ if(ASC.chargeOsc) try{ ASC.chargeOsc.o.frequency.value = 160 + 420*t; }catch(e){} }
-function ascChargeSoundStop(){
-  if(!ASC.chargeOsc) return;
-  try{ ASC.chargeOsc.g.gain.exponentialRampToValueAtTime(0.0001, ASC.actx.currentTime+0.05); ASC.chargeOsc.o.stop(ASC.actx.currentTime+0.08); }catch(e){}
-  ASC.chargeOsc = null;
+function jmpDifficulty(y){ return Math.min(1, y/9000); } /* 0 → 1 over the first 900 pts */
+function jmpMakePlat(rng, y, lastSolidY){
+  const d = jmpDifficulty(y);
+  const w = 96 - d*38;
+  const x = (rng()*2-1) * (JMP_C.LOGICAL_W/2 - w/2 - 8);
+  let type = 'n';
+  const roll = rng();
+  const mustSolid = (y - lastSolidY) > 150; /* breakables only allowed close above a solid */ /* never strand the player on crumble-only gaps */
+  if(!mustSolid){
+    if(roll < 0.06 + d*0.14) type = 'b';           /* breakable */
+    else if(roll < 0.06 + d*0.14 + d*0.22) type = 'm'; /* moving */
+  }
+  const pl = { x, y, w, type, broken:false, phase: rng()*Math.PI*2, amp: 40 + rng()*70, spd: 0.9 + rng()*0.9, cx:x };
+  pl.spring = type === 'n' && rng() < 0.08;
+  return pl;
+}
+function jmpGenerateTo(targetY){
+  while(ASC.genY < targetY){
+    const d = jmpDifficulty(ASC.genY);
+    ASC.genY += 70 + ASC.rng()*(60 + d*100);            /* single hop: 70–230px */
+    ASC.genY = Math.min(ASC.genY, (ASC.lastSolidY||0) + 235); /* never outrun the bounce (261px) */
+    const pl = jmpMakePlat(ASC.rng, ASC.genY, ASC.lastSolidY||0);
+    ASC.plats.push(pl);
+    if(pl.type !== 'b') ASC.lastSolidY = pl.y;
+    if(ASC.genY > 1100 && ASC.genY > ASC.foeY){
+      ASC.foeY = ASC.genY + 800 + ASC.rng()*900 * (1.4 - d*0.6);
+      ASC.foes.push({ x:(ASC.rng()*2-1)*(JMP_C.LOGICAL_W/2-40), y:ASC.genY + 60,
+        phase: ASC.rng()*Math.PI*2, amp: 30 + ASC.rng()*50, dead:false });
+    }
+  }
+  /* cull what's far below the camera */
+  ASC.plats = ASC.plats.filter(pl=> pl.y > ASC.cam - 1400);
+  ASC.foes = ASC.foes.filter(f=> f.y > ASC.cam - 1400);
 }
 
-/* ---------- quips ---------- */
-const ASC_FALL_QUIPS = ['MY GAINS!','totally planned that','the tower fights dirty','gravity is a hater','warm-up rep','I meant to scout down here'];
-const ASC_SUMMIT_QUIP = 'THE GOLDEN SQUEEZER IS MINE. DESTINY: JUICED.';
-function ascSetQuip(text){ ASC.quip = {text, t:1.8}; }
+/* ---------- physics: fixed step, pure enough to test ---------- */
+function jmpWrap(x){
+  const half = JMP_C.LOGICAL_W/2;
+  if(x < -half) return x + JMP_C.LOGICAL_W;
+  if(x > half) return x - JMP_C.LOGICAL_W;
+  return x;
+}
+function jmpStep(p, plats, foes, dt, now){
+  const ev = { bounced:false, spring:false, broke:false, stomped:false, died:false };
+  const prevY = p.y;
+  p.vy -= JMP_C.G*dt;
+  p.y += p.vy*dt;
+  p.x = jmpWrap(p.x + p.vx*dt);
+  /* platform bounce: only while falling, only crossing the top this step */
+  if(p.vy < 0){
+    for(const pl of plats){
+      if(pl.broken) continue;
+      const px = pl.type==='m' ? pl.cx + Math.sin(now*pl.spd + pl.phase)*pl.amp : pl.x;
+      const top = pl.y + JMP_C.PLAT_H;
+      if(prevY >= top && p.y <= top && Math.abs(p.x - px) < pl.w/2 + 14){
+        if(pl.type === 'b'){ pl.broken = true; ev.broke = true; continue; } /* crumbles, no bounce */
+        p.y = top;
+        p.vy = pl.spring ? JMP_C.SPRING : JMP_C.BOUNCE;
+        ev.bounced = true; ev.spring = pl.spring;
+        break;
+      }
+    }
+  }
+  /* sour flies: player spans feet (p.y) to head (~p.y+58 core) */
+  for(const f of foes){
+    if(f.dead) continue;
+    const fx = f.x + Math.sin(now*1.3 + f.phase)*f.amp;
+    if(Math.abs(p.x - fx) < 26 && p.y < f.y + 14 && p.y + 58 > f.y - 12){
+      if(p.vy < 0 && p.y > f.y){ f.dead = true; p.vy = JMP_C.BOUNCE*1.05; ev.stomped = true; }
+      else ev.died = true;
+    }
+  }
+  return ev;
+}
 
-/* ---------- character: Lemons, the beefiest lemon alive ---------- */
+/* ---------- Lemons, mid-flight forever ---------- */
 function ascDrawLemons(ctx, sx, sy, p, now){
-  const a = ASC.anim;
-  const chargeT = p.charging ? Math.min(1, p.chargeT/ASC_C.MAX_CHARGE) : 0;
-  const panic = !p.grounded && p.vy < -720;
-  const rising = !p.grounded && p.vy > 60;
-  const landSquash = Math.max(0, a.landT) / 0.14;
-  const crouch = chargeT*0.30;
-  const breathe = p.grounded && !p.charging ? 1 + 0.014*Math.sin(now*2.2) : 1;
-  const flexing = p.grounded && !p.charging && (now % 3.1) > 2.55;
-  const walkSwing = Math.sin(a.walkPhase*10) * (a.walking?1:0);
-  const sYs = (1 - crouch*0.6) * (landSquash>0 ? 0.82 : 1) * breathe;
-  const sXs = landSquash>0 ? 1.16 : 1;
+  const panic = p.vy < -900;
+  const rising = p.vy > 60;
+  const landSquash = Math.max(0, ASC.anim.landT) / 0.12;
+  const lean = Math.max(-1, Math.min(1, p.vx/JMP_C.VXMAX)) * 0.2;
+  const sYs = landSquash > 0 ? 0.82 : 1;
+  const sXs = landSquash > 0 ? 1.15 : 1;
   const SKIN='#E5A96B', SKIND='#C98A4E', SHORT='#4E7A3A', INK='#23241B', ZEST='#F4CE3E', SNK='#FFFDF4';
-
   ctx.save();
   ctx.translate(sx, sy);
-  if(chargeT > 0.85) ctx.translate((Math.random()-0.5)*3.2, 0);
+  ctx.rotate(lean);
   ctx.scale(p.facing||1, 1);
   ctx.scale(sXs, sYs);
-
-  /* charge aura */
-  if(p.charging && chargeT > 0.12){
-    ctx.globalAlpha = chargeT*0.4;
-    ctx.beginPath(); ctx.arc(0, -30, 24 + chargeT*14, 0, Math.PI*2);
-    ctx.fillStyle = ZEST; ctx.fill();
-    ctx.globalAlpha = 1;
-  }
-
   /* sneakers */
   ctx.fillStyle = SNK;
-  const lLeg = walkSwing*4, rLeg = -walkSwing*4;
-  ctx.fillRect(-15+lLeg, -7, 14, 7); ctx.fillRect(1+rLeg, -7, 14, 7);
+  ctx.fillRect(-15, -7, 14, 7); ctx.fillRect(1, -7, 14, 7);
   ctx.strokeStyle = INK; ctx.lineWidth = 1.6;
-  ctx.strokeRect(-15+lLeg, -7, 14, 7); ctx.strokeRect(1+rLeg, -7, 14, 7);
-  ctx.fillStyle = ZEST; ctx.fillRect(-15+lLeg, -4.5, 14, 2); ctx.fillRect(1+rLeg, -4.5, 14, 2);
-  /* legs */
+  ctx.strokeRect(-15, -7, 14, 7); ctx.strokeRect(1, -7, 14, 7);
+  ctx.fillStyle = ZEST; ctx.fillRect(-15, -4.5, 14, 2); ctx.fillRect(1, -4.5, 14, 2);
+  /* legs — tucked slightly when rising */
+  const tuck = rising ? 4 : 0;
   ctx.fillStyle = SKIN;
-  ctx.fillRect(-11+lLeg, -21, 9, 15); ctx.fillRect(2+rLeg, -21, 9, 15);
-  /* gym shorts */
+  ctx.fillRect(-11, -21+tuck, 9, 15-tuck); ctx.fillRect(2, -21+tuck, 9, 15-tuck);
+  /* shorts */
   ctx.fillStyle = SHORT;
   ctx.beginPath();
   ctx.moveTo(-14, -34); ctx.lineTo(14, -34); ctx.lineTo(16, -20); ctx.lineTo(3, -20);
   ctx.lineTo(0, -26); ctx.lineTo(-3, -20); ctx.lineTo(-16, -20); ctx.closePath(); ctx.fill();
   ctx.strokeStyle = INK; ctx.lineWidth = 1.4; ctx.stroke();
-  ctx.fillStyle = INK; ctx.fillRect(-14, -35, 28, 3); /* waistband */
-  /* torso: V-taper, shirtless, absolutely juiced */
+  ctx.fillStyle = INK; ctx.fillRect(-14, -35, 28, 3);
+  /* torso */
   ctx.fillStyle = SKIN;
   ctx.beginPath();
   ctx.moveTo(-10, -34); ctx.lineTo(-18, -56); ctx.lineTo(18, -56); ctx.lineTo(10, -34);
   ctx.closePath(); ctx.fill();
   ctx.strokeStyle = INK; ctx.lineWidth = 1.6; ctx.stroke();
-  /* pec + ab lines */
   ctx.strokeStyle = SKIND; ctx.lineWidth = 1.3;
   ctx.beginPath(); ctx.moveTo(-9,-50); ctx.lineTo(-1,-48); ctx.moveTo(9,-50); ctx.lineTo(1,-48);
-  ctx.moveTo(-4,-44); ctx.lineTo(4,-44); ctx.moveTo(-3,-39); ctx.lineTo(3,-39); ctx.stroke();
-  /* arms: huge. pose depends on state */
-  const armPose = p.charging ? 'down' : panic ? 'flail' : rising ? 'up' : flexing ? 'flex' : 'idle';
-  ctx.fillStyle = SKIN; ctx.strokeStyle = INK; ctx.lineWidth = 1.6;
-  function arm(side){ /* side: -1 left, +1 right */
-    let sh = {x:side*16, y:-53};
+  ctx.moveTo(-4,-44); ctx.lineTo(4,-44); ctx.stroke();
+  /* arms: up while rising, flail in panic, braced otherwise */
+  ctx.fillStyle = SKIN; ctx.strokeStyle = INK;
+  function arm(side){
+    const sh = {x:side*16, y:-53};
     let el, fi;
-    if(armPose==='down'){ el = {x:side*22, y:-40}; fi = {x:side*18, y:-27}; }
-    else if(armPose==='up'){ el = {x:side*23, y:-60}; fi = {x:side*17, y:-74}; }
-    else if(armPose==='flail'){ const w = Math.sin(performance.now()/60 + side); el = {x:side*(22+w*3), y:-52+w*8}; fi = {x:side*(26-w*4), y:-64+w*12}; }
-    else if(armPose==='flex'){ el = {x:side*25, y:-52}; fi = {x:side*18, y:-64}; }
-    else { el = {x:side*22, y:-46 + walkSwing*side*2}; fi = {x:side*20, y:-33 + walkSwing*side*3}; }
-    /* deltoid */
-    ctx.beginPath(); ctx.arc(sh.x, sh.y, 7.5, 0, Math.PI*2); ctx.fill(); ctx.stroke();
-    /* bicep + forearm as thick strokes */
+    if(rising){ el = {x:side*23, y:-62}; fi = {x:side*17, y:-75}; }
+    else if(panic){ const w = Math.sin(now*14 + side); el = {x:side*(22+w*3), y:-52+w*8}; fi = {x:side*(26-w*4), y:-63+w*11}; }
+    else { el = {x:side*23, y:-46}; fi = {x:side*19, y:-56}; }
+    ctx.beginPath(); ctx.arc(sh.x, sh.y, 7.5, 0, Math.PI*2); ctx.fill();
+    ctx.lineWidth = 1.4; ctx.stroke();
     ctx.lineCap = 'round';
     ctx.strokeStyle = SKIN; ctx.lineWidth = 11;
     ctx.beginPath(); ctx.moveTo(sh.x, sh.y); ctx.lineTo(el.x, el.y); ctx.stroke();
     ctx.lineWidth = 8.5;
     ctx.beginPath(); ctx.moveTo(el.x, el.y); ctx.lineTo(fi.x, fi.y); ctx.stroke();
     ctx.strokeStyle = INK; ctx.lineWidth = 1.4;
-    /* fist */
     ctx.beginPath(); ctx.arc(fi.x, fi.y, 5, 0, Math.PI*2); ctx.fillStyle = SKIN; ctx.fill(); ctx.stroke();
-    return {sh, el, fi};
+    return {sh, el};
   }
-  const armR = arm(1); const armL = arm(-1);
-  /* tattoos: lemon slice on left bicep, bolt on right forearm, flame on right bicep */
-  ctx.save();
-  const mid = (a,b)=>({x:(a.x+b.x)/2, y:(a.y+b.y)/2});
-  const tatL = mid(armL.sh, armL.el);
-  ctx.beginPath(); ctx.arc(tatL.x, tatL.y, 3.2, 0, Math.PI*2); ctx.fillStyle = ZEST; ctx.fill();
+  const aR = arm(1), aL = arm(-1);
+  /* tattoos */
+  const tat = {x:(aL.sh.x+aL.el.x)/2, y:(aL.sh.y+aL.el.y)/2};
+  ctx.beginPath(); ctx.arc(tat.x, tat.y, 3, 0, Math.PI*2); ctx.fillStyle = ZEST; ctx.fill();
   ctx.strokeStyle = INK; ctx.lineWidth = 0.9; ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(tatL.x-2.2,tatL.y); ctx.lineTo(tatL.x+2.2,tatL.y); ctx.moveTo(tatL.x,tatL.y-2.2); ctx.lineTo(tatL.x,tatL.y+2.2); ctx.stroke();
-  const tatR = mid(armR.el, armR.fi);
-  ctx.strokeStyle = '#B5651D'; ctx.lineWidth = 1.6;
-  ctx.beginPath(); ctx.moveTo(tatR.x-2,tatR.y-3); ctx.lineTo(tatR.x+1,tatR.y); ctx.lineTo(tatR.x-1,tatR.y); ctx.lineTo(tatR.x+2,tatR.y+3); ctx.stroke();
-  ctx.restore();
-  /* sweat at high charge */
-  if(chargeT > 0.55){
-    ctx.fillStyle = '#9FD8E8';
-    ctx.beginPath(); ctx.arc(-14, -66 - chargeT*4, 2, 0, Math.PI*2); ctx.fill();
-    ctx.beginPath(); ctx.arc(15, -63 - chargeT*7, 1.6, 0, Math.PI*2); ctx.fill();
-  }
-  /* the lemon head */
+  /* head */
   const hy = -66;
   ctx.beginPath(); ctx.ellipse(0, hy, 12.5, 10, 0, 0, Math.PI*2);
   ctx.fillStyle = ZEST; ctx.fill();
   ctx.strokeStyle = INK; ctx.lineWidth = 2; ctx.stroke();
-  /* nubs */
   ctx.beginPath(); ctx.ellipse(-13.5, hy, 2.6, 1.9, 0, 0, Math.PI*2); ctx.fill(); ctx.stroke();
   ctx.beginPath(); ctx.ellipse(13.5, hy, 2.6, 1.9, 0, 0, Math.PI*2); ctx.fill(); ctx.stroke();
-  /* leaf sprig */
   ctx.fillStyle = SHORT;
   ctx.beginPath(); ctx.moveTo(3, hy-9); ctx.quadraticCurveTo(9, hy-17, 16, hy-14);
   ctx.quadraticCurveTo(11, hy-9, 3, hy-9); ctx.closePath(); ctx.fill();
   ctx.strokeStyle = INK; ctx.lineWidth = 1.2; ctx.stroke();
-  /* face: determined vs panic */
-  ctx.fillStyle = INK; ctx.strokeStyle = INK;
+  ctx.fillStyle = INK;
   if(panic){
     ctx.fillStyle = '#FFFDF4';
     ctx.beginPath(); ctx.arc(2, hy-2, 3.4, 0, Math.PI*2); ctx.fill();
@@ -2490,226 +2379,204 @@ function ascDrawLemons(ctx, sx, sy, p, now){
     ctx.beginPath(); ctx.arc(9.6, hy-1.6, 1.4, 0, Math.PI*2); ctx.fill();
     ctx.beginPath(); ctx.ellipse(6, hy+4.5, 2.6, 3.4, 0, 0, Math.PI*2); ctx.fill();
   }else{
-    ctx.lineWidth = 2;
+    ctx.lineWidth = 2; ctx.strokeStyle = INK;
     ctx.beginPath(); ctx.moveTo(-1, hy-5.5); ctx.lineTo(4.5, hy-4); ctx.moveTo(11.5, hy-5.5); ctx.lineTo(6.5, hy-4); ctx.stroke();
     ctx.fillRect(1.5, hy-2.5, 2.6, 3.2); ctx.fillRect(7.5, hy-2.5, 2.6, 3.2);
     ctx.lineWidth = 1.8;
     ctx.beginPath(); ctx.moveTo(2, hy+5); ctx.lineTo(10, hy+4.4); ctx.stroke();
-    ctx.lineWidth = 0.9;
-    ctx.beginPath(); ctx.moveTo(4.6, hy+3.6); ctx.lineTo(4.7, hy+5.8); ctx.moveTo(7.3, hy+3.4); ctx.lineTo(7.4, hy+5.6); ctx.stroke();
-  }
-  /* charge meter pill beside him */
-  if(p.charging){
-    ctx.setTransform(1,0,0,1,0,0); /* meter reads upright regardless of facing */
-    ctx.translate(sx - (p.facing===1? 34 : -34), sy - 44);
-    ctx.fillStyle = 'rgba(255,253,244,.85)';
-    ctx.strokeStyle = INK; ctx.lineWidth = 1.4;
-    ctx.beginPath(); ctx.roundRect(-4, -18, 8, 36, 4); ctx.fill(); ctx.stroke();
-    const fillH = 34 * chargeT;
-    ctx.fillStyle = chargeT > 0.95 ? '#B5651D' : ZEST;
-    ctx.beginPath(); ctx.roundRect(-3, 17 - fillH, 6, fillH, 3); ctx.fill();
   }
   ctx.restore();
 }
 
-/* ---------- rendering ---------- */
-function ascDrawPlatform(ctx, pl, sx, sy, zone, idx){
-  const h = ascRng(idx*13+zone.i);
-  if(pl.wall){
-    if(zone.i===0){ /* trunk strip */
-      ctx.fillStyle = zone.wallC; ctx.fillRect(sx, sy, pl.w, pl.h);
-      ctx.strokeStyle = 'rgba(35,36,27,.35)'; ctx.lineWidth = 1.5; ctx.strokeRect(sx, sy, pl.w, pl.h);
-      ctx.strokeStyle = 'rgba(255,253,244,.15)';
-      ctx.beginPath(); ctx.moveTo(sx+5, sy+6); ctx.lineTo(sx+5, sy+pl.h-6); ctx.stroke();
-    }else if(zone.i===1){ /* vertical pipe */
-      ctx.fillStyle = '#5A5468'; ctx.fillRect(sx, sy, pl.w, pl.h);
-      ctx.fillStyle = 'rgba(255,253,244,.18)'; ctx.fillRect(sx+2, sy, 4, pl.h);
-      ctx.strokeStyle = 'rgba(35,36,27,.5)'; ctx.lineWidth = 1.5; ctx.strokeRect(sx, sy, pl.w, pl.h);
-      for(let yy = sy+18; yy < sy+pl.h-10; yy += 46){ ctx.fillStyle='rgba(35,36,27,.4)'; ctx.fillRect(sx-2, yy, pl.w+4, 5); }
-    }else{ /* springy membrane */
-      ctx.fillStyle = '#D8842A'; ctx.fillRect(sx, sy, pl.w, pl.h);
-      ctx.strokeStyle = '#FBF0B2'; ctx.lineWidth = 2.2;
-      ctx.beginPath();
-      for(let yy = sy+8; yy < sy+pl.h-4; yy += 22){ ctx.moveTo(sx+3, yy); ctx.quadraticCurveTo(sx+pl.w/2, yy+8, sx+pl.w-3, yy); }
-      ctx.stroke();
-      ctx.strokeStyle = 'rgba(35,36,27,.4)'; ctx.lineWidth = 1.5; ctx.strokeRect(sx, sy, pl.w, pl.h);
-    }
+/* ---------- render ---------- */
+function jmpDrawPlat(ctx, pl, sx, sy, zone, s){
+  const w = pl.w*s, h = JMP_C.PLAT_H*s;
+  if(pl.type === 'b'){
+    ctx.globalAlpha = pl.broken ? 0.25 : 1;
+    ctx.fillStyle = '#8A6B33';
+    ctx.fillRect(sx-w/2, sy, w, h);
+    ctx.strokeStyle = 'rgba(35,36,27,.5)'; ctx.lineWidth = 1.4;
+    ctx.strokeRect(sx-w/2, sy, w, h);
+    ctx.beginPath();
+    ctx.moveTo(sx-w*0.22, sy); ctx.lineTo(sx-w*0.1, sy+h*0.6); ctx.lineTo(sx+w*0.05, sy+h*0.3); ctx.lineTo(sx+w*0.2, sy+h);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
     return;
   }
-  /* standable platform: strong bright top edge = "you can land here" */
-  ctx.fillStyle = zone.plat; ctx.fillRect(sx, sy, pl.w, pl.h);
-  ctx.strokeStyle = 'rgba(35,36,27,.4)'; ctx.lineWidth = 1.5; ctx.strokeRect(sx, sy, pl.w, pl.h);
-  ctx.fillStyle = zone.platTop; ctx.fillRect(sx, sy, pl.w, 4);
-  if(zone.i===0){ /* leaf tufts + a hanging lemon sometimes */
-    ctx.fillStyle = '#4E7A3A';
-    for(let xx = sx+6; xx < sx+pl.w-6; xx += 16){ ctx.beginPath(); ctx.arc(xx + h()*6, sy+1, 4+h()*2, Math.PI, 0); ctx.fill(); }
-    if(h() > 0.55){ ctx.fillStyle='#F4CE3E'; ctx.beginPath(); ctx.arc(sx+pl.w-8, sy+pl.h+6, 4.5, 0, Math.PI*2); ctx.fill();
-      ctx.strokeStyle='rgba(35,36,27,.5)'; ctx.lineWidth=1; ctx.stroke();
-      ctx.beginPath(); ctx.moveTo(sx+pl.w-8, sy+pl.h); ctx.lineTo(sx+pl.w-8, sy+pl.h+2); ctx.stroke(); }
-  }else if(zone.i===1){ /* rivets + hazard nick */
-    ctx.fillStyle = 'rgba(35,36,27,.5)';
-    for(let xx = sx+6; xx < sx+pl.w-4; xx += 18) ctx.fillRect(xx, sy+8, 2.5, 2.5);
-  }else{ /* pulp drips under the ledge */
-    ctx.fillStyle = zone.plat;
-    for(let xx = sx+8; xx < sx+pl.w-6; xx += 20){ ctx.beginPath(); ctx.arc(xx+h()*8, sy+pl.h, 3+h()*3, 0, Math.PI); ctx.fill(); }
+  ctx.fillStyle = zone.plat;
+  ctx.fillRect(sx-w/2, sy, w, h);
+  ctx.strokeStyle = 'rgba(35,36,27,.4)'; ctx.lineWidth = 1.4;
+  ctx.strokeRect(sx-w/2, sy, w, h);
+  ctx.fillStyle = zone.platTop;
+  ctx.fillRect(sx-w/2, sy, w, 4*s);
+  if(pl.type === 'm'){
+    ctx.fillStyle = 'rgba(35,36,27,.55)';
+    ctx.beginPath(); ctx.moveTo(sx-w/2+5, sy+h/2); ctx.lineTo(sx-w/2+11, sy+3); ctx.lineTo(sx-w/2+11, sy+h-3); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(sx+w/2-5, sy+h/2); ctx.lineTo(sx+w/2-11, sy+3); ctx.lineTo(sx+w/2-11, sy+h-3); ctx.closePath(); ctx.fill();
   }
-  if(pl.rest){ /* a little flag marks earned rest spots */
+  if(pl.spring){
     ctx.strokeStyle = '#23241B'; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.moveTo(sx+10, sy); ctx.lineTo(sx+10, sy-18); ctx.stroke();
-    ctx.fillStyle = pl.summit ? '#DDB32A' : '#F4CE3E';
-    ctx.beginPath(); ctx.moveTo(sx+11, sy-18); ctx.lineTo(sx+26, sy-14); ctx.lineTo(sx+11, sy-10); ctx.closePath(); ctx.fill();
-  }
-  if(pl.summit){ /* THE GOLDEN SQUEEZER */
-    const cx = sx + pl.w/2;
-    ctx.fillStyle = '#DDB32A';
-    ctx.beginPath(); ctx.ellipse(cx, sy-16, 16, 12, 0, Math.PI, 0); ctx.fill();
-    ctx.strokeStyle = '#23241B'; ctx.lineWidth = 2; ctx.stroke();
     ctx.beginPath();
-    for(let a = 0.35; a < Math.PI-0.3; a += 0.5){ ctx.moveTo(cx, sy-16); ctx.lineTo(cx+Math.cos(a)*15, sy-16-Math.sin(a)*11); }
-    ctx.strokeStyle = 'rgba(35,36,27,.55)'; ctx.lineWidth = 1.3; ctx.stroke();
-    ctx.fillRect(cx-20, sy-6, 40, 4);
+    ctx.moveTo(sx-7, sy); ctx.lineTo(sx-4, sy-6); ctx.lineTo(sx, sy-2); ctx.lineTo(sx+4, sy-8); ctx.lineTo(sx+7, sy-4);
+    ctx.stroke();
+    ctx.fillStyle = '#F4CE3E';
+    ctx.fillRect(sx-9, sy-12, 18, 4);
+    ctx.strokeStyle = 'rgba(35,36,27,.6)'; ctx.lineWidth = 1.2;
+    ctx.strokeRect(sx-9, sy-12, 18, 4);
   }
 }
-function ascDrawDecor(ctx, d, sx, sy){
-  if(d.t==='blob' || d.t==='membrane'){ ctx.fillStyle = d.c; ctx.beginPath(); ctx.arc(sx, sy, d.r, 0, Math.PI*2); ctx.fill(); }
-  else if(d.t==='trunk'){ ctx.strokeStyle = d.c; ctx.lineWidth = 26; ctx.lineCap='round';
-    ctx.beginPath(); ctx.moveTo(sx, sy+400); ctx.quadraticCurveTo(sx+d.sway, sy-d.h*0.35, sx-d.sway*0.5, sy-d.h); ctx.stroke(); }
-  else if(d.t==='lemon'){ ctx.fillStyle = d.c; ctx.beginPath(); ctx.ellipse(sx, sy, d.r*1.15, d.r, 0.4, 0, Math.PI*2); ctx.fill();
-    ctx.strokeStyle='rgba(35,36,27,.3)'; ctx.lineWidth=1; ctx.stroke(); }
-  else if(d.t==='pipe'){ ctx.fillStyle = d.c; ctx.beginPath(); ctx.roundRect(sx, sy, d.w, d.h, d.h/2); ctx.fill(); }
-  else if(d.t==='vat'){ ctx.fillStyle = d.c; ctx.beginPath(); ctx.roundRect(sx-d.w/2, sy, d.w, d.h, 18); ctx.fill(); }
-  else if(d.t==='drip'){ ctx.strokeStyle = d.c; ctx.lineWidth = 7; ctx.lineCap='round';
-    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(sx, sy+d.h); ctx.stroke(); }
+function jmpDrawFoe(ctx, f, sx, sy, now){
+  const bob = Math.sin(now*5 + f.phase)*3;
+  ctx.save(); ctx.translate(sx, sy+bob);
+  const flap = Math.sin(now*22 + f.phase)*0.5;
+  ctx.fillStyle = 'rgba(244,206,62,.85)';
+  ctx.beginPath(); ctx.ellipse(-14, -6, 9, 4.5, -0.5+flap, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(14, -6, 9, 4.5, 0.5-flap, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(0, 0, 12, 10, 0, 0, Math.PI*2);
+  ctx.fillStyle = '#23241B'; ctx.fill();
+  ctx.strokeStyle = '#F4CE3E'; ctx.lineWidth = 1.6;
+  ctx.beginPath(); ctx.moveTo(-8, 3); ctx.lineTo(8, 3); ctx.stroke(); /* sour stripe */
+  ctx.fillStyle = '#FFFDF4';
+  ctx.beginPath(); ctx.arc(-4, -3, 2.8, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(4, -3, 2.8, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#23241B';
+  ctx.beginPath(); ctx.arc(-3.4, -2.6, 1.2, 0, Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(4.6, -2.6, 1.2, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
 }
-function ascRender(ctx, canvas, zone, now){
+function jmpRender(ctx, canvas, now){
   const W = canvas.width, H = canvas.height;
+  const zone = ascZoneFor(ASC.cam);
   const g = ctx.createLinearGradient(0, 0, 0, H);
-  g.addColorStop(0, zone.skyTop); g.addColorStop(1, zone.skyBot);
+  g.addColorStop(0, zone.skyT); g.addColorStop(1, zone.skyB);
   ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
-  const camX = W/2, camY = H*0.6;
-  const toScreen = (x, y) => [camX + x, camY - (y - ASC.cam)];
-  for(const d of ASC.world.decor){
-    const sy = camY - d.par*(d.y - ASC.cam);
-    if(sy < -260 || sy > H+260) continue;
-    ascDrawDecor(ctx, d, camX + d.x*0.9, sy);
+  const s = Math.min(W / JMP_C.LOGICAL_W, 1.6);
+  const camX = W/2, camY = H*0.55;
+  const toS = (x, y) => [camX + x*s, camY - (y - ASC.cam)*s];
+  /* faint zone dust */
+  ctx.fillStyle = zone.dust;
+  for(let k=0;k<14;k++){
+    const dy = ((k*473 + now*22) % 2200);
+    const [dxs, dys] = toS(((k*197)%JMP_C.LOGICAL_W)-JMP_C.LOGICAL_W/2, ASC.cam - 900 + dy);
+    if(dys>-10 && dys<H+10){ ctx.beginPath(); ctx.arc(dxs, dys, 1.6+((k*7)%3), 0, Math.PI*2); ctx.fill(); }
   }
-  for(const pt of ASC.world.parts){
-    pt.y += pt.vy/60;
-    if(pt.y > 5600) pt.y = 0;
-    const [sx, sy] = toScreen(pt.x, pt.y);
-    if(sy < -10 || sy > H+10) continue;
-    ctx.fillStyle = zone.dust;
-    ctx.beginPath(); ctx.arc(sx, sy, pt.r, 0, Math.PI*2); ctx.fill();
+  for(const pl of ASC.plats){
+    const px = pl.type==='m' ? pl.cx + Math.sin(now*pl.spd + pl.phase)*pl.amp : pl.x;
+    const [sx, sy] = toS(px, pl.y + JMP_C.PLAT_H);
+    if(sy < -30 || sy > H+30) continue;
+    jmpDrawPlat(ctx, pl, sx, sy, ascZoneFor(pl.y), s);
   }
-  ASC.world.plats.forEach((pl, i)=>{
-    if(pl.floor && pl.w > 600){ /* draw the grove floor as ground */
-      const [, fy] = toScreen(0, pl.y+pl.h);
-      if(fy > -20 && fy < H+40){ ctx.fillStyle = '#7BA05B'; ctx.fillRect(0, fy, W, H-fy+20);
-        ctx.fillStyle = '#B7E07A'; ctx.fillRect(0, fy, W, 5); }
-      return;
-    }
-    const [sx, sy] = toScreen(pl.x, pl.y+pl.h);
-    if(sy < -360 || sy > H+60) return;
-    ascDrawPlatform(ctx, pl, sx, sy, ascZoneFor(pl.y), i);
-  });
-  const [psx, psy] = toScreen(ASC.p.x, ASC.p.y);
+  for(const f of ASC.foes){
+    if(f.dead) continue;
+    const fx = f.x + Math.sin(now*1.3 + f.phase)*f.amp;
+    const [sx, sy] = toS(fx, f.y);
+    if(sy < -40 || sy > H+40) continue;
+    jmpDrawFoe(ctx, f, sx, sy, now);
+  }
+  const [psx, psy] = toS(ASC.p.x, ASC.p.y);
   ascDrawLemons(ctx, psx, psy, ASC.p, now);
   if(ASC.quip && ASC.quip.t > 0){
     ctx.globalAlpha = Math.min(1, ASC.quip.t);
-    ctx.font = '700 15px Instrument Sans, sans-serif';
-    ctx.textAlign = 'center';
+    ctx.font = '700 15px Instrument Sans, sans-serif'; ctx.textAlign = 'center';
     ctx.fillStyle = '#23241B';
-    ctx.fillText(ASC.quip.text, psx, psy - 96);
+    ctx.fillText(ASC.quip.text, psx, psy - 96*Math.min(s,1));
     ctx.globalAlpha = 1;
+  }
+  if(ASC.dead){
+    ctx.fillStyle = 'rgba(21,21,15,.55)'; ctx.fillRect(0,0,W,H);
+    ctx.textAlign = 'center'; ctx.fillStyle = '#FFFDF4';
+    ctx.font = '640 34px Fraunces, Georgia, serif';
+    ctx.fillText('SQUEEZED.', W/2, H*0.42);
+    ctx.font = '600 16px Instrument Sans, sans-serif';
+    ctx.fillText(`${ASC.score} pts \u00b7 best ${ASC.best}`, W/2, H*0.42 + 32);
+    ctx.font = '500 13px Instrument Sans, sans-serif';
+    ctx.fillStyle = 'rgba(255,253,244,.75)';
+    ctx.fillText('ontouchstart' in window ? 'tap to re-climb' : 'space to re-climb', W/2, H*0.42 + 58);
   }
 }
 
-/* ---------- lifecycle + input ---------- */
+/* ---------- lifecycle ---------- */
+const JMP_DEATH_QUIPS = ['gravity is a hater','the flies unionized','MY GAINS!','citrus has fallen'];
+function jmpReset(){
+  ASC.p = { x:0, y:40, vx:0, vy:JMP_C.BOUNCE, facing:1 };
+  ASC.plats = [{ x:0, y:0, w:170, type:'n', broken:false, spring:false, cx:0, phase:0, amp:0, spd:0 }];
+  ASC.foes = [];
+  ASC.cam = 0; ASC.genY = 0; ASC.foeY = 1200; ASC.lastSolidY = 0;
+  ASC.dead = false; ASC.score = 0; ASC.quip = null; ASC.acc = 0;
+  ASC.rng = jmpRng((Date.now() & 0xffff) | 1); /* fresh tower every run */
+  jmpGenerateTo(2400);
+}
 function openAscent(){
   if(ASC.open) return;
   closeMoonScreen();
   ASC.open = true;
-  ASC.world = ascBuildWorld();
-  const saved = store.get('lemons.ascent');
-  const validSave = saved && saved.v === ASC_C.WORLD_V && saved.p;
-  ASC.stats = (validSave && saved.stats) || {best:0, falls:0, worstFall:0};
-  ASC.p = validSave
-    ? {x:saved.p.x, y:saved.p.y, vx:0, vy:0, grounded:true, facing:1, chargeT:0, charging:false}
-    : {x:0, y:0, vx:0, vy:0, grounded:true, facing:1, chargeT:0, charging:false};
-  ASC.cam = ASC.p.y; ASC.acc = 0; ASC.quip = null;
-  ASC.anim = {landT:0, flexT:0, walkPhase:0, walking:false};
+  ASC.best = (store.get('lemons.jump')?.best) || 0;
+  jmpReset();
   const touch = 'ontouchstart' in window;
+  const needsTiltPerm = touch && typeof DeviceOrientationEvent !== 'undefined'
+    && typeof DeviceOrientationEvent.requestPermission === 'function';
   const el = document.createElement('div');
   el.id = 'ascmodal';
   el.innerHTML = `
     <canvas id="asccanvas"></canvas>
     <div class="lctop">
       <span class="mstitle">SOUR ASCENT<span class="dot">.</span></span>
-      <span class="asctag">The Citric Tower</span>
+      <span class="asctag">endless citrus bounce</span>
       <span style="flex:1"></span>
-      <button class="linkish" id="ascreset">back to the grove</button>
+      ${needsTiltPerm ? '<button class="linkish" id="asctilt">enable tilt</button>' : ''}
       <button class="modalclose lcclose" id="ascclose" aria-label="Close">&times;</button>
     </div>
     <div class="ascstats">
-      <span><b id="ascheight">0</b>m</span>
-      <span><b id="ascbest">${Math.round(ASC.stats.best/10)}</b>m best</span>
-      <span><b id="ascfalls">${ASC.stats.falls}</b> falls</span>
-      <span id="asczone">${ascZoneFor(ASC.p.y).name}</span>
+      <span><b id="ascpts">0</b> pts</span>
+      <span><b id="ascbest">${ASC.best}</b> best</span>
+      <span id="asczone">${ASC_ZONES[0].name}</span>
     </div>
     <p class="lchint">${touch
-      ? 'hold \u25C0 \u25B6 to walk \u00b7 hold the lemon to charge, release to leap \u00b7 no steering mid-air'
-      : 'A/D or \u2190\u2192 to walk \u00b7 hold Space to charge (aim with A/D), release to leap \u00b7 no steering mid-air'}</p>
-    ${touch ? `<div class="ascpad">
-      <button id="ascleft" aria-label="Walk left">&#9664;</button>
-      <button id="ascjump" aria-label="Hold to charge, release to jump"><svg viewBox="0 0 24 24" width="28" height="28"><circle cx="12" cy="12" r="9" fill="var(--zest)" stroke="var(--ink)" stroke-width="2"/><path d="M12 6v12M6 12h12" stroke="var(--pith)" stroke-width="2" stroke-linecap="round"/></svg></button>
-      <button id="ascright" aria-label="Walk right">&#9654;</button>
-    </div>` : ''}`;
+      ? (needsTiltPerm ? 'tilt to steer (tap enable tilt) \u00b7 or hold a side of the screen \u00b7 bounce on heads, dodge the rest'
+                       : 'tilt to steer \u00b7 or hold a side of the screen \u00b7 bounce on heads, dodge the rest')
+      : '\u2190\u2192 or A/D to steer \u00b7 wrap around the edges \u00b7 bounce on heads, dodge the rest'}</p>`;
   document.body.appendChild(el);
   document.body.style.overflow = 'hidden';
   $('#ascclose').addEventListener('click', closeAscent);
-  $('#ascreset').addEventListener('click', ()=>{
-    ASC.p = {x:0, y:0, vx:0, vy:0, grounded:true, facing:1, chargeT:0, charging:false};
-    ASC.cam = 0;
-  });
   document.addEventListener('keydown', moonEsc);
 
   ASC.onKeyDown = e=>{
     if(e.code==='ArrowLeft'||e.code==='KeyA') ASC.keys.left = true;
     if(e.code==='ArrowRight'||e.code==='KeyD') ASC.keys.right = true;
-    if((e.code==='Space'||e.code==='ArrowUp') && ASC.p.grounded && !ASC.p.charging){
-      ASC.p.charging = true; ASC.p.chargeT = 0; ascChargeSoundStart();
-    }
-    if(['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+    if((e.code==='Space'||e.code==='Enter') && ASC.dead) jmpReset();
+    if(['ArrowLeft','ArrowRight','Space','ArrowUp','ArrowDown'].includes(e.code)) e.preventDefault();
   };
   ASC.onKeyUp = e=>{
     if(e.code==='ArrowLeft'||e.code==='KeyA') ASC.keys.left = false;
     if(e.code==='ArrowRight'||e.code==='KeyD') ASC.keys.right = false;
-    if((e.code==='Space'||e.code==='ArrowUp') && ASC.p.charging){
-      ascChargeSoundStop(); ascBeep(240, 90, 0.13, 'square', 0.06); ascLaunch(ASC.p);
-    }
   };
   window.addEventListener('keydown', ASC.onKeyDown);
   window.addEventListener('keyup', ASC.onKeyUp);
 
+  ASC.onTilt = e=>{ if(e.gamma != null){ ASC.gamma = e.gamma; ASC.tiltOn = true; } };
   if(touch){
-    const hold = (id, dir)=>{
-      const b = $(id);
-      b.addEventListener('touchstart', e=>{ e.preventDefault(); ASC.touchDir = dir; }, {passive:false});
-      b.addEventListener('touchend', e=>{ e.preventDefault(); if(ASC.touchDir===dir) ASC.touchDir = 0; }, {passive:false});
-      b.addEventListener('touchcancel', ()=>{ if(ASC.touchDir===dir) ASC.touchDir = 0; });
-    };
-    hold('#ascleft', -1); hold('#ascright', 1);
-    const jb = $('#ascjump');
-    jb.addEventListener('touchstart', e=>{ e.preventDefault();
-      if(ASC.p.grounded && !ASC.p.charging){ ASC.p.charging = true; ASC.p.chargeT = 0; ascChargeSoundStart(); }
-    }, {passive:false});
-    jb.addEventListener('touchend', e=>{ e.preventDefault();
-      if(ASC.p.charging){ ascChargeSoundStop(); ascBeep(240, 90, 0.13, 'square', 0.06); ascLaunch(ASC.p); }
-    }, {passive:false});
+    if(needsTiltPerm){
+      $('#asctilt').addEventListener('click', ()=>{
+        DeviceOrientationEvent.requestPermission().then(res=>{
+          if(res === 'granted'){ window.addEventListener('deviceorientation', ASC.onTilt); $('#asctilt').remove(); }
+        }).catch(()=>{});
+      });
+    }else{
+      window.addEventListener('deviceorientation', ASC.onTilt);
+    }
+    /* fallback / additional: hold a side of the screen to steer, tap to restart */
+    el.addEventListener('touchstart', e=>{
+      if(e.target.closest('.lctop')) return;
+      if(ASC.dead){ jmpReset(); return; }
+      const t = e.changedTouches[0];
+      ASC.touchDir = t.clientX < window.innerWidth/2 ? -1 : 1;
+    }, {passive:true});
+    el.addEventListener('touchend', ()=>{ ASC.touchDir = 0; }, {passive:true});
+    el.addEventListener('touchcancel', ()=>{ ASC.touchDir = 0; }, {passive:true});
   }
-  ascStartLoop();
+  jmpStartLoop();
 }
-function ascStartLoop(){
+function jmpStartLoop(){
   const canvas = $('#asccanvas'), ctx = canvas.getContext('2d');
   function resize(){ canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
   resize();
@@ -2718,79 +2585,512 @@ function ascStartLoop(){
   let last = performance.now();
   function tick(now){
     ASC.raf = requestAnimationFrame(tick);
-    const dt = Math.min((now - last)/1000, 0.05); last = now;
-    const p = ASC.p;
-    const dir = (ASC.keys.right?1:0) - (ASC.keys.left?1:0) || ASC.touchDir;
+    const dt = Math.min((now-last)/1000, 0.05); last = now;
+    const t = now/1000;
+    if(!ASC.dead){
+      /* steering: tilt beats touch-hold beats keys, whichever is active */
+      let target = 0;
+      const keyDir = (ASC.keys.right?1:0) - (ASC.keys.left?1:0);
+      if(ASC.touchDir) target = ASC.touchDir * JMP_C.VXMAX;
+      else if(ASC.tiltOn && ASC.gamma != null) target = Math.max(-JMP_C.VXMAX, Math.min(JMP_C.VXMAX, ASC.gamma * JMP_C.TILT_SENS));
+      else target = keyDir * JMP_C.VXMAX;
+      if(keyDir) target = keyDir * JMP_C.VXMAX; /* desktop keys always win */
+      ASC.p.vx += (target - ASC.p.vx) * Math.min(1, dt * JMP_C.STEER);
+      if(Math.abs(ASC.p.vx) > 30) ASC.p.facing = ASC.p.vx > 0 ? 1 : -1;
 
-    if(p.charging){
-      p.chargeT = Math.min(ASC_C.MAX_CHARGE, p.chargeT + dt);
-      if(dir !== 0) p.facing = dir;
-      ascChargeSoundUpdate(p.chargeT/ASC_C.MAX_CHARGE);
-    }else if(p.grounded){
-      ASC.anim.walking = dir !== 0;
-      if(dir !== 0) ASC.anim.walkPhase += dt;
-      ascGroundedStep(p, ASC.world, dt, dir);
-    }
-    if(!p.grounded && !p.charging){
-      ASC.anim.walking = false;
       ASC.acc += dt;
-      while(ASC.acc >= ASC_C.STEP){
-        ASC.acc -= ASC_C.STEP;
-        if(p.y > (p.airPeakY ?? p.y)) p.airPeakY = p.y;
-        const ev = ascPhysStep(p, ASC.world, ASC_C.STEP);
-        if(ev.bounced) ascBeep(300, 540, 0.1, 'sine', 0.05);
-        if(ev.bonked) ascBeep(140, 90, 0.07, 'sine', 0.05);
-        if(ev.landed){
-          ASC.anim.landT = 0.14;
-          const fell = Math.max(0, (p.airPeakY ?? p.y) - p.y);
-          ascBeep(fell > 350 ? 80 : 110, 55, 0.11, 'sine', fell > 350 ? 0.09 : 0.06);
-          if(fell > 350){
-            ASC.stats.falls++;
-            ASC.stats.worstFall = Math.max(ASC.stats.worstFall, fell);
-            ascSetQuip(pickLine(ASC_FALL_QUIPS, Math.floor(fell)));
-          }
-          const onSummit = ASC.world.plats.some(pl=>pl.summit && ascAabbOverlap({x:p.x-2,y:p.y-4,w:4,h:6}, {x:pl.x,y:pl.y,w:pl.w,h:pl.h+8}));
-          if(onSummit) ascSetQuip(ASC_SUMMIT_QUIP);
-          ASC.stats.best = Math.max(ASC.stats.best, p.y);
-          ascSave();
+      while(ASC.acc >= JMP_C.STEP){
+        ASC.acc -= JMP_C.STEP;
+        const ev = jmpStep(ASC.p, ASC.plats, ASC.foes, JMP_C.STEP, t);
+        if(ev.bounced){ ASC.anim.landT = 0.12; ascBeep(ev.spring?280:170, ev.spring?720:340, ev.spring?0.16:0.09, 'sine', 0.05); }
+        if(ev.broke) ascBeep(150, 70, 0.1, 'sine', 0.05);
+        if(ev.stomped){ ascBeep(300, 560, 0.12, 'triangle', 0.06); ASC.quip = {text:'fly? denied.', t:1.1}; }
+        if(ev.died){
+          ASC.dead = true;
+          ASC.quip = null;
+          ascBeep(220, 50, 0.35, 'sawtooth', 0.08);
+          jmpSaveBest();
           break;
         }
+      }
+      /* score + camera only ever go up */
+      const pts = Math.max(0, Math.floor(ASC.p.y/10));
+      if(pts > ASC.score) ASC.score = pts;
+      if(ASC.p.y > ASC.cam) ASC.cam += (ASC.p.y - ASC.cam) * Math.min(1, dt*7);
+      jmpGenerateTo(ASC.cam + 2000);
+      /* the fall that ends it */
+      if(ASC.p.y < ASC.cam - JMP_C.DEATH_BELOW){
+        ASC.dead = true;
+        ascBeep(220, 50, 0.35, 'sawtooth', 0.08);
+        jmpSaveBest();
       }
     }
     if(ASC.anim.landT > 0) ASC.anim.landT -= dt;
     if(ASC.quip) ASC.quip.t -= dt;
-    const camTarget = p.y + 110;
-    ASC.cam += (camTarget - ASC.cam) * Math.min(1, dt*4.5);
-    const zone = ascZoneFor(Math.max(0, p.y));
-    ascRender(ctx, canvas, zone, now/1000);
-    ascUpdateHUD(zone);
+    const ps = $('#ascpts'); if(ps) ps.textContent = ASC.score;
+    const bs = $('#ascbest'); if(bs) bs.textContent = Math.max(ASC.best, ASC.score);
+    const zn = $('#asczone'); const z = ascZoneFor(ASC.cam);
+    if(zn && zn.textContent !== z.name) zn.textContent = z.name;
+    jmpRender(ctx, canvas, t);
   }
   ASC.raf = requestAnimationFrame(tick);
 }
-function ascUpdateHUD(zone){
-  const h = $('#ascheight'); if(h) h.textContent = Math.max(0, Math.round(ASC.p.y/10));
-  const b = $('#ascbest'); if(b) b.textContent = Math.round(Math.max(ASC.stats.best, ASC.p.y)/10);
-  const f = $('#ascfalls'); if(f) f.textContent = ASC.stats.falls;
-  const z = $('#asczone'); if(z && z.textContent !== zone.name) z.textContent = zone.name;
-}
-function ascSave(){
+function jmpSaveBest(){
+  ASC.best = Math.max(ASC.best, ASC.score);
   clearTimeout(ASC.saveT);
-  ASC.saveT = setTimeout(()=>{
-    store.set('lemons.ascent', { v:ASC_C.WORLD_V, p:{x:ASC.p.x, y:ASC.p.y}, stats:ASC.stats });
-  }, 400);
+  ASC.saveT = setTimeout(()=>store.set('lemons.jump', {best:ASC.best}), 200);
 }
 function closeAscent(){
   if(!ASC.open) return;
   ASC.open = false;
   cancelAnimationFrame(ASC.raf);
   clearTimeout(ASC.saveT);
-  ascChargeSoundStop();
-  store.set('lemons.ascent', { v:ASC_C.WORLD_V, p:{x:ASC.p.x, y:ASC.p.y}, stats:ASC.stats });
+  jmpSaveBest();
   window.removeEventListener('keydown', ASC.onKeyDown);
   window.removeEventListener('keyup', ASC.onKeyUp);
   window.removeEventListener('resize', ASC.onResize);
-  ASC.keys = {}; ASC.touchDir = 0;
+  window.removeEventListener('deviceorientation', ASC.onTilt);
+  ASC.keys = {}; ASC.touchDir = 0; ASC.tiltOn = false; ASC.gamma = null;
   const el = $('#ascmodal'); if(el) el.remove();
+  document.body.style.overflow = '';
+}
+
+/* =====================================================================
+   SECRET DOOR #7: CITRUS MX (click "Next full" in the Moon screen)
+   A physics BMX game. Up = gas, Down = brake/reverse, Left/Right = tilt.
+   Same beefy Lemons, now on a zest-framed BMX with lemon-slice wheels.
+   Two-wheel Verlet physics on authored terrain, six levels, best times.
+   ===================================================================== */
+const BMX_C = { G:1500, DRIVE:980, REVERSE:560, TILT:8.2, WHEEL_R:15, WB:54,
+  STEP:1/120, FRICTION:0.994, BRAKE:0.90, REST:0.14, MAXTILT:0.11 };
+const BMX = { open:false, raf:0, keys:{}, level:0, terrain:null, bike:null,
+  t0:0, time:0, crashT:0, doneT:0, dist:0, quip:null, saveT:null, acc:0 };
+
+/* ---------- levels: authored control points, y-down world ---------- */
+const BMX_LEVELS = [
+  { name:'Grove Rollers', pal:0, finish:2500, pts:[[0,420],[300,420],[560,380],[820,430],[1080,370],[1360,430],[1650,380],[1950,430],[2250,400],[2600,410],[3000,410]] },
+  { name:'The Big Ramp', pal:0, finish:2700, pts:[[0,420],[350,420],[700,400],[950,330],[1080,300],[1140,470],[1450,470],[1750,420],[2050,440],[2380,400],[2800,410],[3200,410]] },
+  { name:'Pulp Bumps', pal:2, finish:2900, pts:[[0,420],[300,420],[480,390],[620,430],[760,390],[900,430],[1040,390],[1180,430],[1320,390],[1500,440],[1750,380],[2000,440],[2250,390],[2550,430],[2950,410],[3350,410]] },
+  { name:'Juice Pipes', pal:1, finish:3000, pts:[[0,420],[320,420],[600,340],[840,460],[1100,320],[1360,470],[1650,330],[1950,460],[2250,350],[2600,430],[3050,410],[3450,410]] },
+  { name:'Fizz Gap', pal:2, finish:3100, pts:[[0,420],[380,420],[700,380],[900,320],[980,300],[1060,520],[1300,520],[1420,330],[1500,310],[1580,540],[1860,540],[2000,420],[2350,400],[2700,430],[3150,410],[3550,410]] },
+  { name:'Citric Backbone', pal:1, finish:3600, pts:[[0,420],[300,420],[560,370],[760,430],[930,330],[1010,310],[1090,500],[1330,500],[1520,400],[1700,340],[1850,460],[2050,360],[2180,330],[2260,530],[2520,530],[2700,420],[2950,380],[3250,440],[3650,410],[4050,410]] }
+];
+const BMX_PALS = [
+  { skyT:'#BFE3EE', skyB:'#FFF6D8', dirt:'#8A6B33', top:'#B7E07A', hill:'rgba(78,122,58,.35)' },
+  { skyT:'#E8D9B8', skyB:'#FFE9C2', dirt:'#5C5648', top:'#F4CE3E', hill:'rgba(74,68,56,.4)' },
+  { skyT:'#F7C98B', skyB:'#FFEFC9', dirt:'#C97B2E', top:'#FBF0B2', hill:'rgba(181,101,29,.3)' }
+];
+
+/* Catmull-Rom smoothed heightfield sampled every 8px — authored points in,
+   smooth rideable terrain out. Pure + testable. */
+function bmxBuildTerrain(level){
+  const pts = level.pts, step = 8;
+  const maxX = pts[pts.length-1][0];
+  const hs = [];
+  const cr = (p0,p1,p2,p3,t)=> 0.5*((2*p1) + (-p0+p2)*t + (2*p0-5*p1+4*p2-p3)*t*t + (-p0+3*p1-3*p2+p3)*t*t*t);
+  let seg = 0;
+  for(let x=0; x<=maxX; x+=step){
+    while(seg < pts.length-2 && x > pts[seg+1][0]) seg++;
+    const p1 = pts[seg], p2 = pts[Math.min(seg+1, pts.length-1)];
+    const p0 = pts[Math.max(seg-1, 0)], p3 = pts[Math.min(seg+2, pts.length-1)];
+    const t = (x - p1[0]) / Math.max(1, p2[0]-p1[0]);
+    hs.push(cr(p0[1], p1[1], p2[1], p3[1], Math.max(0, Math.min(1, t))));
+  }
+  return { hs, step, maxX, finish: level.finish, name: level.name, pal: BMX_PALS[level.pal] };
+}
+function bmxHeightAt(ter, x){
+  const fx = Math.max(0, Math.min(ter.maxX-1, x)) / ter.step;
+  const i = Math.floor(fx), f = fx - i;
+  const a = ter.hs[i], b = ter.hs[Math.min(i+1, ter.hs.length-1)];
+  return a + (b-a)*f;
+}
+function bmxNormalAt(ter, x){
+  const d = 6;
+  const dy = bmxHeightAt(ter, x+d) - bmxHeightAt(ter, x-d);
+  const len = Math.hypot(2*d, dy);
+  /* y-down: surface tangent (2d, dy); normal points up-out of ground */
+  return { tx:2*d/len, ty:dy/len, nx:dy/len, ny:-2*d/len };
+}
+
+/* ---------- bike: two Verlet wheels + rigid rod ---------- */
+function bmxSpawnBike(ter){
+  const x = 80, y = bmxHeightAt(ter, x) - BMX_C.WHEEL_R - 1;
+  return {
+    w:[{x:x, y:y, px:x, py:y, contact:false, spin:0},
+       (()=>{ const fy = bmxHeightAt(ter, x+BMX_C.WB)-BMX_C.WHEEL_R-1; return {x:x+BMX_C.WB, y:fy, px:x+BMX_C.WB, py:fy, contact:false, spin:0}; })()]
+  };
+}
+function bmxStep(bike, ter, input, dt){
+  const ev = {crashed:false, finished:false};
+  const [r, f] = bike.w;
+  /* integrate (Verlet) */
+  for(const w of bike.w){
+    const vx = (w.x - w.px) * BMX_C.FRICTION, vy = (w.y - w.py) * BMX_C.FRICTION;
+    w.px = w.x; w.py = w.y;
+    w.x += vx; w.y += vy + BMX_C.G*dt*dt;
+  }
+  /* tilt: perpendicular push on the two wheels in opposite directions */
+  if(input.left || input.right){
+    const dx = f.x - r.x, dy = f.y - r.y, len = Math.hypot(dx, dy) || 1;
+    const px = -dy/len, py = dx/len;
+    const s = (input.left ? -1 : 1) * BMX_C.TILT * dt;
+    r.x += px*s; r.y += py*s;
+    f.x -= px*s; f.y -= py*s;
+  }
+  /* solve rod + ground a few times, interleaved for stability */
+  for(let it=0; it<3; it++){
+    /* rod constraint */
+    let dx = f.x - r.x, dy = f.y - r.y;
+    const dist = Math.hypot(dx, dy) || 1;
+    const corr = (dist - BMX_C.WB) / dist / 2;
+    r.x += dx*corr; r.y += dy*corr;
+    f.x -= dx*corr; f.y -= dy*corr;
+    /* ground collision per wheel */
+    for(const w of bike.w){
+      w.contact = false;
+      const gy = bmxHeightAt(ter, w.x);
+      if(w.y + BMX_C.WHEEL_R > gy){
+        const n = bmxNormalAt(ter, w.x);
+        const pen = w.y + BMX_C.WHEEL_R - gy;
+        w.x += n.nx * pen * 0.6;
+        w.y += n.ny * pen;
+        w.contact = true;
+        /* velocity response: kill most normal velocity, keep tangential */
+        let vx = w.x - w.px, vy = w.y - w.py;
+        const vn = vx*n.nx + vy*n.ny, vt = vx*n.tx + vy*n.ty;
+        const newVn = -vn * BMX_C.REST;
+        let newVt = vt;
+        if(input.down) newVt *= BMX_C.BRAKE;
+        vx = n.nx*newVn + n.tx*newVt;
+        vy = n.ny*newVn + n.ty*newVt;
+        w.px = w.x - vx; w.py = w.y - vy;
+      }
+    }
+  }
+  /* drive: gas pushes contacting wheels along the surface toward the front */
+  const dirX = f.x - r.x, dirY = f.y - r.y;
+  if(input.up || input.down){
+    for(const w of bike.w){
+      if(!w.contact) continue;
+      const n = bmxNormalAt(ter, w.x);
+      const sign = (dirX*n.tx + dirY*n.ty) >= 0 ? 1 : -1;
+      const a = input.up ? BMX_C.DRIVE : -BMX_C.REVERSE;
+      w.x += n.tx * sign * a * dt * dt;
+      w.y += n.ty * sign * a * dt * dt;
+    }
+  }
+  /* wheel spin (visual) from tangential travel */
+  for(const w of bike.w) w.spin += ((w.x - w.px)) / BMX_C.WHEEL_R;
+  /* crash: rider head below the surface */
+  const head = bmxHeadPos(bike);
+  if(head.y > bmxHeightAt(ter, head.x) + 2) ev.crashed = true;
+  /* finish: both wheels past the flag */
+  if(r.x > ter.finish && f.x > ter.finish) ev.finished = true;
+  return ev;
+}
+function bmxHeadPos(bike){
+  const [r, f] = bike.w;
+  const mx = (r.x+f.x)/2, my = (r.y+f.y)/2;
+  const dx = f.x-r.x, dy = f.y-r.y, len = Math.hypot(dx,dy)||1;
+  /* perpendicular "up" from the bike (y-down world → up is -normal) */
+  return { x: mx - (-dy/len)*46, y: my - (dx/len)*46 };
+}
+
+/* ---------- drawing ---------- */
+function bmxDrawWheel(ctx, w){
+  ctx.save();
+  ctx.translate(w.x, w.y);
+  ctx.rotate(w.spin);
+  ctx.beginPath(); ctx.arc(0, 0, BMX_C.WHEEL_R, 0, Math.PI*2);
+  ctx.fillStyle = '#F4CE3E'; ctx.fill();
+  ctx.lineWidth = 2.4; ctx.strokeStyle = '#23241B'; ctx.stroke();
+  ctx.beginPath(); ctx.arc(0, 0, BMX_C.WHEEL_R-4.5, 0, Math.PI*2);
+  ctx.fillStyle = '#FFFDF4'; ctx.fill();
+  ctx.strokeStyle = '#F4CE3E'; ctx.lineWidth = 2; ctx.lineCap = 'round';
+  ctx.beginPath();
+  for(let k=0;k<4;k++){ const a = k*Math.PI/4;
+    ctx.moveTo(Math.cos(a)*(BMX_C.WHEEL_R-5), Math.sin(a)*(BMX_C.WHEEL_R-5));
+    ctx.lineTo(-Math.cos(a)*(BMX_C.WHEEL_R-5), -Math.sin(a)*(BMX_C.WHEEL_R-5)); }
+  ctx.stroke();
+  ctx.restore();
+}
+function bmxDrawRig(ctx, bike, crashed, now){
+  const [r, f] = bike.w;
+  const dx = f.x-r.x, dy = f.y-r.y, len = Math.hypot(dx,dy)||1;
+  const ux = dx/len, uy = dy/len;         /* along bike, rear→front */
+  const px = -uy, py = ux;                /* bike-down (y-down world) */
+  const at = (a,b)=>({x: r.x + ux*a - px*b, y: r.y + uy*a - py*b}); /* a along, b up */
+  const crank = at(24, 4), seatTop = at(14, 26), barTop = at(50, 30);
+  const INK='#23241B', ZEST='#F4CE3E', RIND='#DDB32A', SKIN='#E5A96B', SHORT='#4E7A3A';
+  /* frame */
+  ctx.strokeStyle = RIND; ctx.lineWidth = 4.6; ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(r.x, r.y); ctx.lineTo(crank.x, crank.y);
+  ctx.lineTo(f.x, f.y);
+  ctx.moveTo(crank.x, crank.y); ctx.lineTo(seatTop.x, seatTop.y);
+  ctx.moveTo(seatTop.x, seatTop.y); ctx.lineTo(r.x, r.y);
+  ctx.moveTo(f.x, f.y); ctx.lineTo(barTop.x, barTop.y);
+  ctx.stroke();
+  ctx.strokeStyle = INK; ctx.lineWidth = 1.4;
+  /* seat + handlebar */
+  ctx.strokeStyle = INK; ctx.lineWidth = 5; 
+  ctx.beginPath(); ctx.moveTo(seatTop.x - ux*7, seatTop.y - uy*7); ctx.lineTo(seatTop.x + ux*7, seatTop.y + uy*7); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(barTop.x - ux*5, barTop.y - uy*5); ctx.lineTo(barTop.x + ux*6, barTop.y + uy*6); ctx.stroke();
+  /* rider: seated Lemons — hips on the seat, hands on the bars */
+  const hip = at(15, 30), shoulder = at(26, 52), knee = at(30, 16);
+  const headC = at(30, 64);
+  /* legs to crank */
+  ctx.strokeStyle = SKIN; ctx.lineWidth = 7.5; ctx.lineCap='round';
+  const pedalA = bike.w[0].spin*0.9;
+  const pedal = {x:crank.x + Math.cos(pedalA)*8, y:crank.y + Math.sin(pedalA)*8};
+  ctx.beginPath(); ctx.moveTo(hip.x, hip.y); ctx.lineTo(knee.x, knee.y); ctx.lineTo(pedal.x, pedal.y); ctx.stroke();
+  /* shorts */
+  ctx.strokeStyle = SHORT; ctx.lineWidth = 10;
+  ctx.beginPath(); ctx.moveTo(hip.x, hip.y); ctx.lineTo((hip.x+knee.x)/2, (hip.y+knee.y)/2); ctx.stroke();
+  /* torso (leaning forward) */
+  ctx.strokeStyle = SKIN; ctx.lineWidth = 12;
+  ctx.beginPath(); ctx.moveTo(hip.x, hip.y); ctx.lineTo(shoulder.x, shoulder.y); ctx.stroke();
+  /* huge arm to the bars */
+  ctx.lineWidth = 9;
+  ctx.beginPath(); ctx.moveTo(shoulder.x, shoulder.y); ctx.lineTo(barTop.x, barTop.y); ctx.stroke();
+  ctx.beginPath(); ctx.arc(shoulder.x, shoulder.y, 6.5, 0, Math.PI*2); ctx.fillStyle=SKIN; ctx.fill();
+  ctx.strokeStyle=INK; ctx.lineWidth=1.2; ctx.stroke();
+  /* bicep tattoo */
+  const tat = {x:(shoulder.x+barTop.x)/2 - ux*6, y:(shoulder.y+barTop.y)/2 - uy*6};
+  ctx.beginPath(); ctx.arc(tat.x, tat.y, 2.8, 0, Math.PI*2); ctx.fillStyle=ZEST; ctx.fill();
+  ctx.strokeStyle=INK; ctx.lineWidth=0.8; ctx.stroke();
+  /* lemon head */
+  const ha = Math.atan2(uy, ux);
+  ctx.save(); ctx.translate(headC.x, headC.y); ctx.rotate(ha);
+  ctx.beginPath(); ctx.ellipse(0, 0, 11.5, 9.2, 0, 0, Math.PI*2);
+  ctx.fillStyle = ZEST; ctx.fill(); ctx.strokeStyle = INK; ctx.lineWidth = 2; ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(12.5, 0, 2.4, 1.7, 0, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.ellipse(-12.5, 0, 2.4, 1.7, 0, 0, Math.PI*2); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = SHORT;
+  ctx.beginPath(); ctx.moveTo(-2, -8); ctx.quadraticCurveTo(3, -15, 10, -13);
+  ctx.quadraticCurveTo(5, -8, -2, -8); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle=INK; ctx.lineWidth=1.1; ctx.stroke();
+  ctx.fillStyle = INK;
+  if(crashed){
+    ctx.strokeStyle = INK; ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.moveTo(2,-3); ctx.lineTo(6,1); ctx.moveTo(6,-3); ctx.lineTo(2,1);
+    ctx.moveTo(8,-3); ctx.lineTo(11,0); ctx.moveTo(11,-3); ctx.lineTo(8,0); ctx.stroke();
+    ctx.beginPath(); ctx.ellipse(6, 4.5, 2.2, 2.8, 0, 0, Math.PI*2); ctx.fill();
+  }else{
+    ctx.lineWidth = 1.8; ctx.strokeStyle = INK;
+    ctx.beginPath(); ctx.moveTo(1,-4.5); ctx.lineTo(5.5,-3.2); ctx.stroke();
+    ctx.fillRect(3, -1.8, 2.4, 2.8); ctx.fillRect(8, -1.8, 2.4, 2.8);
+    ctx.beginPath(); ctx.moveTo(3.5, 4.4); ctx.lineTo(10, 3.8); ctx.stroke();
+  }
+  ctx.restore();
+  bmxDrawWheel(ctx, r); bmxDrawWheel(ctx, f);
+}
+function bmxRender(ctx, canvas, now){
+  const W = canvas.width, H = canvas.height;
+  const ter = BMX.terrain, pal = ter.pal;
+  const [r, f] = BMX.bike.w;
+  const bx = (r.x+f.x)/2, by = (r.y+f.y)/2;
+  const camX = Math.max(0, Math.min(bx - W*0.38, ter.maxX - W + 40));
+  const camY = by - H*0.55;
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, pal.skyT); g.addColorStop(1, pal.skyB);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  /* lemon sun + parallax hills */
+  ctx.beginPath(); ctx.arc(W*0.78 - camX*0.05, 90 - camY*0.05, 34, 0, Math.PI*2);
+  ctx.fillStyle = '#F4CE3E'; ctx.fill(); ctx.strokeStyle='#23241B'; ctx.lineWidth=2.4; ctx.stroke();
+  ctx.fillStyle = pal.hill;
+  for(let k=0;k<4;k++){
+    const hx = ((k*730 - camX*0.3) % (W+800)) - 400;
+    ctx.beginPath(); ctx.arc(hx, H*0.9 - camY*0.25, 240+k*40, Math.PI, 0); ctx.fill();
+  }
+  /* terrain */
+  ctx.beginPath();
+  const x0 = Math.max(0, Math.floor(camX/ter.step)-2), x1 = Math.min(ter.hs.length-1, Math.ceil((camX+W)/ter.step)+2);
+  ctx.moveTo(x0*ter.step - camX, ter.hs[x0] - camY);
+  for(let i=x0+1; i<=x1; i++) ctx.lineTo(i*ter.step - camX, ter.hs[i] - camY);
+  ctx.lineTo(x1*ter.step - camX, H+40); ctx.lineTo(x0*ter.step - camX, H+40);
+  ctx.closePath();
+  ctx.fillStyle = pal.dirt; ctx.fill();
+  ctx.strokeStyle = pal.top; ctx.lineWidth = 5; ctx.lineCap='round';
+  ctx.beginPath();
+  ctx.moveTo(x0*ter.step - camX, ter.hs[x0] - camY);
+  for(let i=x0+1; i<=x1; i++) ctx.lineTo(i*ter.step - camX, ter.hs[i] - camY);
+  ctx.stroke();
+  /* finish flag */
+  const fgx = ter.finish - camX, fgy = bmxHeightAt(ter, ter.finish) - camY;
+  if(fgx > -40 && fgx < W+40){
+    ctx.strokeStyle = '#23241B'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(fgx, fgy); ctx.lineTo(fgx, fgy-56); ctx.stroke();
+    ctx.fillStyle = '#F4CE3E';
+    ctx.beginPath(); ctx.moveTo(fgx+2, fgy-56); ctx.lineTo(fgx+30, fgy-48); ctx.lineTo(fgx+2, fgy-40); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = 'rgba(35,36,27,.6)'; ctx.lineWidth = 1.2; ctx.stroke();
+  }
+  ctx.save(); ctx.translate(-camX, -camY);
+  bmxDrawRig(ctx, BMX.bike, BMX.crashT > 0, now);
+  ctx.restore();
+  /* quip */
+  if(BMX.quip && BMX.quip.t > 0){
+    ctx.globalAlpha = Math.min(1, BMX.quip.t);
+    ctx.font = '700 16px Instrument Sans, sans-serif'; ctx.textAlign = 'center';
+    ctx.fillStyle = '#23241B';
+    ctx.fillText(BMX.quip.text, bx - camX, by - camY - 92);
+    ctx.globalAlpha = 1;
+  }
+}
+
+/* ---------- lifecycle ---------- */
+const BMX_CRASH_QUIPS = ['face, meet grove','the helmet was cosmetic anyway','citrus down. citrus down.','physics remains undefeated','sponsors, look away'];
+function bmxLoadLevel(i){
+  BMX.level = Math.max(0, Math.min(BMX_LEVELS.length-1, i));
+  BMX.terrain = bmxBuildTerrain(BMX_LEVELS[BMX.level]);
+  BMX.bike = bmxSpawnBike(BMX.terrain);
+  BMX.t0 = performance.now(); BMX.time = 0; BMX.crashT = 0; BMX.doneT = 0; BMX.quip = null;
+  const lv = $('#bmxlevel'); if(lv) lv.textContent = `${BMX.level+1}/${BMX_LEVELS.length} \u00b7 ${BMX_LEVELS[BMX.level].name}`;
+  const bt = $('#bmxbest'); if(bt){
+    const best = (store.get('lemons.bmx')?.best||{})[BMX.level];
+    bt.textContent = best ? (best/1000).toFixed(1)+'s best' : '\u2014';
+  }
+}
+function openBmx(){
+  if(BMX.open) return;
+  closeMoonScreen();
+  BMX.open = true;
+  const saved = store.get('lemons.bmx');
+  const startLevel = saved?.level || 0;
+  const touch = 'ontouchstart' in window;
+  const el = document.createElement('div');
+  el.id = 'bmxmodal';
+  el.innerHTML = `
+    <canvas id="bmxcanvas"></canvas>
+    <div class="lctop">
+      <span class="mstitle">CITRUS MX<span class="dot">.</span></span>
+      <span class="asctag" id="bmxlevel"></span>
+      <span style="flex:1"></span>
+      <button class="linkish" id="bmxretry">retry</button>
+      <button class="modalclose lcclose" id="bmxclose" aria-label="Close">&times;</button>
+    </div>
+    <div class="ascstats">
+      <span><b id="bmxtime">0.0</b>s</span>
+      <span id="bmxbest">\u2014</span>
+    </div>
+    <p class="lchint">${touch
+      ? 'right side: gas / brake \u00b7 left side: tilt \u00b7 land on the wheels, not the head'
+      : '\u2191 gas \u00b7 \u2193 brake/reverse \u00b7 \u2190\u2192 tilt \u00b7 R retry \u00b7 land on the wheels, not the head'}</p>
+    ${touch ? `<div class="bmxpad bmxpad-l">
+      <button id="bmxtl" aria-label="Tilt left">&#8634;</button>
+      <button id="bmxtr" aria-label="Tilt right">&#8635;</button>
+    </div>
+    <div class="bmxpad bmxpad-r">
+      <button id="bmxbrake" aria-label="Brake">&#9660;</button>
+      <button id="bmxgas" aria-label="Gas">&#9650;</button>
+    </div>` : ''}`;
+  document.body.appendChild(el);
+  document.body.style.overflow = 'hidden';
+  $('#bmxclose').addEventListener('click', closeBmx);
+  $('#bmxretry').addEventListener('click', ()=>bmxLoadLevel(BMX.level));
+  document.addEventListener('keydown', moonEsc);
+
+  BMX.onKeyDown = e=>{
+    if(e.code==='ArrowUp'||e.code==='KeyW') BMX.keys.up = true;
+    if(e.code==='ArrowDown'||e.code==='KeyS') BMX.keys.down = true;
+    if(e.code==='ArrowLeft'||e.code==='KeyA') BMX.keys.left = true;
+    if(e.code==='ArrowRight'||e.code==='KeyD') BMX.keys.right = true;
+    if(e.code==='KeyR') bmxLoadLevel(BMX.level);
+    if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+  };
+  BMX.onKeyUp = e=>{
+    if(e.code==='ArrowUp'||e.code==='KeyW') BMX.keys.up = false;
+    if(e.code==='ArrowDown'||e.code==='KeyS') BMX.keys.down = false;
+    if(e.code==='ArrowLeft'||e.code==='KeyA') BMX.keys.left = false;
+    if(e.code==='ArrowRight'||e.code==='KeyD') BMX.keys.right = false;
+  };
+  window.addEventListener('keydown', BMX.onKeyDown);
+  window.addEventListener('keyup', BMX.onKeyUp);
+  if(touch){
+    const hold = (id, key)=>{
+      const b = $(id);
+      b.addEventListener('touchstart', e=>{ e.preventDefault(); BMX.keys[key] = true; }, {passive:false});
+      b.addEventListener('touchend', e=>{ e.preventDefault(); BMX.keys[key] = false; }, {passive:false});
+      b.addEventListener('touchcancel', ()=>{ BMX.keys[key] = false; });
+    };
+    hold('#bmxgas','up'); hold('#bmxbrake','down'); hold('#bmxtl','left'); hold('#bmxtr','right');
+  }
+  bmxLoadLevel(startLevel);
+  bmxStartLoop();
+}
+function bmxStartLoop(){
+  const canvas = $('#bmxcanvas'), ctx = canvas.getContext('2d');
+  function resize(){ canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+  resize();
+  BMX.onResize = resize;
+  window.addEventListener('resize', resize);
+  let last = performance.now();
+  function tick(now){
+    BMX.raf = requestAnimationFrame(tick);
+    const dt = Math.min((now-last)/1000, 0.05); last = now;
+    if(BMX.crashT > 0){
+      BMX.crashT -= dt;
+      if(BMX.crashT <= 0) bmxLoadLevel(BMX.level);
+    }else if(BMX.doneT > 0){
+      BMX.doneT -= dt;
+      if(BMX.doneT <= 0){
+        if(BMX.level < BMX_LEVELS.length-1) bmxLoadLevel(BMX.level+1);
+        else { bmxLoadLevel(0); BMX.quip = {text:'FULL SEND COMPLETE. TOUR RESTARTS.', t:2.2}; }
+        bmxSaveProgress();
+      }
+    }else{
+      BMX.time = now - BMX.t0;
+      BMX.acc += dt;
+      while(BMX.acc >= BMX_C.STEP){
+        BMX.acc -= BMX_C.STEP;
+        const ev = bmxStep(BMX.bike, BMX.terrain, BMX.keys, BMX_C.STEP);
+        if(ev.crashed){
+          BMX.crashT = 1.0;
+          BMX.quip = {text: pickLine(BMX_CRASH_QUIPS, Math.floor(now)), t:1.4};
+          ascBeep(120, 55, 0.16, 'sine', 0.09);
+          break;
+        }
+        if(ev.finished){
+          BMX.doneT = 1.4;
+          const secs = BMX.time;
+          const data = store.get('lemons.bmx') || {level:0, best:{}};
+          data.best = data.best || {};
+          if(!data.best[BMX.level] || secs < data.best[BMX.level]) data.best[BMX.level] = Math.round(secs);
+          data.level = Math.min(BMX.level+1, BMX_LEVELS.length-1);
+          store.set('lemons.bmx', data);
+          BMX.quip = {text:`CLEARED IN ${(secs/1000).toFixed(1)}s. EASY SQUEEZE.`, t:1.6};
+          ascBeep(320, 640, 0.22, 'triangle', 0.07);
+          break;
+        }
+      }
+    }
+    if(BMX.quip) BMX.quip.t -= dt;
+    const t = $('#bmxtime'); if(t) t.textContent = (BMX.time/1000).toFixed(1);
+    bmxRender(ctx, canvas, now/1000);
+  }
+  BMX.raf = requestAnimationFrame(tick);
+}
+function bmxSaveProgress(){
+  clearTimeout(BMX.saveT);
+  BMX.saveT = setTimeout(()=>{
+    const data = store.get('lemons.bmx') || {best:{}};
+    data.level = BMX.level;
+    store.set('lemons.bmx', data);
+  }, 300);
+}
+function closeBmx(){
+  if(!BMX.open) return;
+  BMX.open = false;
+  cancelAnimationFrame(BMX.raf);
+  clearTimeout(BMX.saveT);
+  const data = store.get('lemons.bmx') || {best:{}};
+  data.level = BMX.level;
+  store.set('lemons.bmx', data);
+  window.removeEventListener('keydown', BMX.onKeyDown);
+  window.removeEventListener('keyup', BMX.onKeyUp);
+  window.removeEventListener('resize', BMX.onResize);
+  BMX.keys = {};
+  const el = $('#bmxmodal'); if(el) el.remove();
   document.body.style.overflow = '';
 }
 
@@ -2802,6 +3102,7 @@ document.addEventListener('click', e=>{
   else if(e.target.closest('#sunsetsecret')) openLemoncraft();
   else if(e.target.closest('#tomorrowsecret')) openSolitaire();
   else if(e.target.closest('#nextnewsecret')) openAscent();
+  else if(e.target.closest('#nextfullsecret')) openBmx();
 });
 
 /* ---------- boot ---------- */
