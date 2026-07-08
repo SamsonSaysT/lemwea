@@ -916,6 +916,7 @@ function renderApp(){
           <input class="scrub" id="radarscrub" type="range" min="0" max="0" value="0" aria-label="Radar frame">
           <span class="frametime" id="radartime">—</span>
         </div>
+        <p class="radarnote" id="radaroutlook"></p>
         <p class="radarnote">Past two hours of precipitation plus a short nowcast. Tiles by RainViewer.</p>
         <p class="mapcredit">Basemap © OpenStreetMap/CARTO · radar © RainViewer</p>
       </div>
@@ -1126,12 +1127,12 @@ function renderAir(){
         </div>
       </div>
 
-      <div class="airsection">
+      ${topPollen.length ? `<div class="airsection">
         <h3>Pollen count</h3>
         <div class="airrows">
-          ${topPollen.length ? topPollen.map(([name,val])=>`<div class="airrowline"><span>${esc(name)}</span><b>${esc(pollenLabel(val))}</b><small>${Math.round(val)} grains/m³</small></div>`).join('') : '<p class="airnone">No pollen data for this spot right now.</p>'}
+          ${topPollen.map(([name,val])=>`<div class="airrowline"><span>${esc(name)}</span><b>${esc(pollenLabel(val))}</b><small>${Math.round(val)} grains/m³</small></div>`).join('')}
         </div>
-      </div>
+      </div>` : ''}
 
       <div class="airsection">
         <h3>Air through the day</h3>
@@ -1140,7 +1141,7 @@ function renderAir(){
         </div>
       </div>
 
-      <p class="blendnote">AQI and pollen use the Open-Meteo air-quality feed. Pollen can be patchy by region, so treat it as a clean heads-up, not a medical-grade read.</p>
+      <p class="blendnote">${topPollen.length ? 'AQI and pollen use the Open-Meteo air-quality feed. Pollen can be patchy by region, so treat it as a clean heads-up, not a medical-grade read.' : 'Air quality from the Open-Meteo air-quality feed.'}</p>
     </div>`;
 }
 
@@ -1213,8 +1214,34 @@ function initRadar(){
     $('#radarplay').addEventListener('click', ()=> radar.playing ? stopRadar() : playRadar());
     $('#modeRain').addEventListener('click', ()=>setMode('rain'));
     $('#modeSat').addEventListener('click', ()=>setMode('sat'));
+    /* RainViewer's satellite layer only covers parts of the world — if there
+       are no frames here, don't show a toggle to an empty map */
+    if(!radar.sets.sat.frames.length){
+      const mt = document.querySelector('.modetoggle'); if(mt) mt.remove();
+    }
     setMode('rain');
   }).catch(()=>{ $('#radartime').textContent = 'radar offline'; });
+
+  /* rain outlook: Open-Meteo 15-minute nowcast — "rain around 4:15" under the map */
+  fetchJSON(`https://api.open-meteo.com/v1/forecast?latitude=${state.loc.lat}&longitude=${state.loc.lon}&minutely_15=precipitation&forecast_minutely_15=24&timezone=auto`)
+    .then(d=>{
+      const el = $('#radaroutlook'); if(!el) return;
+      const times = d.minutely_15?.time || [], vals = d.minutely_15?.precipitation || [];
+      const nowMs = Date.now();
+      let firstRain = null, rainingNow = false;
+      for(let i=0;i<times.length;i++){
+        const t = Date.parse(times[i]);
+        if(t + 15*60000 < nowMs) continue;
+        if(vals[i] != null && vals[i] > 0.1){
+          if(t <= nowMs){ rainingNow = true; break; }
+          firstRain = t; break;
+        }
+      }
+      const fmt = new Intl.DateTimeFormat('en-US', {hour:'numeric', minute:'2-digit', timeZone: state.tz || undefined});
+      el.textContent = rainingNow ? 'Precipitation over the spot right now.'
+        : firstRain ? `Next precipitation near here around ${fmt.format(new Date(firstRain))}.`
+        : 'Nothing hitting this spot in the next 6 hours.';
+    }).catch(()=>{});
 
   function setMode(mode){
     stopRadar();
@@ -2011,12 +2038,41 @@ function solAutoFoundationTarget(card){
   return solCanStackFoundation(card, SOL.found[s.id], s.id) ? s.id : null;
 }
 
-function solCardFace(c){
-  const suit = SOL_SUITS.find(s=>s.id===c.suit);
-  const tone = c.warm ? 'warm' : 'cool';
-  return `<div class="solcard ${tone}"><span class="solrank">${c.rank}</span><span class="solglyph">${suit.glyph}</span></div>`;
+function solSuitIcon(id, size){
+  const S = `viewBox="0 0 24 24" width="${size}" height="${size}" aria-hidden="true"`;
+  if(id==='zest') return `<svg ${S}><circle cx="12" cy="12" r="9" fill="currentColor"/><circle cx="12" cy="12" r="5.6" fill="var(--pith)"/><path d="M12 7.2v9.6M7.2 12h9.6M8.8 8.8l6.4 6.4M15.2 8.8l-6.4 6.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>`;
+  if(id==='rind') return `<svg ${S}><path d="M3.4 12c0-.9.6-1.7 1.5-2C6.2 7.6 8.8 6 12 6s5.8 1.6 7.1 4c.9.3 1.5 1.1 1.5 2s-.6 1.7-1.5 2c-1.3 2.4-3.9 4-7.1 4s-5.8-1.6-7.1-4c-.9-.3-1.5-1.1-1.5-2Z" fill="currentColor"/><path d="M13.4 6.3c-.3-1.7 1-2.8 2.8-2.6.1 1.6-1.1 2.7-2.8 2.6Z" fill="currentColor"/></svg>`;
+  if(id==='leaf') return `<svg ${S}><path d="M4.5 19.5C4.5 10.5 10.5 4.5 19.5 4.5c0 9-6 15-15 15Z" fill="currentColor"/><path d="M7 17c3-3.6 6.4-7 10-10" stroke="var(--pith)" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>`;
+  return `<svg ${S}><path d="M12 3.5c3.6 3.4 5.5 6.6 5.5 9.9a5.5 5.5 0 0 1-11 0c0-3.3 1.9-6.5 5.5-9.9Z" fill="currentColor"/><path d="M12 8v8" stroke="var(--pith)" stroke-width="1.4" stroke-linecap="round"/></svg>`;
 }
-function solCardBack(){ return `<div class="solcard solback"><svg viewBox="0 0 24 24" width="16" height="16"><circle cx="12" cy="12" r="8" fill="var(--zest)" stroke="var(--pith)" stroke-width="1.6"/></svg></div>`; }
+function solCardFace(c){
+  const tone = c.warm ? 'warm' : 'cool';
+  return `<div class="solcard ${tone}">
+    <span class="solcorner"><b>${c.rank}</b>${solSuitIcon(c.suit, 10)}</span>
+    <span class="solbig">${solSuitIcon(c.suit, 24)}</span>
+  </div>`;
+}
+function solCardBack(){
+  return `<div class="solcard solback">
+    <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+      <circle cx="12" cy="12" r="9.5" fill="var(--zest)" stroke="var(--ink)" stroke-width="1.4"/>
+      <circle cx="12" cy="12" r="5.8" fill="var(--pith)"/>
+      <path d="M12 7v10M7 12h10M8.6 8.6l6.8 6.8M15.4 8.6l-6.8 6.8" stroke="var(--zest)" stroke-width="1.5" stroke-linecap="round"/>
+    </svg>
+  </div>`;
+}
+/* ---- undo: cheap full-state snapshots ---- */
+function solSnapshot(){
+  SOL.undo = SOL.undo || [];
+  SOL.undo.push(JSON.stringify({tab:SOL.tab, stock:SOL.stock, waste:SOL.waste, found:SOL.found, moves:SOL.moves}));
+  if(SOL.undo.length > 60) SOL.undo.shift();
+}
+function solUndo(){
+  if(!SOL.undo || !SOL.undo.length) { solMsg('Nothing to unsqueeze.'); return; }
+  const snap = JSON.parse(SOL.undo.pop());
+  Object.assign(SOL, {tab:snap.tab, stock:snap.stock, waste:snap.waste, found:snap.found, moves:snap.moves, sel:null});
+  solRender(); solMsg('Rewound one move.');
+}
 
 function openSolitaire(){
   closeMoonScreen();
@@ -2030,7 +2086,14 @@ function openSolitaire(){
     <div class="solwrap">
       <div class="mshead">
         <span class="mstitle">LEMON SOLITAIRE<span class="dot">.</span></span>
+        <span style="flex:1"></span>
+        <button class="linkish" id="solundo">undo</button>
         <button class="linkish" id="solnew">new deal</button>
+      </div>
+      <div class="msbar">
+        <span class="msstat"><b id="solmoves">0</b> moves</span>
+        <span class="mssub" id="solmsgtop"></span>
+        <span class="msstat"><b id="soltime">0:00</b></span>
       </div>
       <div class="soltop">
         <div class="solpile" id="solstock"></div>
@@ -2044,21 +2107,33 @@ function openSolitaire(){
   document.body.appendChild(el);
   document.body.style.overflow = 'hidden';
   $('#solcloseX').addEventListener('click', closeSolitaire);
-  $('#solnew').addEventListener('click', ()=>{ solDeal(); solRender(); });
+  $('#solnew').addEventListener('click', ()=>{ SOL.undo = []; solDeal(); solStartTimer(); solRender(); });
+  $('#solundo').addEventListener('click', solUndo);
+  solStartTimer();
   el.addEventListener('click', e=>{ if(e.target === el) closeSolitaire(); });
   document.addEventListener('keydown', moonEsc);
   $('#solstock').addEventListener('click', solDrawStock);
   solRender();
 }
+function solStartTimer(){
+  clearInterval(SOL.tInt);
+  SOL.tInt = setInterval(()=>{
+    const el = $('#soltime'); if(!el) return;
+    const sec = Math.floor((Date.now()-SOL.t0)/1000);
+    el.textContent = Math.floor(sec/60)+':'+String(sec%60).padStart(2,'0');
+  }, 1000);
+}
 function closeSolitaire(){
   if(!SOL.open) return;
   SOL.open = false;
+  clearInterval(SOL.tInt);
   const el = $('#solmodal'); if(el) el.remove();
   document.body.style.overflow = '';
 }
 function solDrawStock(){
+  if(!SOL.stock.length && !SOL.waste.length) return;
+  solSnapshot();
   if(!SOL.stock.length){
-    if(!SOL.waste.length) return;
     SOL.stock = SOL.waste.reverse().map(c=>({...c, up:false}));
     SOL.waste = [];
   }else{
@@ -2084,6 +2159,7 @@ function solTryMoveTo(destCol){
   const lead = cards[0];
   const destTop = SOL.tab[destCol][SOL.tab[destCol].length-1];
   if(!solCanStackTableau(lead, destTop)){ solMsg('That one won\u2019t sit there.'); SOL.sel=null; solRender(); return; }
+  solSnapshot();
   if(src.pile==='waste') SOL.waste.pop();
   else if(src.pile==='found') SOL.found[src.suit].pop();
   else SOL.tab[src.col].splice(src.idx);
@@ -2100,11 +2176,12 @@ function solTryMoveToFoundation(suitId){
   if(src.pile==='waste') card = SOL.waste[SOL.waste.length-1];
   else card = SOL.tab[src.col]?.[SOL.tab[src.col].length-1];
   if(!card || !solCanStackFoundation(card, SOL.found[suitId], suitId)){ solMsg('Not the right lemon for that pile.'); SOL.sel=null; solRender(); return; }
+  solSnapshot();
   if(src.pile==='waste') SOL.waste.pop(); else { SOL.tab[src.col].pop(); const t=SOL.tab[src.col]; if(t.length) t[t.length-1].up=true; }
   SOL.found[suitId].push(card);
   SOL.sel = null; SOL.moves++;
   solRender();
-  if(solWon()) setTimeout(()=>solMsg('Full grove! Every lemon sorted. \uD83C\uDF4B'), 50);
+  if(solWon()) setTimeout(solWinNow, 50);
 }
 function solClickTableauCard(col, idx){
   const card = SOL.tab[col][idx];
@@ -2119,18 +2196,31 @@ function solClickTableauCard(col, idx){
   /* double-tap-like convenience: tapping the very top card of a column tries the foundation first */
   if(idx === SOL.tab[col].length-1){
     const target = solAutoFoundationTarget(card);
-    if(target){ SOL.found[target].push(card); SOL.tab[col].pop(); const t=SOL.tab[col]; if(t.length) t[t.length-1].up=true; SOL.moves++; solRender();
-      if(solWon()) setTimeout(()=>solMsg('Full grove! Every lemon sorted. \uD83C\uDF4B'), 50); return; }
+    if(target){ solSnapshot(); SOL.found[target].push(card); SOL.tab[col].pop(); const t=SOL.tab[col]; if(t.length) t[t.length-1].up=true; SOL.moves++; solRender();
+      if(solWon()) setTimeout(solWinNow, 50); return; }
   }
   solSelect({pile:'tab', col, idx});
 }
 function solClickWaste(){
   if(!SOL.waste.length) return;
   if(SOL.sel && SOL.sel.src.pile==='waste'){ SOL.sel=null; solRender(); return; }
-  const card = SOL.waste[SOL.waste.length-1];
-  const target = solAutoFoundationTarget(card);
-  if(target && !SOL.sel){ /* offer selection either way; clicking waste just selects, foundation click confirms */ }
+  if(!SOL.sel){
+    const card = SOL.waste[SOL.waste.length-1];
+    const target = solAutoFoundationTarget(card);
+    if(target){
+      solSnapshot();
+      SOL.found[target].push(SOL.waste.pop());
+      SOL.moves++; solRender();
+      if(solWon()) solWinNow();
+      return;
+    }
+  }
   solSelect({pile:'waste'});
+}
+function solWinNow(){
+  clearInterval(SOL.tInt);
+  const sec = Math.floor((Date.now()-SOL.t0)/1000);
+  solMsg(`Full grove in ${Math.floor(sec/60)}:${String(sec%60).padStart(2,'0')} \u00b7 ${SOL.moves} moves. Every lemon home. \uD83C\uDF4B`);
 }
 function solClickFoundation(suitId){
   if(SOL.sel){ solTryMoveToFoundation(suitId); return; }
@@ -2140,6 +2230,7 @@ function solClickFoundation(suitId){
 function solRender(){
   const stockEl = $('#solstock'), wasteEl = $('#solwaste'), foundEl = $('#solfound'), tabEl = $('#soltableau');
   if(!stockEl) return;
+  const mv = $('#solmoves'); if(mv) mv.textContent = SOL.moves;
   stockEl.innerHTML = SOL.stock.length ? solCardBack() : `<div class="solcard solempty">&#8635;</div>`;
   wasteEl.innerHTML = SOL.waste.length ? solCardFace(SOL.waste[SOL.waste.length-1]) : `<div class="solcard solempty"></div>`;
   wasteEl.classList.toggle('sel', !!(SOL.sel && SOL.sel.src.pile==='waste'));
@@ -2176,8 +2267,8 @@ function solRender(){
    want you dead unless you land on their heads. Fall off the bottom and
    the run ends. Points = how high you got. Best score sticks around.
    ===================================================================== */
-const JMP_C = { G:2400, BOUNCE:1120, SPRING:1800, VXMAX:440, STEER:9,
-  TILT_SENS:14, LOGICAL_W:500, DEATH_BELOW:640, STEP:1/120, PLAT_H:14 };
+const JMP_C = { G:2400, BOUNCE:1120, SPRING:1800, VXMAX:560, STEER:13,
+  TILT_SENS:20, LOGICAL_W:500, DEATH_BELOW:640, STEP:1/120, PLAT_H:14 };
 const ASC = { open:false, raf:0, keys:{}, touchDir:0, gamma:null, tiltOn:false,
   p:null, plats:[], foes:[], cam:0, genY:0, foeY:1200, dead:false,
   score:0, best:0, anim:{landT:0}, quip:null, acc:0, rng:null, saveT:null };
@@ -2661,8 +2752,8 @@ function closeAscent(){
    Same beefy Lemons, now on a zest-framed BMX with lemon-slice wheels.
    Two-wheel Verlet physics on authored terrain, six levels, best times.
    ===================================================================== */
-const BMX_C = { G:1500, DRIVE:980, REVERSE:560, TILT:8.2, WHEEL_R:15, WB:54,
-  STEP:1/120, FRICTION:0.994, BRAKE:0.90, REST:0.14, MAXTILT:0.11 };
+const BMX_C = { G:1500, DRIVE:1380, REVERSE:700, WHEEL_R:15, WB:54,
+  STEP:1/120, FRICTION:0.989, BRAKE:0.90, REST:0.14, MAXTILT:0.11 };
 const BMX = { open:false, raf:0, keys:{}, level:0, terrain:null, bike:null,
   t0:0, time:0, crashT:0, doneT:0, dist:0, quip:null, saveT:null, acc:0 };
 
@@ -2729,15 +2820,8 @@ function bmxStep(bike, ter, input, dt){
     w.px = w.x; w.py = w.y;
     w.x += vx; w.y += vy + BMX_C.G*dt*dt;
   }
-  /* tilt: perpendicular push on the two wheels in opposite directions */
-  if(input.left || input.right){
-    const dx = f.x - r.x, dy = f.y - r.y, len = Math.hypot(dx, dy) || 1;
-    const px = -dy/len, py = dx/len;
-    const s = (input.left ? -1 : 1) * BMX_C.TILT * dt;
-    r.x += px*s; r.y += py*s;
-    f.x -= px*s; f.y -= py*s;
-  }
   /* solve rod + ground a few times, interleaved for stability */
+  for(const w of bike.w) w.contact = false; /* reset ONCE — solver iterations only ever set it */
   for(let it=0; it<3; it++){
     /* rod constraint */
     let dx = f.x - r.x, dy = f.y - r.y;
@@ -2747,43 +2831,74 @@ function bmxStep(bike, ter, input, dt){
     f.x -= dx*corr; f.y -= dy*corr;
     /* ground collision per wheel */
     for(const w of bike.w){
-      w.contact = false;
       const gy = bmxHeightAt(ter, w.x);
-      if(w.y + BMX_C.WHEEL_R > gy){
-        const n = bmxNormalAt(ter, w.x);
-        const pen = w.y + BMX_C.WHEEL_R - gy;
-        w.x += n.nx * pen * 0.6;
-        w.y += n.ny * pen;
+      if(w.y + BMX_C.WHEEL_R > gy - 1){ /* 1px grace so resting wheels stay driveable */
         w.contact = true;
-        /* velocity response: kill most normal velocity, keep tangential */
-        let vx = w.x - w.px, vy = w.y - w.py;
-        const vn = vx*n.nx + vy*n.ny, vt = vx*n.tx + vy*n.ty;
-        const newVn = -vn * BMX_C.REST;
-        let newVt = vt;
-        if(input.down) newVt *= BMX_C.BRAKE;
-        vx = n.nx*newVn + n.tx*newVt;
-        vy = n.ny*newVn + n.ty*newVt;
-        w.px = w.x - vx; w.py = w.y - vy;
+        const pen = w.y + BMX_C.WHEEL_R - gy;
+        if(pen > 0){
+          const n = bmxNormalAt(ter, w.x);
+          w.x += n.nx * pen * 0.6;
+          w.y += n.ny * pen;
+          /* velocity response: kill most normal velocity, keep tangential */
+          let vx = w.x - w.px, vy = w.y - w.py;
+          const vn = vx*n.nx + vy*n.ny, vt = vx*n.tx + vy*n.ty;
+          const newVn = -vn * BMX_C.REST;
+          let newVt = vt;
+          if(input.down) newVt *= BMX_C.BRAKE;
+          vx = n.nx*newVn + n.tx*newVt;
+          vy = n.ny*newVn + n.ty*newVt;
+          w.px = w.x - vx; w.py = w.y - vy;
+        }
       }
     }
   }
-  /* drive: gas pushes contacting wheels along the surface toward the front */
+  /* drive: if either wheel has grip, accelerate BOTH wheel masses equally
+     along that surface — pure translation, zero drive-torque. This is what
+     kills the instant-frontflip: per-wheel thrust was torquing the nose
+     down every time the front wheel unweighted over a bump or crest. */
   const dirX = f.x - r.x, dirY = f.y - r.y;
   if(input.up || input.down){
-    for(const w of bike.w){
-      if(!w.contact) continue;
-      const n = bmxNormalAt(ter, w.x);
+    const gripW = r.contact ? r : (f.contact ? f : null);
+    if(gripW){
+      const n = bmxNormalAt(ter, gripW.x);
       const sign = (dirX*n.tx + dirY*n.ty) >= 0 ? 1 : -1;
       const a = input.up ? BMX_C.DRIVE : -BMX_C.REVERSE;
-      w.x += n.tx * sign * a * dt * dt;
-      w.y += n.ty * sign * a * dt * dt;
+      for(const w of bike.w){
+        w.x += n.tx * sign * a * dt * dt;
+        w.y += n.ty * sign * a * dt * dt;
+      }
+    }
+  }
+  /* rotation controller (Trials-style): holding left/right steers the spin
+     RATE toward a fixed target; releasing steers it back to zero fast. No
+     impulse pile-up, no ringing — rotation is something you hold, not wind up.
+     Right = lean forward (nose down), Left = lean back, world-consistent. */
+  {
+    const ux = dirX, uy = dirY, L = Math.hypot(ux, uy) || 1;
+    const px = -uy/L, py = ux/L;
+    const relx = (f.x - f.px) - (r.x - r.px), rely = (f.y - f.py) - (r.y - r.py);
+    const wPerp = relx*px + rely*py;                     /* + = clockwise spin */
+    const grounded = r.contact || f.contact;
+    const dir = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+    const T = 2.45 * (grounded ? 0.35 : 1);              /* ≈ 5.4 rad/s in the air */
+    const targetW = dir * T;
+    const rate = dir !== 0 ? 11 : 6;                     /* fast attack, faster stop */
+    let delta = (targetW - wPerp) * Math.min(1, rate*dt);
+    const CAP = 3.0;                                     /* bump-kick ceiling ≈ 6.7 rad/s */
+    if(wPerp + delta > CAP) delta = CAP - wPerp;
+    if(wPerp + delta < -CAP) delta = -CAP - wPerp;
+    if(delta !== 0){
+      const half = delta/2;
+      /* velocity change via prev positions: v = x - px */
+      f.px -= px*half; f.py -= py*half;
+      r.px += px*half; r.py += py*half;
     }
   }
   /* wheel spin (visual) from tangential travel */
   for(const w of bike.w) w.spin += ((w.x - w.px)) / BMX_C.WHEEL_R;
   /* crash: rider head below the surface */
   const head = bmxHeadPos(bike);
-  if(head.y > bmxHeightAt(ter, head.x) + 2) ev.crashed = true;
+  if(head.y > bmxHeightAt(ter, head.x) + 7) ev.crashed = true;
   /* finish: both wheels past the flag */
   if(r.x > ter.finish && f.x > ter.finish) ev.finished = true;
   return ev;
@@ -2966,7 +3081,9 @@ function openBmx(){
       <span class="mstitle">CITRUS MX<span class="dot">.</span></span>
       <span class="asctag" id="bmxlevel"></span>
       <span style="flex:1"></span>
+      <button class="linkish" id="bmxprev" aria-label="Previous level">&lsaquo; prev</button>
       <button class="linkish" id="bmxretry">retry</button>
+      <button class="linkish" id="bmxnext" aria-label="Next level">next &rsaquo;</button>
       <button class="modalclose lcclose" id="bmxclose" aria-label="Close">&times;</button>
     </div>
     <div class="ascstats">
@@ -2988,6 +3105,8 @@ function openBmx(){
   document.body.style.overflow = 'hidden';
   $('#bmxclose').addEventListener('click', closeBmx);
   $('#bmxretry').addEventListener('click', ()=>bmxLoadLevel(BMX.level));
+  $('#bmxprev').addEventListener('click', ()=>bmxLoadLevel(BMX.level-1));
+  $('#bmxnext').addEventListener('click', ()=>bmxLoadLevel(BMX.level+1));
   document.addEventListener('keydown', moonEsc);
 
   BMX.onKeyDown = e=>{
