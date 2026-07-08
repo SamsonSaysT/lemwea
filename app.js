@@ -1214,10 +1214,11 @@ function initRadar(){
     $('#radarplay').addEventListener('click', ()=> radar.playing ? stopRadar() : playRadar());
     $('#modeRain').addEventListener('click', ()=>setMode('rain'));
     $('#modeSat').addEventListener('click', ()=>setMode('sat'));
-    /* RainViewer's satellite layer only covers parts of the world — if there
-       are no frames here, don't show a toggle to an empty map */
+    /* satellite coverage is regional; if there are no frames, grey out that
+       one button but ALWAYS keep the rain radar showing */
     if(!radar.sets.sat.frames.length){
-      const mt = document.querySelector('.modetoggle'); if(mt) mt.remove();
+      const sb = $('#modeSat');
+      if(sb){ sb.disabled = true; sb.title = 'No satellite coverage here right now'; }
     }
     setMode('rain');
   }).catch(()=>{ $('#radartime').textContent = 'radar offline'; });
