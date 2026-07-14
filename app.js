@@ -567,15 +567,20 @@ async function geolocate(){
   navigator.geolocation.getCurrentPosition(async pos=>{
     const {latitude:lat, longitude:lon} = pos.coords;
     let name = 'My location', admin = '';
+    /* Nominatim (OpenStreetMap) first — it resolves incorporated US suburbs
+       like St. Clair Shores or Grosse Pointe, where metro-anchored geocoders
+       just say "Detroit". zoom=12 targets the town, not the whole metro. */
     try{
-      const g = await fetchJSON(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=en`);
-      name = g.city || g.locality || g.localityInfo?.administrative?.[0]?.name || name;
-      admin = g.principalSubdivision || g.countryName || '';
+      const n = await fetchJSON(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=12&addressdetails=1&accept-language=en`);
+      const a = n.address || {};
+      name = a.city || a.town || a.village || a.hamlet || a.municipality || a.suburb || a.neighbourhood || a.county || n.name || name;
+      admin = a.state || a.country || '';
     }catch(e){
       try{
-        const n = await fetchJSON(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&zoom=10&addressdetails=1&accept-language=en`);
-        name = n.address?.city || n.address?.town || n.address?.village || n.address?.hamlet || n.name || name;
-        admin = n.address?.state || n.address?.country || '';
+        const g = await fetchJSON(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=en`);
+        /* prefer the fine-grained locality over .city, which snaps to the metro */
+        name = g.locality || g.localityInfo?.administrative?.slice(-1)[0]?.name || g.city || name;
+        admin = g.principalSubdivision || g.countryName || '';
       }catch(_e){}
     }
     setLocation({lat, lon, name, admin});
