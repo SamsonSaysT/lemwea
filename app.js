@@ -443,19 +443,41 @@ function usAqiAt(h, idx){
   }
   return {aqi, dominant, parts};
 }
-/* normalize an AirNow currentobservation payload -> {aqi, dominant} */
-function normalizeAirnow(list){
+/* normalize an AirNow currentobservation payload -> {aqi, dominant}
+   The API can return rows from SEVERAL reporting areas within the search
+   radius. airnow.gov's headline is: your NEAREST area, worst pollutant
+   within it. Taking the max across every area in 75 miles was reading
+   some other town's plume as yours — so: group by area, pick the closest
+   to the requested point, then take that area's worst pollutant. */
+function normalizeAirnow(list, lat, lon){
   if(!Array.isArray(list) || !list.length) return null;
-  let aqi = null, dominant = null;
+  const groups = new Map();
   for(const row of list){
     const v = row?.AQI;
-    if(typeof v === 'number' && v >= 0 && (aqi == null || v > aqi)){
-      aqi = v;
-      dominant = row.ParameterName || null;
-      if(dominant === 'O3') dominant = 'Ozone';
-    }
+    if(typeof v !== 'number' || v < 0) continue;
+    const key = (row.Latitude != null && row.Longitude != null)
+      ? row.Latitude + '|' + row.Longitude
+      : (row.ReportingArea || 'x');
+    if(!groups.has(key)) groups.set(key, {lat:row.Latitude, lon:row.Longitude, rows:[]});
+    groups.get(key).rows.push(row);
   }
-  return aqi == null ? null : {aqi, dominant};
+  if(!groups.size) return null;
+  let best = null, bestD = Infinity;
+  for(const g of groups.values()){
+    const d = (isFinite(g.lat) && isFinite(g.lon) && isFinite(lat) && isFinite(lon))
+      ? (g.lat-lat)*(g.lat-lat) + (g.lon-lon)*(g.lon-lon)
+      : Infinity;
+    if(d < bestD || best === null){ bestD = d; best = g; }
+  }
+  let aqi = null, dominant = null;
+  const byName = new Map();
+  for(const row of best.rows){
+    const name = row.ParameterName === 'O3' ? 'Ozone' : (row.ParameterName || '?');
+    if(!byName.has(name) || row.AQI > byName.get(name)) byName.set(name, row.AQI);
+    if(aqi == null || row.AQI > aqi){ aqi = row.AQI; dominant = name; }
+  }
+  const pollutants = [...byName.entries()].map(([name, v])=>({name, aqi:v})).sort((x,y)=>y.aqi-x.aqi);
+  return aqi == null ? null : {aqi, dominant, pollutants};
 }
 /* an active NWS air-quality / smoke alert means model numbers are suspect */
 function smokeAlertActive(){
@@ -466,14 +488,14 @@ async function fetchAirQuality(lat, lon){
      model so a slow or failed model call can never block real data */
   const groundP = AIRNOW_PROXY
     ? fetchJSON(`${AIRNOW_PROXY}/?lat=${lat.toFixed(4)}&lon=${lon.toFixed(4)}`, {}, 9000)
-        .then(normalizeAirnow)
+        .then(obs=>normalizeAirnow(obs, lat, lon))
         .catch(e=>{ console.warn('AirNow proxy unreachable:', e && e.message); return null; })
     : Promise.resolve(null);
   const model = await fetchAirModel(lat, lon);
   const ground = await groundP;
   if(!model.ok && !ground) return {ok:false};
   const base = model.ok ? model : {ok:true, aqi:null, dominant:null, pm25:null, pm10:null, ozone:null, no2:null, co:null, pollen:[], hourly:[]};
-  if(ground){ base.aqi = ground.aqi; base.dominant = ground.dominant; base.source = 'ground'; }
+  if(ground){ base.aqi = ground.aqi; base.dominant = ground.dominant; base.groundPollutants = ground.pollutants || []; base.source = 'ground'; }
   else base.source = 'model';
   return base;
 }
@@ -1225,12 +1247,14 @@ function renderAir(){
         ${a.dominant ? `<div class="hilo">driven by ${esc(a.dominant)} \u00b7 ${a.source==='ground' ? 'AirNow ground monitors' : 'NowCast \u00b7 model'}</div>` : ''}
         <div class="lemonsays"><span>Lemons says</span><p>${esc(airSays(a))}</p></div>
         <div class="hilo"></div>
-        <div class="statrow airstats">
+        ${(a.source==='ground' && a.groundPollutants && a.groundPollutants.length) ? `<div class="statrow airstats">
+          ${a.groundPollutants.map(p=>`<div class="stat"><div class="k">${esc(p.name)}</div><div class="v">${Math.round(p.aqi)}<small> AQI</small></div></div>`).join('')}
+        </div>` : `<div class="statrow airstats">
           <div class="stat"><div class="k">PM2.5</div><div class="v">${a.pm25!=null?Math.round(a.pm25):'—'}<small> µg/m³</small></div></div>
           <div class="stat"><div class="k">PM10</div><div class="v">${a.pm10!=null?Math.round(a.pm10):'—'}<small> µg/m³</small></div></div>
           <div class="stat"><div class="k">Ozone</div><div class="v">${a.ozone!=null?Math.round(a.ozone):'—'}<small> µg/m³</small></div></div>
           <div class="stat"><div class="k">NO₂</div><div class="v">${a.no2!=null?Math.round(a.no2):'—'}<small> µg/m³</small></div></div>
-        </div>
+        </div>`}
       </div>
 
       ${topPollen.length ? `<div class="airsection">
