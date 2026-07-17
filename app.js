@@ -39,7 +39,7 @@ function parseSharedLocation(){
    API. Deploy airnow-worker.js (in this repo) to a free Cloudflare Worker
    with a free AirNow key, paste the worker URL here, and the Air tab reads
    the exact same number as airnow.gov. Empty = model fallback. */
-const AIRNOW_PROXY = 'lemons-air.hivemindtony.workers.dev';
+const AIRNOW_PROXY = 'https://lemons-air.hivemindtony.workers.dev';
 
 const state = {
   // Plain visits always start at “Where are you, Lemons?”
