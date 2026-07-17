@@ -462,6 +462,22 @@ function smokeAlertActive(){
   return (state.alerts||[]).some(al=> /air quality|smoke|particulate/i.test(al.event||''));
 }
 async function fetchAirQuality(lat, lon){
+  /* ground monitors are the primary source — fetched in parallel with the
+     model so a slow or failed model call can never block real data */
+  const groundP = AIRNOW_PROXY
+    ? fetchJSON(`${AIRNOW_PROXY}/?lat=${lat.toFixed(4)}&lon=${lon.toFixed(4)}`, {}, 9000)
+        .then(normalizeAirnow)
+        .catch(e=>{ console.warn('AirNow proxy unreachable:', e && e.message); return null; })
+    : Promise.resolve(null);
+  const model = await fetchAirModel(lat, lon);
+  const ground = await groundP;
+  if(!model.ok && !ground) return {ok:false};
+  const base = model.ok ? model : {ok:true, aqi:null, dominant:null, pm25:null, pm10:null, ozone:null, no2:null, co:null, pollen:[], hourly:[]};
+  if(ground){ base.aqi = ground.aqi; base.dominant = ground.dominant; base.source = 'ground'; }
+  else base.source = 'model';
+  return base;
+}
+async function fetchAirModel(lat, lon){
   const fields = [
     'pm2_5','pm10','ozone','nitrogen_dioxide','sulphur_dioxide','carbon_monoxide',
     'alder_pollen','birch_pollen','grass_pollen','mugwort_pollen','olive_pollen','ragweed_pollen'
@@ -483,19 +499,12 @@ async function fetchAirQuality(lat, lon){
     ].filter(x=>x[1]!=null).sort((a,b)=>b[1]-a[1]);
     let now = usAqiAt(h, idx);
     let source = 'model';
-    if(AIRNOW_PROXY){
-      try{
-        const obs = await fetchJSON(`${AIRNOW_PROXY}?lat=${lat.toFixed(4)}&lon=${lon.toFixed(4)}`, {}, 8000);
-        const ground = normalizeAirnow(obs);
-        if(ground){ now = {aqi:ground.aqi, dominant:ground.dominant}; source = 'ground'; }
-      }catch(e){ /* worker down -> model fallback */ }
-    }
     const hourly = times.slice(idx, idx+24).map((t,i)=>{
       const j = idx+i;
       return { epochH:t, aqi:usAqiAt(h, j).aqi, pm25:h.pm2_5?.[j] ?? null, grass:h.grass_pollen?.[j] ?? null, ragweed:h.ragweed_pollen?.[j] ?? null };
     });
     return {
-      ok:true, source,
+      ok:true,
       aqi:now.aqi, dominant:now.dominant, pm25:get('pm2_5'), pm10:get('pm10'), ozone:get('ozone'),
       no2:get('nitrogen_dioxide'), co:get('carbon_monoxide'), pollen, hourly
     };
@@ -1214,10 +1223,6 @@ function renderAir(){
         <div class="bigtemp airscore">${a.aqi!=null?Math.round(a.aqi):'—'}<sup>AQI</sup></div>
         <div class="cond">${lemonFruit(22, 'Air quality')} ${esc(aqiLabel(a.aqi))}</div>
         ${a.dominant ? `<div class="hilo">driven by ${esc(a.dominant)} \u00b7 ${a.source==='ground' ? 'AirNow ground monitors' : 'NowCast \u00b7 model'}</div>` : ''}
-        ${(smokeAlertActive() && a.source !== 'ground') ? `<div class="lemonalert airwarn">
-          <div class="alerthead">${lemonFruit(18)}<span class="alertkind">This number may be way off</span></div>
-          <p class="alertline">A smoke / air-quality alert is active, and the free model behind this reading regularly misses smoke plumes. Ground stations may read far worse \u2014 check <a href="https://www.airnow.gov" target="_blank" rel="noopener">AirNow</a>.</p>
-        </div>` : ''}
         <div class="lemonsays"><span>Lemons says</span><p>${esc(airSays(a))}</p></div>
         <div class="hilo"></div>
         <div class="statrow airstats">
