@@ -477,7 +477,14 @@ function normalizeAirnow(list, lat, lon){
     if(aqi == null || row.AQI > aqi){ aqi = row.AQI; dominant = name; }
   }
   const pollutants = [...byName.entries()].map(([name, v])=>({name, aqi:v})).sort((x,y)=>y.aqi-x.aqi);
-  return aqi == null ? null : {aqi, dominant, pollutants};
+  let obsLabel = null;
+  const r0 = best.rows[0];
+  if(r0 && typeof r0.HourObserved === 'number'){
+    const h = r0.HourObserved;
+    const h12 = h % 12 === 0 ? 12 : h % 12;
+    obsLabel = h12 + (h < 12 ? ' AM' : ' PM') + (r0.LocalTimeZone ? ' ' + r0.LocalTimeZone : '');
+  }
+  return aqi == null ? null : {aqi, dominant, pollutants, obsLabel};
 }
 /* an active NWS air-quality / smoke alert means model numbers are suspect */
 function smokeAlertActive(){
@@ -495,9 +502,50 @@ async function fetchAirQuality(lat, lon){
   const ground = await groundP;
   if(!model.ok && !ground) return {ok:false};
   const base = model.ok ? model : {ok:true, aqi:null, dominant:null, pm25:null, pm10:null, ozone:null, no2:null, co:null, pollen:[], hourly:[]};
-  if(ground){ base.aqi = ground.aqi; base.dominant = ground.dominant; base.groundPollutants = ground.pollutants || []; base.source = 'ground'; }
+  if(ground){ base.aqi = ground.aqi; base.dominant = ground.dominant; base.groundPollutants = ground.pollutants || []; base.obsLabel = ground.obsLabel || null; base.source = 'ground'; }
   else base.source = 'model';
   return base;
+}
+/* HRRR-Smoke inline map: NOAA publishes viewer graphics but not a stable
+   documented image API, so we PROBE a small set of known path shapes across
+   the last 8 hourly runs and show the first image that actually loads. If
+   none do, the section keeps just the link to NOAA's viewer \u2014 no broken
+   images, ever. Pure generator so the candidate list is testable. */
+function hrrrSmokeCandidates(now = new Date()){
+  const runs = [];
+  for(let back = 1; back <= 8; back++){
+    const d = new Date(now.getTime() - back*3600000);
+    runs.push(d.getUTCFullYear()
+      + String(d.getUTCMonth()+1).padStart(2,'0')
+      + String(d.getUTCDate()).padStart(2,'0')
+      + String(d.getUTCHours()).padStart(2,'0'));
+  }
+  const base = 'https://rapidrefresh.noaa.gov/hrrr/HRRRsmoke/for_web/hrrr_ncep_smoke_jet/';
+  const shapes = [
+    r => base + r + '/full/nsmoke_full_f00.png',
+    r => base + r + '/full/nsmoke_f00_full.png',
+    r => base + r + '/t1/nsmoke_t1_f00.png',
+    r => base + r + '/full/trc1_sfc_full_f00.png'
+  ];
+  const out = [];
+  for(const r of runs) for(const shape of shapes) out.push(shape(r));
+  return out;
+}
+function initSmokeMap(){
+  const img = $('#smokeimg');
+  if(!img || img.dataset.probed) return;
+  img.dataset.probed = '1';
+  const candidates = hrrrSmokeCandidates();
+  let i = 0;
+  const tryNext = ()=>{
+    if(i >= candidates.length) return; /* all missed: link-only section stays */
+    const url = candidates[i++];
+    const probe = new Image();
+    probe.onload = ()=>{ img.src = url; img.classList.add('loaded'); };
+    probe.onerror = tryNext;
+    probe.src = url;
+  };
+  tryNext();
 }
 async function fetchAirModel(lat, lon){
   const fields = [
@@ -1244,7 +1292,7 @@ function renderAir(){
         <div class="airlabel">Air quality</div>
         <div class="bigtemp airscore">${a.aqi!=null?Math.round(a.aqi):'—'}<sup>AQI</sup></div>
         <div class="cond">${lemonFruit(22, 'Air quality')} ${esc(aqiLabel(a.aqi))}</div>
-        ${a.dominant ? `<div class="hilo">driven by ${esc(a.dominant)} \u00b7 ${a.source==='ground' ? 'AirNow ground monitors' : 'NowCast \u00b7 model'}</div>` : ''}
+        ${a.dominant ? `<div class="hilo">driven by ${esc(a.dominant)} \u00b7 ${a.source==='ground' ? ('AirNow ground monitors' + (a.obsLabel ? ' \u00b7 ' + esc(a.obsLabel) + ' obs' : '')) : 'NowCast \u00b7 model'}</div>` : ''}
         <div class="lemonsays"><span>Lemons says</span><p>${esc(airSays(a))}</p></div>
         <div class="hilo"></div>
         ${(a.source==='ground' && a.groundPollutants && a.groundPollutants.length) ? `<div class="statrow airstats">
@@ -1271,8 +1319,15 @@ function renderAir(){
         </div>
       </div>
 
-      <p class="blendnote">${topPollen.length ? 'AQI and pollen use the Open-Meteo air-quality feed. Pollen can be patchy by region, so treat it as a clean heads-up, not a medical-grade read.' : 'AQI computed here with EPA NowCast + 2024 breakpoints from CAMS model data. During heavy smoke, ground sensors (AirNow) can still read worse than any model.'}</p>
+      <div class="airsection">
+        <h3>Smoke map</h3>
+        <img id="smokeimg" alt="NOAA HRRR near-surface smoke forecast" loading="lazy">
+        <p class="blendnote" id="smokenote">NOAA HRRR-Smoke \u00b7 <a href="https://rapidrefresh.noaa.gov/hrrr/HRRRsmoke/" target="_blank" rel="noopener">open the full viewer with forecast loops</a></p>
+      </div>
+
+      <p class="blendnote">${a.source==='ground' ? 'Headline and pollutant numbers are live EPA/AirNow ground-monitor readings \u2014 the same feed as airnow.gov. Observations post hourly, so a fast-moving hour can briefly differ from their gauge.' : (topPollen.length ? 'AQI and pollen use the Open-Meteo air-quality feed. Pollen can be patchy by region, so treat it as a clean heads-up, not a medical-grade read.' : 'AQI computed here with EPA NowCast + 2024 breakpoints from CAMS model data. During heavy smoke, ground sensors (AirNow) can still read worse than any model.')}</p>
     </div>`;
+  initSmokeMap();
 }
 
 /* ---------- mobile swipe between sections ---------- */

@@ -571,3 +571,6 @@ footer.site b{color:var(--ink);font-weight:600}
 .modetoggle button:disabled{opacity:.4;cursor:not-allowed}
 .airwarn{margin:18px auto 0;max-width:520px;border-left-color:#B5651D}
 .airwarn .alertline a{color:var(--ink);font-weight:600;text-decoration:underline;text-underline-offset:2px}
+#smokeimg{display:none;width:100%;border:1px solid var(--hairline);border-radius:10px;margin-top:4px}
+#smokeimg.loaded{display:block}
+#smokenote a{color:var(--ink);font-weight:600;text-decoration:underline;text-underline-offset:2px}
