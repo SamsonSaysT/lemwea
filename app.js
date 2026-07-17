@@ -34,6 +34,13 @@ function parseSharedLocation(){
     admin: p.get('admin') || ''
   };
 }
+/* ---- REAL ground-station air quality (the accuracy fix) ----
+   Every accurate AQI on the internet is EPA ground-monitor data via a keyed
+   API. Deploy airnow-worker.js (in this repo) to a free Cloudflare Worker
+   with a free AirNow key, paste the worker URL here, and the Air tab reads
+   the exact same number as airnow.gov. Empty = model fallback. */
+const AIRNOW_PROXY = 'lemons-air.hivemindtony.workers.dev';
+
 const state = {
   // Plain visits always start at “Where are you, Lemons?”
   // Only a shared ?lat=&lon= link starts directly on a forecast.
@@ -385,14 +392,83 @@ async function fetchBrightSky(lat, lon){
 }
 
 /* ---- 5. Open-Meteo Air Quality + pollen ---- */
+/* ---- US AQI, computed here the way AirNow does it ----
+   Open-Meteo's us_aqi runs particulates through a 24-HOUR mean, so a smoke
+   spike today gets diluted by yesterday's clean air (reads "Moderate" while
+   the sky is orange). EPA's NowCast is a 12-hour ratio-weighted average that
+   chases deteriorating air fast — that's what AirNow shows and what phones
+   compare against. We compute NowCast for PM + current-hour gases, on the
+   2024 breakpoints, and report the worst pollutant. */
+const EPA_BP = {
+  pm25: [[0,9.0,0,50],[9.1,35.4,51,100],[35.5,55.4,101,150],[55.5,125.4,151,200],[125.5,225.4,201,300],[225.5,325.4,301,500]],
+  pm10: [[0,54,0,50],[55,154,51,100],[155,254,101,150],[255,354,151,200],[355,424,201,300],[425,604,301,500]],
+  o3:   [[0,54,0,50],[55,70,51,100],[71,85,101,150],[86,105,151,200],[106,200,201,300]],
+  no2:  [[0,53,0,50],[54,100,51,100],[101,360,101,150],[361,649,151,200]],
+  so2:  [[0,35,0,50],[36,75,51,100],[76,185,101,150],[186,304,151,200]],
+  co:   [[0,4.4,0,50],[4.5,9.4,51,100],[9.5,12.4,101,150],[12.5,15.4,151,200]]
+};
+function epaSubIndex(kind, conc){
+  if(conc == null || !isFinite(conc) || conc < 0) return null;
+  const table = EPA_BP[kind];
+  for(const [bl, bh, il, ih] of table){
+    if(conc <= bh) return Math.round((ih-il)/(bh-bl)*(Math.max(conc,bl)-bl)+il);
+  }
+  return 500;
+}
+/* EPA NowCast: vals[0] = most recent hour, up to 12 hours back */
+function nowCast(vals){
+  const c = vals.slice(0,12);
+  const valid = c.filter(v=>v!=null && isFinite(v));
+  if(!valid.length) return null;
+  const recent = c.slice(0,3).filter(v=>v!=null && isFinite(v));
+  if(recent.length < 2) return valid[0];
+  const w = Math.max(Math.min(...valid)/Math.max(...valid) || 0, 0.5);
+  let num = 0, den = 0;
+  c.forEach((v,i)=>{ if(v!=null && isFinite(v)){ const wi = Math.pow(w,i); num += wi*v; den += wi; } });
+  return den ? num/den : valid[0];
+}
+function usAqiAt(h, idx){
+  const back = (name, n=12) => { const out=[]; for(let i=0;i<n;i++){ const v=h[name]?.[idx-i]; out.push(v==null?null:v); } return out; };
+  const parts = {
+    'PM2.5': epaSubIndex('pm25', nowCast(back('pm2_5'))),
+    'PM10':  epaSubIndex('pm10', nowCast(back('pm10'))),
+    'Ozone': epaSubIndex('o3',  (h.ozone?.[idx] ?? null) != null ? h.ozone[idx]/1.96 : null),
+    'NO2':   epaSubIndex('no2', (h.nitrogen_dioxide?.[idx] ?? null) != null ? h.nitrogen_dioxide[idx]/1.88 : null),
+    'SO2':   epaSubIndex('so2', (h.sulphur_dioxide?.[idx] ?? null) != null ? h.sulphur_dioxide[idx]/2.62 : null),
+    'CO':    epaSubIndex('co',  (h.carbon_monoxide?.[idx] ?? null) != null ? h.carbon_monoxide[idx]/1145 : null)
+  };
+  let aqi = null, dominant = null;
+  for(const [name, v] of Object.entries(parts)){
+    if(v != null && (aqi == null || v > aqi)){ aqi = v; dominant = name; }
+  }
+  return {aqi, dominant, parts};
+}
+/* normalize an AirNow currentobservation payload -> {aqi, dominant} */
+function normalizeAirnow(list){
+  if(!Array.isArray(list) || !list.length) return null;
+  let aqi = null, dominant = null;
+  for(const row of list){
+    const v = row?.AQI;
+    if(typeof v === 'number' && v >= 0 && (aqi == null || v > aqi)){
+      aqi = v;
+      dominant = row.ParameterName || null;
+      if(dominant === 'O3') dominant = 'Ozone';
+    }
+  }
+  return aqi == null ? null : {aqi, dominant};
+}
+/* an active NWS air-quality / smoke alert means model numbers are suspect */
+function smokeAlertActive(){
+  return (state.alerts||[]).some(al=> /air quality|smoke|particulate/i.test(al.event||''));
+}
 async function fetchAirQuality(lat, lon){
   const fields = [
-    'us_aqi','pm2_5','pm10','ozone','nitrogen_dioxide','carbon_monoxide',
+    'pm2_5','pm10','ozone','nitrogen_dioxide','sulphur_dioxide','carbon_monoxide',
     'alder_pollen','birch_pollen','grass_pollen','mugwort_pollen','olive_pollen','ragweed_pollen'
   ];
   try{
     const url = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lon}`
-      + `&hourly=${fields.join(',')}&timezone=auto&forecast_days=5`;
+      + `&hourly=${fields.join(',')}&timezone=auto&past_days=1&forecast_days=5`;
     const d = await fetchJSON(url, {}, 12000);
     const times = (d.hourly?.time || []).map(epochHour);
     const nowH = Math.floor(Date.now()/3600000);
@@ -405,13 +481,22 @@ async function fetchAirQuality(lat, lon){
       ['Birch', get('birch_pollen')], ['Alder', get('alder_pollen')],
       ['Mugwort', get('mugwort_pollen')], ['Olive', get('olive_pollen')]
     ].filter(x=>x[1]!=null).sort((a,b)=>b[1]-a[1]);
+    let now = usAqiAt(h, idx);
+    let source = 'model';
+    if(AIRNOW_PROXY){
+      try{
+        const obs = await fetchJSON(`${AIRNOW_PROXY}?lat=${lat.toFixed(4)}&lon=${lon.toFixed(4)}`, {}, 8000);
+        const ground = normalizeAirnow(obs);
+        if(ground){ now = {aqi:ground.aqi, dominant:ground.dominant}; source = 'ground'; }
+      }catch(e){ /* worker down -> model fallback */ }
+    }
     const hourly = times.slice(idx, idx+24).map((t,i)=>{
       const j = idx+i;
-      return { epochH:t, aqi:h.us_aqi?.[j] ?? null, pm25:h.pm2_5?.[j] ?? null, grass:h.grass_pollen?.[j] ?? null, ragweed:h.ragweed_pollen?.[j] ?? null };
+      return { epochH:t, aqi:usAqiAt(h, j).aqi, pm25:h.pm2_5?.[j] ?? null, grass:h.grass_pollen?.[j] ?? null, ragweed:h.ragweed_pollen?.[j] ?? null };
     });
     return {
-      ok:true,
-      aqi:get('us_aqi'), pm25:get('pm2_5'), pm10:get('pm10'), ozone:get('ozone'),
+      ok:true, source,
+      aqi:now.aqi, dominant:now.dominant, pm25:get('pm2_5'), pm10:get('pm10'), ozone:get('ozone'),
       no2:get('nitrogen_dioxide'), co:get('carbon_monoxide'), pollen, hourly
     };
   }catch(e){ return {ok:false}; }
@@ -817,6 +902,8 @@ function lemonsSays(cur, today){
       'Flood alert\u2019s live. Do not test puddles of unknown depth.',
       'Flood warning today. That\u2019s not a shortcut, that\u2019s a lake now.'
     ], 1));
+    else if(alertText.includes('air quality') || alertText.includes('smoke')) lines.push(
+      'Air quality alert is active. If the sky looks smoky, believe the sky \u2014 the Air tab has the details.');
     else lines.push('There\u2019s an official alert up — worth an actual glance before heading out.');
   }else if(cur.code>=95){
     lines.push(pickLine([
@@ -1061,7 +1148,8 @@ function aqiLabel(v){
   if(v<=100) return 'Moderate';
   if(v<=150) return 'Unhealthy for sensitive folks';
   if(v<=200) return 'Unhealthy';
-  return 'Very unhealthy';
+  if(v<=300) return 'Very unhealthy';
+  return 'Hazardous';
 }
 function pollenLabel(v){
   if(v==null) return '—';
@@ -1071,6 +1159,9 @@ function pollenLabel(v){
   return 'high';
 }
 function airSays(a){
+  if(smokeAlertActive() && a.source !== 'ground'){
+    return 'There\u2019s an active air quality alert, and this reading comes from a model that regularly misses smoke. Believe the sky and the ground sensors over this number \u2014 limit time outside.';
+  }
   const cur = consensusCurrent();
   const aqi = a.aqi;
   const lines = [];
@@ -1122,6 +1213,11 @@ function renderAir(){
         <div class="airlabel">Air quality</div>
         <div class="bigtemp airscore">${a.aqi!=null?Math.round(a.aqi):'—'}<sup>AQI</sup></div>
         <div class="cond">${lemonFruit(22, 'Air quality')} ${esc(aqiLabel(a.aqi))}</div>
+        ${a.dominant ? `<div class="hilo">driven by ${esc(a.dominant)} \u00b7 ${a.source==='ground' ? 'AirNow ground monitors' : 'NowCast \u00b7 model'}</div>` : ''}
+        ${(smokeAlertActive() && a.source !== 'ground') ? `<div class="lemonalert airwarn">
+          <div class="alerthead">${lemonFruit(18)}<span class="alertkind">This number may be way off</span></div>
+          <p class="alertline">A smoke / air-quality alert is active, and the free model behind this reading regularly misses smoke plumes. Ground stations may read far worse \u2014 check <a href="https://www.airnow.gov" target="_blank" rel="noopener">AirNow</a>.</p>
+        </div>` : ''}
         <div class="lemonsays"><span>Lemons says</span><p>${esc(airSays(a))}</p></div>
         <div class="hilo"></div>
         <div class="statrow airstats">
@@ -1146,7 +1242,7 @@ function renderAir(){
         </div>
       </div>
 
-      <p class="blendnote">${topPollen.length ? 'AQI and pollen use the Open-Meteo air-quality feed. Pollen can be patchy by region, so treat it as a clean heads-up, not a medical-grade read.' : 'Air quality from the Open-Meteo air-quality feed.'}</p>
+      <p class="blendnote">${topPollen.length ? 'AQI and pollen use the Open-Meteo air-quality feed. Pollen can be patchy by region, so treat it as a clean heads-up, not a medical-grade read.' : 'AQI computed here with EPA NowCast + 2024 breakpoints from CAMS model data. During heavy smoke, ground sensors (AirNow) can still read worse than any model.'}</p>
     </div>`;
 }
 

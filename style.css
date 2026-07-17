@@ -569,3 +569,5 @@ footer.site b{color:var(--ink);font-weight:600}
 #radaroutlook{color:var(--ink);font-weight:600}
 #radaroutlook:empty{display:none}
 .modetoggle button:disabled{opacity:.4;cursor:not-allowed}
+.airwarn{margin:18px auto 0;max-width:520px;border-left-color:#B5651D}
+.airwarn .alertline a{color:var(--ink);font-weight:600;text-decoration:underline;text-underline-offset:2px}
