@@ -1,26 +1,15 @@
 /* =====================================================================
-   LEMONS. — AirNow proxy worker
+   LEMONS. — AirNow proxy worker  (v2)
    ---------------------------------------------------------------------
-   This tiny Cloudflare Worker holds your AirNow API key server-side so
-   the public site can read real EPA ground-monitor AQI — the exact same
-   numbers airnow.gov shows — without exposing the key.
+   v2 fixes shoreline/boundary gaps: AirNow's lat/long lookup can return
+   an EMPTY result for points that sit between reporting areas (St. Clair
+   Shores' geocoded center is basically in the lake). This version walks
+   a distance ladder (75 -> 150 miles) until monitors answer, and never
+   caches empty results, so a miss can't get locked in for 10 minutes.
 
-   SETUP (~5 minutes, all free):
-   1. Get a free AirNow API key: https://docs.airnowapi.org  → "Request an
-      account" → key arrives by email.
-   2. Cloudflare dashboard → Workers & Pages → Create → Worker.
-      Name it something like  lemons-air . Paste this entire file in,
-      replacing the hello-world code. Deploy.
-   3. Worker → Settings → Variables and Secrets → Add:
-         name:  AIRNOW_API_KEY     type: Secret     value: (your key)
-      Save and redeploy.
-   4. Copy the worker URL (https://lemons-air.<you>.workers.dev) into
-      AIRNOW_PROXY at the top of app.js. Push the site. Done — the Air
-      tab now says "AirNow ground monitors" and matches airnow.gov.
-
-   Free-tier math: Workers allow 100k requests/day; AirNow allows 500/hr.
-   Responses are cached at Cloudflare's edge for 10 minutes, so even a
-   busy day stays comfortably inside both.
+   TO UPDATE: Cloudflare dashboard -> Workers & Pages -> your worker ->
+   Edit code -> replace everything with this file -> Deploy. The
+   AIRNOW_API_KEY secret you already set carries over automatically.
    ===================================================================== */
 
 export default {
@@ -42,25 +31,37 @@ export default {
       return new Response(JSON.stringify({error:'AIRNOW_API_KEY secret not set'}), {status:500, headers:{...cors, 'Content-Type':'application/json'}});
     }
 
-    /* edge cache: one entry per rounded coordinate per 10 minutes */
-    const cacheKey = new Request(`https://cache.lemons/air?lat=${lat.toFixed(2)}&lon=${lon.toFixed(2)}`);
+    /* edge cache (v2 key so old cached empties are abandoned) */
+    const cacheKey = new Request(`https://cache.lemons/air-v2?lat=${lat.toFixed(2)}&lon=${lon.toFixed(2)}`);
     const cache = caches.default;
     const hit = await cache.match(cacheKey);
     if(hit) return hit;
 
-    const upstream = `https://www.airnowapi.org/aq/observation/latLong/current/`
-      + `?format=application/json&latitude=${lat}&longitude=${lon}&distance=75&API_KEY=${env.AIRNOW_API_KEY}`;
-    let body, status = 200;
-    try{
-      const r = await fetch(upstream, {cf:{cacheTtl:600}});
-      body = await r.text();
-      if(!r.ok) status = 502;
-    }catch(e){
-      body = JSON.stringify({error:'upstream failed'});
-      status = 502;
+    /* distance ladder: shoreline & boundary points can miss at small radii */
+    let data = null, lastErr = null;
+    for(const distance of [75, 150]){
+      const upstream = `https://www.airnowapi.org/aq/observation/latLong/current/`
+        + `?format=application/json&latitude=${lat}&longitude=${lon}&distance=${distance}&API_KEY=${env.AIRNOW_API_KEY}`;
+      try{
+        const r = await fetch(upstream);
+        if(!r.ok){ lastErr = 'upstream ' + r.status; continue; }
+        const j = await r.json();
+        if(Array.isArray(j) && j.length){ data = j; break; }
+        lastErr = 'empty at ' + distance + 'mi';
+      }catch(e){ lastErr = String(e && e.message || e); }
     }
-    const res = new Response(body, {status, headers:{...cors, 'Content-Type':'application/json'}});
-    if(status === 200) ctx.waitUntil(cache.put(cacheKey, res.clone()));
+
+    if(!data){
+      /* no monitors answered — return empty WITHOUT caching, so the next
+         request tries again immediately instead of inheriting a stale miss */
+      return new Response('[]', {status:200, headers:{
+        'Access-Control-Allow-Origin':'*', 'Access-Control-Allow-Methods':'GET, OPTIONS',
+        'Cache-Control':'no-store', 'Content-Type':'application/json', 'X-Lemons-Note': lastErr || 'no data'
+      }});
+    }
+
+    const res = new Response(JSON.stringify(data), {status:200, headers:{...cors, 'Content-Type':'application/json'}});
+    ctx.waitUntil(cache.put(cacheKey, res.clone()));
     return res;
   }
 };
