@@ -1903,7 +1903,8 @@ function initRadar(){
     map, frames:[], layers:{}, layerMeta:{}, layerIndex:{}, basemaps, baseName, idx:0, displayedIdx:-1, desiredIdx:0,
     playing:false, timer:null, frameRaf:null, swapTimer:null, moveTimer:null, locked:true, scrubbing:false,
     activeLayer:null, pendingLayer:null, pendingIdx:-1, swapSeq:0,
-    locationMarker, markerVisible, fsHandler:null, fallbackFullscreen:false, fsPlaceholder:null,
+    locationMarker, markerVisible, fsHandler:null, fitHandler:null, orientationHandler:null,
+    fitWidth:0, fallbackFullscreen:false, fsPlaceholder:null,
     hotIndices:new Set(), hotRadius:2, preloadGen:0, preloadQueue:[], preloadActive:0, preloadConcurrency:4, bgStarted:false,
     destroy(){
       clearTimeout(this.timer); clearTimeout(this.swapTimer); clearTimeout(this.moveTimer);
@@ -1913,6 +1914,8 @@ function initRadar(){
         document.removeEventListener('fullscreenchange', this.fsHandler);
         document.removeEventListener('webkitfullscreenchange', this.fsHandler);
       }
+      if(this.fitHandler) window.removeEventListener('resize', this.fitHandler);
+      if(this.orientationHandler) window.removeEventListener('orientationchange', this.orientationHandler);
       restoreFallbackFullscreen();
       this.map.remove();
     }
@@ -1976,6 +1979,42 @@ function initRadar(){
   const enterFsIcon = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M21 16v5h-5M8 21H3v-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   const exitFsIcon = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M9 3v6H3M15 3v6h6M21 15h-6v6M3 15h6v6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
   const fullscreenElement = ()=>document.fullscreenElement || document.webkitFullscreenElement || null;
+
+  /* Keep the normal radar console entirely above the fold. We measure the
+     actual remaining viewport instead of guessing with vh, then freeze that
+     height so browser chrome / scrolling cannot make the map jump around. */
+  function fitRadarStage(force=false){
+    if(!radarStage) return;
+    const activeFs = fullscreenElement()===radarStage || radar.fallbackFullscreen;
+    if(activeFs) return;
+
+    const width = window.innerWidth || document.documentElement.clientWidth || 0;
+    /* Mobile address-bar show/hide fires resize events without a real layout
+       change. Ignore those; only refit for a meaningful width/orientation change. */
+    if(!force && radar.fitWidth && Math.abs(width-radar.fitWidth) < 40) return;
+    radar.fitWidth = width;
+
+    const viewportH = window.innerHeight || document.documentElement.clientHeight || 720;
+    const stageTop = Math.max(0, radarStage.getBoundingClientRect().top);
+    const controls = radarStage.querySelector('.radarcontrols');
+    const controlsH = Math.ceil(controls?.getBoundingClientRect().height || 82);
+    const bottomBreathingRoom = 8;
+    const available = Math.max(controlsH + 250, viewportH - stageTop - bottomBreathingRoom);
+    const preferred = controlsH + 520;
+    const stageH = Math.min(preferred, available);
+
+    radarStage.style.setProperty('--radar-stage-h', `${Math.round(stageH)}px`);
+    radarStage.classList.add('radarfit');
+    requestAnimationFrame(()=>map.invalidateSize());
+  }
+
+  radar.fitHandler = ()=>fitRadarStage(false);
+  radar.orientationHandler = ()=>setTimeout(()=>fitRadarStage(true), 90);
+  window.addEventListener('resize', radar.fitHandler, {passive:true});
+  window.addEventListener('orientationchange', radar.orientationHandler, {passive:true});
+  requestAnimationFrame(()=>fitRadarStage(true));
+  setTimeout(()=>fitRadarStage(true), 120);
+
   function restoreFallbackFullscreen(){
     if(!radar.fallbackFullscreen) return;
     radar.fallbackFullscreen = false;
@@ -1994,6 +2033,7 @@ function initRadar(){
       fsButton.title = active ? 'Exit fullscreen' : 'Fullscreen map';
       fsButton.setAttribute('aria-pressed', active ? 'true' : 'false');
     }
+    if(!active) fitRadarStage(true);
     requestAnimationFrame(()=>{
       map.invalidateSize();
       setTimeout(()=>map.invalidateSize(), 120);

@@ -335,6 +335,13 @@ nav.tabs button[aria-selected="true"]{color:var(--ink)}
 .radarstage{background:var(--pith)}
 .radarmapframe{position:relative;touch-action:pan-y}
 #map{height:min(62vh,520px);min-height:360px;border-radius:14px;border:1px solid var(--ink);z-index:var(--z-map);background:#EDEBDD;overflow:hidden}
+/* Normal radar view is fitted once to the remaining viewport so the map,
+   basemap switcher, play button, timeline and timestamp are all immediately
+   reachable. The explicit fitted height stays put while the page scrolls. */
+.radarstage.radarfit{display:flex;flex-direction:column;height:var(--radar-stage-h);min-height:0}
+.radarstage.radarfit .radarmapframe{flex:1 1 auto;min-height:0}
+.radarstage.radarfit #map{height:100%;min-height:0;max-height:none}
+.radarstage.radarfit .radarcontrols{flex:0 0 auto}
 .radarmapframe.maplocked #map{pointer-events:none}
 /* Put our fullscreen button above Leaflet's +/- control, then the lemon toggle below it. */
 .radarmapframe .leaflet-top.leaflet-left{top:40px}
@@ -781,4 +788,7 @@ footer.site b{color:var(--ink);font-weight:600}
 @media (max-width:430px){
   .basemaptoggle{width:100%;}
   .basemaptoggle button{flex:1;padding:6px 8px;font-size:.74rem;}
+  .radarui{gap:10px;margin-top:9px}
+  .playbtn{width:40px;height:40px}
+  .frametime{min-width:4.9rem;font-size:.92rem}
 }
