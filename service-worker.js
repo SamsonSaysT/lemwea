@@ -1,4 +1,4 @@
-const CACHE_NAME = 'lemons-weather-v46';
+const CACHE_NAME = 'lemons-weather-v51';
 const APP_SHELL = [
   './',
   './index.html',

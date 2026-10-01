@@ -82,10 +82,14 @@ const state = {
   alerts: [],
   air: null,
   detail: null,                           // richer best-match metrics for click-through views
+  extended: null,                         // ECMWF EC46 ensemble-mean guidance beyond normal forecast range
   historyCache: {},
   tab: 'current',
   radar: null
 };
+
+const DAILY_NORMAL_DAYS = 16;
+const DAILY_EXTENDED_DAYS = 46;
 
 /* ---------- weather-code helpers (WMO) ---------- */
 function codeLabel(c){
@@ -211,7 +215,7 @@ async function fetchOpenMeteo(lat, lon){
   const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`
     + `&hourly=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation_probability,weather_code,wind_speed_10m`
     + `&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code`
-    + `&models=${models}&timezone=auto&forecast_days=10&wind_speed_unit=kmh`;
+    + `&models=${models}&timezone=auto&forecast_days=16&wind_speed_unit=kmh`;
   let d;
   try{
     d = await fetchJSON(url);
@@ -350,6 +354,72 @@ async function fetchForecastDetails(lat, lon){
     sunshineSec:dd.sunshine_duration?.[i] ?? null
   }));
   return {ok:true, hourly, daily};
+}
+
+
+/* ---- sub-seasonal extension: ECMWF EC46 ensemble mean ----
+   This is intentionally NOT blended into the first 16 days. It exists only to
+   keep the calendar going after normal deterministic/model guidance ends.
+   EC46 is coarse (~36 km), ensemble-based and best treated as a pattern signal. */
+async function fetchExtendedOutlook(lat, lon){
+  const dailyFields = ['temperature_2m_max','temperature_2m_min','precipitation_sum','cloud_cover_mean'].join(',');
+  const weeklyFields = ['temperature_2m_anomaly','precipitation_anomaly'].join(',');
+  const url = `https://seasonal-api.open-meteo.com/v1/seasonal?latitude=${lat}&longitude=${lon}`
+    + `&daily=${dailyFields}&weekly=${weeklyFields}&models=ecmwf_ec46_ensemble_mean`
+    + `&timezone=auto&forecast_days=${DAILY_EXTENDED_DAYS}`;
+  const d = await fetchJSON(url, {}, 18000);
+  const daily = new Map(), weekly=[];
+  const dd=d.daily||{};
+  (dd.time||[]).forEach((date,i)=> daily.set(date, {
+    hiC:dd.temperature_2m_max?.[i] ?? null,
+    loC:dd.temperature_2m_min?.[i] ?? null,
+    precipMm:dd.precipitation_sum?.[i] ?? null,
+    cloud:dd.cloud_cover_mean?.[i] ?? null,
+    code:(()=>{
+      const rain=dd.precipitation_sum?.[i] ?? 0, cloud=dd.cloud_cover_mean?.[i] ?? null;
+      if(rain>=5) return 61;
+      if(rain>=0.5) return 80;
+      if(cloud==null) return 2;
+      return cloud>=78?3:cloud>=38?2:cloud>=18?1:0;
+    })()
+  }));
+  const ww=d.weekly||{};
+  (ww.time||[]).forEach((date,i)=> weekly.push({
+    date,
+    tempAnomC:ww.temperature_2m_anomaly?.[i] ?? null,
+    precipAnom:ww.precipitation_anomaly?.[i] ?? null
+  }));
+  return {ok:true, daily, weekly, model:'ECMWF EC46 ensemble mean', resolutionKm:36};
+}
+
+function extendedWeekForDate(date){
+  const weeks=state.extended?.weekly||[];
+  if(!weeks.length) return null;
+  const t=new Date(date+'T12:00:00').getTime();
+  let best=null;
+  for(const w of weeks){
+    const wt=new Date(w.date+'T12:00:00').getTime();
+    if(wt<=t && t<wt+7*86400000) return w;
+    if(wt<=t) best=w;
+  }
+  return best;
+}
+function extendedTempSignal(v){
+  if(v==null || !isFinite(v)) return null;
+  if(v>=1.5) return 'warmer than normal';
+  if(v<=-1.5) return 'cooler than normal';
+  return 'near normal';
+}
+function extendedPrecipSignal(v){
+  if(v==null || !isFinite(v)) return null;
+  if(v>=0.5) return 'wetter than normal';
+  if(v<=-0.5) return 'drier than normal';
+  return 'near normal';
+}
+function extendedConfidence(date){
+  const today=new Date(new Intl.DateTimeFormat('en-CA',{timeZone:state.tz||undefined}).format(new Date())+'T12:00:00');
+  const d=Math.max(0,Math.round((new Date(date+'T12:00:00')-today)/86400000));
+  return d<=23?'low':d<=34?'very low':'very low · pattern only';
 }
 
 /* ---- 2. NWS / weather.gov (US only) ---- */
@@ -690,11 +760,12 @@ async function fetchAirModel(lat, lon){
 async function loadWeather(){
   renderLoading();
   const {lat, lon} = state.loc;
-  const [weatherResults, alertResult, airResult, detailResult] = await Promise.all([
+  const [weatherResults, alertResult, airResult, detailResult, extendedResult] = await Promise.all([
     Promise.allSettled([fetchOpenMeteo(lat, lon), fetchNWS(lat, lon), fetchMetNo(lat, lon), fetchBrightSky(lat, lon)]),
     fetchNWSAlerts(lat, lon).then(v=>({ok:true, value:v})).catch(()=>({ok:false, value:[]})),
     fetchAirQuality(lat, lon).then(v=>({ok:true, value:v})).catch(()=>({ok:false, value:{ok:false}})),
     fetchForecastDetails(lat, lon).then(v=>({ok:true, value:v})).catch(()=>({ok:false, value:null})),
+    fetchExtendedOutlook(lat, lon).then(v=>({ok:true, value:v})).catch(()=>({ok:false, value:null})),
     fetchSunTimes(lat, lon)
   ]);
   let sources = [];
@@ -706,6 +777,7 @@ async function loadWeather(){
   state.alerts = alertResult.value || [];
   state.air = airResult.value || {ok:false};
   state.detail = detailResult.value || null;
+  state.extended = extendedResult.value || null;
   state.updated = Date.now();
   if(!sources.some(s=>s.ok)){
     $('#app').innerHTML = `<div class="msg"><h2>The lemon came up dry.</h2>
@@ -750,12 +822,68 @@ function consensusHourly(hours=24){
   }
   return out;
 }
-function consensusDaily(days=16){
+function consensusDaily(days=DAILY_EXTENDED_DAYS){
   const dates = new Set();
   okSources().forEach(s=> s.daily && [...s.daily.keys()].forEach(d=>dates.add(d)));
+  state.detail?.daily && [...state.detail.daily.keys()].forEach(d=>dates.add(d));
+  state.extended?.daily && [...state.extended.daily.keys()].forEach(d=>dates.add(d));
   const todayStr = new Intl.DateTimeFormat('en-CA',{timeZone:state.tz||undefined}).format(new Date());
+
+  // Normal forecast data gets absolute priority through its true horizon. The
+  // seasonal feed is deliberately held back until AFTER that horizon so it can
+  // never contaminate the regular Lemons squeeze.
+  const normalDates=[];
+  okSources().forEach(s=>s.daily && normalDates.push(...s.daily.keys()));
+  state.detail?.daily && normalDates.push(...state.detail.daily.keys());
+  const normalMax = normalDates.filter(d=>d>=todayStr).sort().at(-1) || null;
+
   return [...dates].filter(d=>d>=todayStr).sort().slice(0,days).map(date=>{
+    const detail = state.detail?.daily?.get(date) || null;
+    const ext = state.extended?.daily?.get(date) || null;
     const pairs = okSources().map(source=>({source,row:source.daily?.get(date)})).filter(x=>x.row && (x.row.hiC!=null || x.row.loC!=null));
+    const insideNormal = normalMax && date<=normalMax;
+
+    if(!pairs.length && (!detail || (detail.hiC==null && detail.loC==null))){
+      if(!ext || (ext.hiC==null && ext.loC==null) || insideNormal) return null;
+      const week=extendedWeekForDate(date);
+      return {
+        date,
+        hiC:ext.hiC ?? null,
+        loC:ext.loC ?? null,
+        precip:null,
+        precipMm:ext.precipMm ?? null,
+        code:ext.code ?? null,
+        count:51,
+        totalCount:51,
+        omittedCount:0,
+        extended:true,
+        fallback:false,
+        tempAnomC:week?.tempAnomC ?? null,
+        precipAnom:week?.precipAnom ?? null,
+        tempSignal:extendedTempSignal(week?.tempAnomC),
+        precipSignal:extendedPrecipSignal(week?.precipAnom),
+        confidence:extendedConfidence(date)
+      };
+    }
+
+    if(!pairs.length){
+      if(!detail || (detail.hiC==null && detail.loC==null)) return null;
+      return {
+        date,
+        hiC:detail.hiC ?? null,
+        loC:detail.loC ?? null,
+        precip:detail.precip ?? null,
+        code:detail.code ?? null,
+        count:1,
+        totalCount:1,
+        omittedCount:0,
+        fallback:true,
+        extended:false,
+        sunrise:detail.sunrise ?? null,
+        sunset:detail.sunset ?? null
+      };
+    }
+
     const hiSel=robustSelect(pairs.filter(x=>x.row.hiC!=null), x=>x.row.hiC, 3.3);
     const loSel=robustSelect(pairs.filter(x=>x.row.loC!=null), x=>x.row.loC, 3.3);
     const badIds=new Set([...hiSel.omitted,...loSel.omitted].map(x=>x.source.id));
@@ -764,13 +892,22 @@ function consensusDaily(days=16){
       keptPairs=robustSelect(pairs,x=>avg([x.row.hiC,x.row.loC]),3.3).kept;
     }
     const rows = keptPairs.map(x=>x.row);
-    const precip=robustAvg(rows.map(r=>r.precip),35);
-    return { date, hiC:avg(rows.map(r=>r.hiC)), loC:avg(rows.map(r=>r.loC)),
-      precip, code:representativeDailyCode(date, rows), count:rows.length,
-      totalCount:pairs.length, omittedCount:pairs.length-keptPairs.length,
-      sunrise:(rows.find(r=>r.sunrise)?.sunrise ?? state.detail?.daily?.get(date)?.sunrise ?? null),
-      sunset:(rows.find(r=>r.sunset)?.sunset ?? state.detail?.daily?.get(date)?.sunset ?? null) };
-  }).filter(d=>d.hiC!=null||d.loC!=null);
+    const precip=robustAvg(rows.map(r=>r.precip),35) ?? detail?.precip ?? null;
+    return {
+      date,
+      hiC:avg(rows.map(r=>r.hiC)) ?? detail?.hiC ?? null,
+      loC:avg(rows.map(r=>r.loC)) ?? detail?.loC ?? null,
+      precip,
+      code:representativeDailyCode(date, rows) ?? detail?.code ?? null,
+      count:rows.length,
+      totalCount:pairs.length,
+      omittedCount:pairs.length-keptPairs.length,
+      fallback:false,
+      extended:false,
+      sunrise:(rows.find(r=>r.sunrise)?.sunrise ?? detail?.sunrise ?? null),
+      sunset:(rows.find(r=>r.sunset)?.sunset ?? detail?.sunset ?? null)
+    };
+  }).filter(d=>d && (d.hiC!=null||d.loC!=null));
 }
 
 /* =====================================================================
@@ -1197,7 +1334,7 @@ function lemonsSays(cur, today){
 }
 function renderApp(){
   const cur = consensusCurrent();
-  const daily = consensusDaily(16);
+  const daily = consensusDaily(DAILY_EXTENDED_DAYS);
   const today = daily[0];
   const app = $('#app');
   setTopActions(`
@@ -1375,6 +1512,7 @@ function renderDaily(daily){
   if(!daily.length){ $('#view-daily').innerHTML = `<div class="msg">No daily data came back.</div>`; return; }
   const monthFmt = new Intl.DateTimeFormat('en-US', {month:'long'});
   const todayStr = new Intl.DateTimeFormat('en-CA',{timeZone:state.tz||undefined}).format(new Date());
+  const normalCount=daily.filter(d=>!d.extended).length, extendedCount=daily.filter(d=>d.extended).length;
   const groups=[];
   daily.forEach(d=>{
     const key=d.date.slice(0,7);
@@ -1387,22 +1525,26 @@ function renderDaily(daily){
     const blanks=Array.from({length:first.getDay()},()=>'<span class="dayblank" aria-hidden="true"></span>');
     const cells=g.days.map(d=>{
       const dt=new Date(d.date+'T12:00:00');
-      return `<button class="daycell${d.date===todayStr?' today':''}" data-date="${d.date}" aria-label="Open details for ${esc(dt.toDateString())}">
+      const sig=d.extended ? (d.tempSignal==='warmer than normal'?'warmer':d.tempSignal==='cooler than normal'?'cooler':d.precipSignal==='wetter than normal'?'wetter':d.precipSignal==='drier than normal'?'drier':'prediction') : '';
+      return `<button class="daycell${d.date===todayStr?' today':''}${d.extended?' extended':''}" data-date="${d.date}" aria-label="Open ${d.extended?'extended prediction':'forecast'} details for ${esc(dt.toDateString())}">
         <span class="daynum">${dt.getDate()}</span>
+        ${d.extended?'<span class="predtag">PRED</span>':''}
         ${iconFor(d.code,36,false)}
         <span class="dayhi">${T(d.hiC)}°</span>
         <span class="daylo">${T(d.loC)}°</span>
-        ${d.precip!=null&&d.precip>=10?`<span class="daypop">${Math.round(d.precip)}%</span>`:''}
+        ${d.extended?`<span class="daysignal">${esc(sig)}</span>`:(d.precip!=null&&d.precip>=10?`<span class="daypop">${Math.round(d.precip)}%</span>`:'')}
       </button>`;
     });
+    const dayCountLabel = `${daily.length} day${daily.length===1?'':'s'}`;
     return `<section class="monthblock${gi?' nextmonth':''}">
-      <div class="dailyhead"><div><h2>${esc(monthFmt.format(first))}</h2>${gi===0?'<p>16-day outlook · tap a day for day / night details</p>':''}</div>${gi===0?'<span>16 days</span>':''}</div>
+      <div class="dailyhead"><div><h2>${esc(monthFmt.format(first))}</h2>${gi===0?`<p>${dayCountLabel} outlook · tap a day for details</p>`:''}</div>${gi===0?`<span>${dayCountLabel}</span>`:''}</div>
+      ${gi===0&&extendedCount?`<div class="extendedlegend"><b>${normalCount} days forecast</b><span>then ${extendedCount} days of clearly marked long-range prediction. Those later cells are ECMWF EC46 ensemble guidance — coarse, low confidence, and worth cross-checking with NWS/other sources as the date gets closer.</span></div>`:''}
       <div class="weekdayrow">${['S','M','T','W','T','F','S'].map(x=>`<span>${x}</span>`).join('')}</div>
       <div class="daygrid">${[...blanks,...cells].join('')}</div>
     </section>`;
   }).join('');
   $('#view-daily').innerHTML = `${blockHtml}
-    <p class="blendnote">Daily highs and lows use the same outlier-resistant squeeze. Detail rows come from the local best-match feed so wind, humidity, visibility, UV, rain amount and sun times stay internally consistent.</p>`;
+    <p class="blendnote">Days 1–${normalCount} use the regular outlier-resistant Lemons squeeze wherever models are available. <b>PRED</b> cells after that are long-range ECMWF EC46 ensemble guidance, not normal day-by-day forecasts. Exact values can move a lot; cross-check other sources before relying on them.</p>`;
   $('#view-daily').querySelectorAll('[data-date]').forEach(b=>b.addEventListener('click', ()=>openDailyDetail(b.dataset.date)));
 }
 
@@ -1459,23 +1601,57 @@ function dayHourlySlice(date, night=false){
 }
 function summarizePeriod(date, night=false){
   const arr=dayHourlySlice(date,night), d=state.detail?.daily?.get(date)||{};
+  const hasHourly = arr.length>0;
+  const gustVals=arr.map(x=>x.gustKmh).filter(x=>x!=null);
+  const precipVals=arr.map(x=>x.precip).filter(x=>x!=null);
   return {
-    feelsC: night ? (d.feelsLoC ?? avg(arr.map(x=>x.feelsC))) : (d.feelsHiC ?? avg(arr.map(x=>x.feelsC))),
-    windKmh: avg(arr.map(x=>x.windKmh)) ?? d.windKmh,
-    windDir: median(arr.map(x=>x.windDir)) ?? d.windDir,
-    gustKmh: Math.max(...arr.map(x=>x.gustKmh).filter(x=>x!=null), d.gustKmh??-Infinity),
-    cloud: avg(arr.map(x=>x.cloud)),
-    precip: Math.max(...arr.map(x=>x.precip).filter(x=>x!=null), d.precip??-Infinity),
-    rainMm: arr.reduce((a,x)=>a+(x.rainMm||0),0),
-    snowCm: arr.reduce((a,x)=>a+(x.snowCm||0),0),
-    precipHours: arr.filter(x=>(x.precipMm||0)>0.05).length,
-    humidity: avg(arr.map(x=>x.humidity)), dewC:avg(arr.map(x=>x.dewC))
+    feelsC: night ? (d.feelsLoC ?? (hasHourly?avg(arr.map(x=>x.feelsC)):null)) : (d.feelsHiC ?? (hasHourly?avg(arr.map(x=>x.feelsC)):null)),
+    windKmh: hasHourly ? (avg(arr.map(x=>x.windKmh)) ?? d.windKmh ?? null) : (d.windKmh ?? null),
+    windDir: hasHourly ? (median(arr.map(x=>x.windDir)) ?? d.windDir ?? null) : (d.windDir ?? null),
+    gustKmh: gustVals.length ? Math.max(...gustVals, d.gustKmh??-Infinity) : (d.gustKmh ?? null),
+    cloud: hasHourly ? avg(arr.map(x=>x.cloud)) : null,
+    precip: precipVals.length ? Math.max(...precipVals, d.precip??-Infinity) : (d.precip ?? null),
+    rainMm: hasHourly ? arr.reduce((a,x)=>a+(x.rainMm||0),0) : (!night ? (d.rainMm ?? null) : null),
+    snowCm: hasHourly ? arr.reduce((a,x)=>a+(x.snowCm||0),0) : (!night ? (d.snowCm ?? null) : null),
+    precipHours: hasHourly ? arr.filter(x=>(x.precipMm||0)>0.05).length : (!night ? (d.precipHours ?? null) : null),
+    humidity: hasHourly ? avg(arr.map(x=>x.humidity)) : null,
+    dewC: hasHourly ? avg(arr.map(x=>x.dewC)) : null
   };
 }
 function safeMax(v){ return v===-Infinity?null:v; }
 
+function openExtendedDailyDetail(day){
+  const date=day.date, dt=new Date(date+'T12:00:00');
+  const subtitle=new Intl.DateTimeFormat('en-US',{weekday:'short',month:'short',day:'numeric'}).format(dt);
+  const signalBits=[day.tempSignal,day.precipSignal].filter(Boolean).join(' · ');
+  const tempAnom = day.tempAnomC!=null ? `${day.tempAnomC>0?'+':''}${(state.unit==='F' ? day.tempAnomC*9/5 : day.tempAnomC).toFixed(1)}°${state.unit}` : null;
+  const precipAmount = day.precipMm!=null ? P(day.precipMm) : null;
+  detailModalShell(state.loc.name, subtitle, `<div class="detailtabs extendedtabs" role="tablist"><button data-dtab="outlook" aria-selected="true">Outlook</button><button data-dtab="history" aria-selected="false">History</button></div><div id="dailyDetailContent"></div>`);
+  const renderOutlook=()=>{
+    const el=$('#dailyDetailContent'); if(!el) return;
+    el.innerHTML=`<div class="extendedwarning"><b>Extended prediction — not a normal forecast</b><span>This is coarse ensemble guidance this far out. Exact day-to-day weather can change a lot.</span></div>
+      <div class="detailhero dailyhero extendedhero">${iconFor(day.code,68,false)}<div class="extendedrange"><b>${T(day.hiC)}°</b><span>/</span><b>${T(day.loC)}°</b></div><div class="detailcond">${esc(signalBits || codeLabel(day.code))}</div></div>
+      <div class="detailrows">
+        ${metricRow('Model mean high', day.hiC!=null?`${T(day.hiC)}°${state.unit}`:'—')}
+        ${metricRow('Model mean low', day.loC!=null?`${T(day.loC)}°${state.unit}`:'—')}
+        ${metricRow('Temperature signal', day.tempSignal?`${esc(day.tempSignal)}${tempAnom?` · ${tempAnom}`:''}`:'—')}
+        ${metricRow('Precipitation signal', day.precipSignal?esc(day.precipSignal):'—')}
+        ${metricRow('Model precipitation', precipAmount)}
+        ${metricRow('Confidence', esc(day.confidence||'very low'))}
+      </div>
+      <div class="extendedsource"><b>What this is</b><p>ECMWF EC46 ensemble-mean guidance at roughly 36 km resolution. Lemons does not blend this into the regular 16-day forecast, and it should be read as a broad pattern prediction — not a promise that this exact high, low or icon will happen on this exact date.</p><p><strong>Cross-check it.</strong> As this date gets closer, use the normal Lemons squeeze plus weather.gov/NWS and another independent source before making plans.</p><div class="extendedlinks"><a href="https://www.weather.gov/" target="_blank" rel="noopener">weather.gov ↗</a><a href="https://www.cpc.ncep.noaa.gov/" target="_blank" rel="noopener">NOAA climate outlooks ↗</a></div></div>`;
+  };
+  $('#forecastDetail').querySelectorAll('[data-dtab]').forEach(b=>b.addEventListener('click',async()=>{
+    const tab=b.dataset.dtab;
+    $('#forecastDetail').querySelectorAll('[data-dtab]').forEach(x=>x.setAttribute('aria-selected',x.dataset.dtab===tab));
+    if(tab==='history') await renderHistoryTab(date,day); else renderOutlook();
+  }));
+  renderOutlook();
+}
+
 function openDailyDetail(date){
-  const day=consensusDaily(16).find(x=>x.date===date); if(!day) return;
+  const day=consensusDaily(DAILY_EXTENDED_DAYS).find(x=>x.date===date); if(!day) return;
+  if(day.extended){ openExtendedDailyDetail(day); return; }
   const dt=new Date(date+'T12:00:00');
   const title=state.loc.name;
   const subtitle=new Intl.DateTimeFormat('en-US',{weekday:'short',month:'short',day:'numeric'}).format(dt);
@@ -1492,11 +1668,11 @@ function openDailyDetail(date){
       : `<div class="celestial"><span class="sectioncap">Sun</span>${metricRow('Rise', det.sunrise?skyTime(det.sunrise):'—')}${metricRow('Set', det.sunset?skyTime(det.sunset):'—')}${metricRow('Total daylight', durText(det.daylightSec))}</div>`;
     $('#dailyDetailContent').innerHTML=`<div class="detailhero dailyhero">${iconFor(code,76,night)}<div class="detailtemp">${T(temp)}°</div><div class="detailprecip">${pop!=null?`Precipitation: ${Math.round(pop)}%`:''}</div><div class="detailcond">${esc(codeLabel(code))}</div></div>
       <div class="detailrows">
-        ${metricRow('Feels like', `${T(sum.feelsC ?? temp)}°${state.unit}`)}
+        ${metricRow('Feels like', sum.feelsC!=null?`${T(sum.feelsC)}°${state.unit}`:'—')}
         ${metricRow('Humidity', sum.humidity!=null?`${Math.round(sum.humidity)}%`:'—')}
         ${metricRow('Wind', windText(sum.windKmh,sum.windDir))}
         ${metricRow('Max wind gusts', sum.gustKmh!=null?`${W(sum.gustKmh)} ${windUnit()}`:'—')}
-        ${metricRow('Total hours of precipitation', `${sum.precipHours} hr${sum.precipHours===1?'':'s'}`)}
+        ${metricRow('Total hours of precipitation', sum.precipHours!=null?`${sum.precipHours} hr${sum.precipHours===1?'':'s'}`:'—')}
         ${metricRow('Precipitation probability', pop!=null?`${Math.round(pop)}%`:'—')}
         ${metricRow(sum.snowCm>0?'Snow amount':'Rain amount', amount)}
         ${!night?metricRow('Max UV index', det.uv!=null?`${det.uv.toFixed(1)}${det.uv<3?' (Low)':det.uv<6?' (Moderate)':det.uv<8?' (High)':' (Very high)'}`:'—'):''}
@@ -1516,33 +1692,333 @@ function moonPhaseAt(dateLike){
   return {age,frac,waxing,name};
 }
 
-async function fetchHistoryForDate(date){
-  const key=`${state.loc.lat.toFixed(3)},${state.loc.lon.toFixed(3)}:${date.slice(5)}`;
+const HISTORY_FIRST_YEAR = 1940;
+const HISTORY_PAGE_YEARS = 10;
+const HISTORY_CHART_W = 1000;
+let historyRenderSeq = 0;
+let historyChartModes = {temp:'line', rain:'line'};
+let historyChartSelectionYears = {temp:null, rain:null};
+
+function historyInitialEndYear(date){
+  return Math.max(HISTORY_FIRST_YEAR, Math.min(new Date(date+'T12:00:00').getFullYear()-1, new Date().getFullYear()));
+}
+function historyPageBounds(endYear){
+  const end=Math.max(HISTORY_FIRST_YEAR,Math.round(endYear));
+  return {startYear:Math.max(HISTORY_FIRST_YEAR,end-HISTORY_PAGE_YEARS+1),endYear:end};
+}
+function historyTempValue(c){ return c==null?null:(state.unit==='F'?cToF(c):c); }
+function historyRainValue(mm){ return mm==null?null:(state.unit==='F'?mm/25.4:mm); }
+function historyRainUnit(){ return state.unit==='F'?'in':'mm'; }
+function historyTempUnit(){ return `°${state.unit}`; }
+function historyActive(){ return !!$('#dailyDetailContent') && !!$('#forecastDetail [data-dtab="history"][aria-selected="true"]'); }
+function historyLoadingMarkup(){
+  return `<div class="historyskeleton" aria-live="polite" aria-label="Loading weather history">
+    <div class="historyskline wide"></div><div class="historyskline"></div><div class="historyskchart"></div>
+    <div class="historyskline short"></div><div class="historyskrow"></div><div class="historyskrow"></div><div class="historyskrow"></div>
+    <p class="historyloadcopy">Gathering the full same-date record…</p>
+  </div>`;
+}
+async function fetchHistoryPage(date,endYear){
+  const target=new Date(date+'T12:00:00'), month=target.getMonth(), day=target.getDate();
+  const b=historyPageBounds(endYear);
+  const key=`page:${state.loc.lat.toFixed(3)},${state.loc.lon.toFixed(3)}:${month+1}-${day}:${b.startYear}-${b.endYear}`;
   if(state.historyCache[key]) return state.historyCache[key];
-  const target=new Date(date+'T12:00:00'), month=target.getMonth(), day=target.getDate(), y=target.getFullYear();
-  const startY=y-10, endY=y-1;
-  const pad=n=>String(n).padStart(2,'0');
-  const start=`${startY}-${pad(month+1)}-${pad(day)}`, end=`${endY}-${pad(month+1)}-${pad(day)}`;
+  const start=`${b.startYear}-01-01`;
+  /* ERA5 trails real time by several days. Clamp a page that reaches the current
+     year so a late-December request never asks the archive for future dates. */
+  const safeArchive=new Date(Date.now()-7*86400000).toISOString().slice(0,10);
+  const end=(`${b.endYear}-12-31`<safeArchive)?`${b.endYear}-12-31`:safeArchive;
   try{
-    const d=await fetchJSON(`https://archive-api.open-meteo.com/v1/archive?latitude=${state.loc.lat}&longitude=${state.loc.lon}&start_date=${start}&end_date=${end}&daily=temperature_2m_max,temperature_2m_min&timezone=auto`,{},15000);
+    /* ERA5 is deliberately pinned here instead of Open-Meteo "best match" so a
+       1940-vs-2020 comparison uses one consistent reanalysis record. */
+    const vars='weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,rain_sum,snowfall_sum';
+    const url=`https://archive-api.open-meteo.com/v1/archive?latitude=${state.loc.lat}&longitude=${state.loc.lon}&start_date=${start}&end_date=${end}&daily=${vars}&timezone=auto&models=era5`;
+    const d=await fetchJSON(url,{},24000);
     const rows=[];
-    (d.daily?.time||[]).forEach((ds,i)=>{ const x=new Date(ds+'T12:00:00'); if(x.getMonth()===month&&x.getDate()===day) rows.push({date:ds,hiC:d.daily.temperature_2m_max?.[i]??null,loC:d.daily.temperature_2m_min?.[i]??null}); });
-    const last=rows.find(r=>r.date.startsWith(String(endY)))||rows.at(-1)||null;
-    const out={avgHiC:avg(rows.map(r=>r.hiC)),avgLoC:avg(rows.map(r=>r.loC)),last,count:rows.length};
-    state.historyCache[key]=out; return out;
+    (d.daily?.time||[]).forEach((ds,i)=>{
+      const x=new Date(ds+'T12:00:00');
+      if(x.getMonth()!==month || x.getDate()!==day) return;
+      rows.push({
+        date:ds,year:x.getFullYear(),
+        code:d.daily.weather_code?.[i]??null,
+        hiC:d.daily.temperature_2m_max?.[i]??null,
+        loC:d.daily.temperature_2m_min?.[i]??null,
+        precipMm:d.daily.precipitation_sum?.[i]??null,
+        rainMm:d.daily.rain_sum?.[i]??null,
+        snowCm:d.daily.snowfall_sum?.[i]??null
+      });
+    });
+    const out={...b,rows,count:rows.length,avgHiC:avg(rows.map(r=>r.hiC)),avgLoC:avg(rows.map(r=>r.loC))};
+    state.historyCache[key]=out;
+    return out;
   }catch(e){ return null; }
 }
-async function renderHistoryTab(date,day){
+async function fetchAllHistory(date){
+  const target=new Date(date+'T12:00:00'), month=target.getMonth(), day=target.getDate();
+  const initialEnd=historyInitialEndYear(date);
+  const key=`all:${state.loc.lat.toFixed(3)},${state.loc.lon.toFixed(3)}:${month+1}-${day}:${initialEnd}`;
+  if(state.historyCache[key]) return state.historyCache[key];
+  const ends=[];
+  for(let end=initialEnd; end>=HISTORY_FIRST_YEAR; end-=HISTORY_PAGE_YEARS) ends.push(end);
+  const pages=new Array(ends.length);
+  let cursor=0;
+  const workers=Array.from({length:Math.min(3,ends.length)},async()=>{
+    while(cursor<ends.length){
+      const i=cursor++;
+      pages[i]=await fetchHistoryPage(date,ends[i]);
+    }
+  });
+  await Promise.all(workers);
+  const byYear=new Map();
+  pages.filter(Boolean).forEach(page=>page.rows.forEach(r=>{
+    if(!byYear.has(r.year)) byYear.set(r.year,r);
+  }));
+  const rows=[...byYear.values()].sort((a,b)=>a.year-b.year);
+  if(!rows.length) return null;
+  const out={
+    rows,
+    count:rows.length,
+    firstYear:rows[0].year,
+    lastYear:rows[rows.length-1].year,
+    partial:pages.some(p=>!p)
+  };
+  state.historyCache[key]=out;
+  return out;
+}
+function historyDateLabel(ds){
+  const d=new Date(ds+'T12:00:00Z');
+  return new Intl.DateTimeFormat('en-US',{month:'short',day:'numeric',year:'numeric',timeZone:'UTC'}).format(d);
+}
+function historyNiceTicks(min,max,target=6){
+  if(!isFinite(min)||!isFinite(max)) return [0,1];
+  if(min===max){ min-=1; max+=1; }
+  const span=Math.max(1e-9,max-min), raw=span/Math.max(2,target-1), p=Math.pow(10,Math.floor(Math.log10(raw)));
+  const candidates=[1,2,2.5,5,10].map(v=>v*p);
+  const step=candidates.reduce((best,v)=>Math.abs(v-raw)<Math.abs(best-raw)?v:best,candidates[0]);
+  const lo=Math.floor(min/step)*step, hi=Math.ceil(max/step)*step;
+  const ticks=[];
+  for(let v=lo,n=0; v<=hi+step*.1 && n<12; v+=step,n++) ticks.push(+v.toFixed(6));
+  return ticks.length>=2?ticks:[lo,hi];
+}
+function historyChartToggle(kind,mode){
+  return `<button type="button" data-history-chart="${kind}" data-history-mode="${mode}" aria-pressed="${historyChartModes[kind]===mode}">${mode[0].toUpperCase()+mode.slice(1)}</button>`;
+}
+function historyXAxisMarks(pts,x,H,B,W){
+  if(!pts.length) return {ticks:'',labels:''};
+  const maxLabels=8;
+  const every=Math.max(1,Math.ceil((pts.length-1)/Math.max(1,maxLabels-1)));
+  const chosen=[];
+  pts.forEach((r,i)=>{ if(i===0 || i===pts.length-1 || i%every===0) chosen.push({r,i}); });
+  const ticks=chosen.map(({i})=>`<line class="hchartxtick" x1="${x(i)}" x2="${x(i)}" y1="${H-B}" y2="${H-B+5}"/>`).join('');
+  const labels=chosen.map(({r,i},n)=>{
+    const pct=100*x(i)/W, edge=n===0?' first':n===chosen.length-1?' last':'';
+    return `<span class="hchartxlabel${edge}" style="left:${pct}%">${r.year}</span>`;
+  }).join('');
+  return {ticks,labels};
+}
+function historyTempChartBody(rows,mode=historyChartModes.temp){
+  const pts=rows.filter(r=>r.hiC!=null||r.loC!=null).sort((a,b)=>a.year-b.year);
+  if(!pts.length) return '<div class="historychartempty">No temperature record came back for this date.</div>';
+  const H=248,T0=16,B=42,PX=10,W=HISTORY_CHART_W, plotW=W, ih=H-T0-B;
+  const vals=pts.flatMap(r=>[historyTempValue(r.hiC),historyTempValue(r.loC)]).filter(v=>v!=null&&isFinite(v));
+  let dataMin=Math.min(...vals), dataMax=Math.max(...vals);
+  const pad=Math.max(3,(dataMax-dataMin)*.08);
+  const ticks=historyNiceTicks(dataMin-pad,dataMax+pad,8), min=ticks[0], max=ticks[ticks.length-1];
+  const x=i=>pts.length===1?plotW/2:PX+i*(plotW-PX*2)/(pts.length-1), y=v=>T0+(max-v)*ih/(max-min||1);
+  const tempFmt=v=>`${Number.isInteger(v)?v:v.toFixed(1)}${historyTempUnit()}`;
+  const grid=ticks.map(v=>`<line class="hchartgrid" x1="0" x2="${plotW}" y1="${y(v)}" y2="${y(v)}"/>`).join('');
+  const axis=ticks.map(v=>`<text class="hchartylabel" x="51" y="${y(v)+4}" text-anchor="end">${tempFmt(v)}</text>`).join('');
+  const xAxis=historyXAxisMarks(pts,x,H,B,W);
+  const pathFor=k=>{ let started=false; return pts.map((r,i)=>{ const v=historyTempValue(r[k]); if(v==null) return null; const cmd=started?'L':'M'; started=true; return `${cmd}${x(i).toFixed(1)},${y(v).toFixed(1)}`; }).filter(Boolean).join(' '); };
+  let marks='';
+  if(mode==='bar'){
+    const spacing=pts.length>1?(plotW-PX*2)/(pts.length-1):26, bw=Math.max(1.4,Math.min(7.5,spacing*.28)), base=y(min);
+    marks=pts.map((r,i)=>{
+      const hi=historyTempValue(r.hiC), lo=historyTempValue(r.loC), cx=x(i);
+      const a=hi==null?'':`<rect class="htempbar hi" x="${cx-bw-0.7}" y="${y(hi)}" width="${bw}" height="${Math.max(1,base-y(hi))}" rx="1"/>`;
+      const b=lo==null?'':`<rect class="htempbar lo" x="${cx+0.7}" y="${y(lo)}" width="${bw}" height="${Math.max(1,base-y(lo))}" rx="1"/>`;
+      return a+b;
+    }).join('');
+  }else if(mode==='area'){
+    const valid=pts.map((r,i)=>({i,hi:historyTempValue(r.hiC),lo:historyTempValue(r.loC)})).filter(r=>r.hi!=null&&r.lo!=null);
+    const band=valid.length>1?`M${valid.map(r=>`${x(r.i)},${y(r.hi)}`).join(' L')} L${[...valid].reverse().map(r=>`${x(r.i)},${y(r.lo)}`).join(' L')} Z`:'';
+    marks=`${band?`<path class="hchartarea temprange" d="${band}"/>`:''}<path class="hchartline hi" d="${pathFor('hiC')}"/><path class="hchartline lo" d="${pathFor('loC')}"/>`;
+  }else{
+    marks=`<path class="hchartline hi" d="${pathFor('hiC')}"/><path class="hchartline lo" d="${pathFor('loC')}"/>`;
+  }
+  return `<div class="historychartframe"><svg class="historyyaxis" viewBox="0 0 58 ${H}" aria-hidden="true">${axis}<text class="hchartaxisunit" x="51" y="11" text-anchor="end">${historyTempUnit()}</text></svg><div class="historyplotviewport historyplotinteractive" data-history-kind="temp" data-plot-w="${W}" data-plot-h="${H}" data-plot-left="${PX}" data-plot-right="${plotW-PX}" data-y-min="${min}" data-y-max="${max}" data-plot-top="${T0}" data-plot-bottom="${H-B}" tabindex="0" role="slider" aria-valuemin="${pts[0].year}" aria-valuemax="${pts[pts.length-1].year}" aria-label="Temperature history graph. Tap or drag across the graph to inspect any year."><div class="historyplotsurface"><svg class="historyplot" viewBox="0 0 ${plotW} ${H}" preserveAspectRatio="none" role="img" aria-label="High and low temperature for every available ${historyDateLabel(pts[0].date).replace(/,?\s*\d{4}$/,'')} record from ${pts[0].year} through ${pts[pts.length-1].year}">${grid}<line class="hchartbaseline" x1="0" x2="${plotW}" y1="${H-B}" y2="${H-B}"/>${marks}${xAxis.ticks}</svg><div class="historyxlabels">${xAxis.labels}</div><div class="historyscrub" aria-hidden="true"><div class="historyscrubband"></div><div class="historyscrubline"></div><i class="historyscrubdot temp-hi"></i><i class="historyscrubdot temp-lo"></i><div class="historycharttip"><b></b><span></span></div></div></div></div></div>`;
+}
+function historyRainChartBody(rows,mode=historyChartModes.rain){
+  const pts=[...rows].filter(r=>r.rainMm!=null).sort((a,b)=>a.year-b.year);
+  if(!pts.length) return '<div class="historychartempty">Rainfall was not available for this date.</div>';
+  const H=232,T0=16,B=42,PX=10,W=HISTORY_CHART_W, plotW=W, ih=H-T0-B;
+  const vals=pts.map(r=>historyRainValue(r.rainMm)).filter(v=>v!=null&&isFinite(v)), maxVal=Math.max(0,...vals);
+  const floorMax=state.unit==='F'?.1:2;
+  const ticks=historyNiceTicks(0,Math.max(maxVal*1.08,floorMax),7).filter(v=>v>=0);
+  const min=0,max=Math.max(...ticks), y=v=>T0+(max-v)*ih/(max||1), x=i=>pts.length===1?plotW/2:PX+i*(plotW-PX*2)/(pts.length-1);
+  const rainFmt=v=>`${v.toFixed(state.unit==='F'?(v<1?2:1):(v<10?1:0))} ${historyRainUnit()}`;
+  const grid=ticks.map(v=>`<line class="hchartgrid" x1="0" x2="${plotW}" y1="${y(v)}" y2="${y(v)}"/>`).join('');
+  const axis=ticks.map(v=>`<text class="hchartylabel" x="51" y="${y(v)+4}" text-anchor="end">${rainFmt(v)}</text>`).join('');
+  const xAxis=historyXAxisMarks(pts,x,H,B,W);
+  const path=pts.map((r,i)=>`${i?'L':'M'}${x(i).toFixed(1)},${y(historyRainValue(r.rainMm)).toFixed(1)}`).join(' ');
+  let marks='';
+  if(mode==='bar'){
+    const spacing=pts.length>1?(plotW-PX*2)/(pts.length-1):24, bw=Math.max(1.7,Math.min(9,spacing*.54)), base=y(0);
+    marks=pts.map((r,i)=>{ const v=historyRainValue(r.rainMm), yy=y(v); return `<rect class="hrainbar" x="${x(i)-bw/2}" y="${yy}" width="${bw}" height="${Math.max(1,base-yy)}" rx="1"/>`; }).join('');
+  }else if(mode==='area'){
+    const first=x(0),last=x(pts.length-1),base=y(0), area=`M${first},${base} L${pts.map((r,i)=>`${x(i)},${y(historyRainValue(r.rainMm))}`).join(' L')} L${last},${base} Z`;
+    marks=`<path class="hchartarea rain" d="${area}"/><path class="hchartline rain" d="${path}"/>`;
+  }else{
+    marks=`<path class="hchartline rain" d="${path}"/>`;
+  }
+  return `<div class="historychartframe"><svg class="historyyaxis" viewBox="0 0 58 ${H}" aria-hidden="true">${axis}<text class="hchartaxisunit" x="51" y="11" text-anchor="end">${historyRainUnit()}</text></svg><div class="historyplotviewport historyplotinteractive" data-history-kind="rain" data-plot-w="${W}" data-plot-h="${H}" data-plot-left="${PX}" data-plot-right="${plotW-PX}" data-y-min="${min}" data-y-max="${max}" data-plot-top="${T0}" data-plot-bottom="${H-B}" tabindex="0" role="slider" aria-valuemin="${pts[0].year}" aria-valuemax="${pts[pts.length-1].year}" aria-label="Rainfall history graph. Tap or drag across the graph to inspect any year."><div class="historyplotsurface"><svg class="historyplot" viewBox="0 0 ${plotW} ${H}" preserveAspectRatio="none" role="img" aria-label="Rainfall for every available same-date record from ${pts[0].year} through ${pts[pts.length-1].year}">${grid}<line class="hchartbaseline" x1="0" x2="${plotW}" y1="${H-B}" y2="${H-B}"/>${marks}${xAxis.ticks}</svg><div class="historyxlabels">${xAxis.labels}</div><div class="historyscrub" aria-hidden="true"><div class="historyscrubband"></div><div class="historyscrubline"></div><i class="historyscrubdot rain"></i><div class="historycharttip"><b></b><span></span></div></div></div></div></div>`;
+}
+function historyTempChart(rows){
+  return `<section class="historychart" data-history-chart-shell="temp"><div class="historycharthead"><div><h3>Temperature</h3><p>${historyTempUnit()} · all ${rows.filter(r=>r.hiC!=null||r.loC!=null).length} records · tap or drag to inspect</p></div><div class="historychartmeta"><div class="historylegend"><span><i class="hi"></i>High</span><span><i class="lo"></i>Low</span></div><div class="historycharttypes" role="group" aria-label="Temperature graph type">${historyChartToggle('temp','line')}${historyChartToggle('temp','bar')}${historyChartToggle('temp','area')}</div></div></div><div class="historychartbody">${historyTempChartBody(rows)}</div></section>`;
+}
+function historyRainChart(rows){
+  return `<section class="historychart" data-history-chart-shell="rain"><div class="historycharthead"><div><h3>Rainfall</h3><p>${historyRainUnit()} · all ${rows.filter(r=>r.rainMm!=null).length} records · tap or drag to inspect</p></div><div class="historychartmeta"><span class="historyunit">${historyRainUnit()}</span><div class="historycharttypes" role="group" aria-label="Rainfall graph type">${historyChartToggle('rain','line')}${historyChartToggle('rain','bar')}${historyChartToggle('rain','area')}</div></div></div><div class="historychartbody">${historyRainChartBody(rows)}</div></section>`;
+}
+function historyRowsMarkup(rows){
+  const ordered=[...rows].sort((a,b)=>b.year-a.year);
+  return `<section class="historyyears"><div class="historyyearsintro"><div><h3>Year by year</h3><p>${ordered.length} available same-date records · newest to oldest</p></div><span>${ordered.length?`${ordered[ordered.length-1].year}–${ordered[0].year}`:''}</span></div><div class="historyyearshead"><span>Date</span><span>Weather</span><b>High <small>${historyTempUnit()}</small></b><b>Low <small>${historyTempUnit()}</small></b><b>Rain <small>${historyRainUnit()}</small></b></div>${ordered.map(r=>`<div class="historyyearrow">
+    <strong><span>${r.year}</span><small>${esc(historyDateLabel(r.date).replace(/,?\s*\d{4}$/,''))}</small></strong><span class="historywx">${iconFor(r.code,28,false)}<span>${esc(codeLabel(r.code))}${r.snowCm>0?`<small>${esc(SNOW(r.snowCm))} snow</small>`:''}</span></span>
+    <b>${r.hiC!=null?`${T(r.hiC)}°`:'—'}</b><b>${r.loC!=null?`${T(r.loC)}°`:'—'}</b><b>${r.rainMm!=null?P(r.rainMm):'—'}</b>
+  </div>`).join('')}</section>`;
+}
+function historySetPlotToNewest(){ /* charts now fit the full record with no horizontal scrolling */ }
+function historyChartPoints(kind,rows){
+  return kind==='temp'
+    ? rows.filter(r=>r.hiC!=null||r.loC!=null).sort((a,b)=>a.year-b.year)
+    : rows.filter(r=>r.rainMm!=null).sort((a,b)=>a.year-b.year);
+}
+function setupHistoryGraphScrubber(kind,rows,shell){
+  const viewport=shell?.querySelector('.historyplotinteractive');
+  const surface=viewport?.querySelector('.historyplotsurface');
+  const scrub=viewport?.querySelector('.historyscrub');
+  if(!viewport||!surface||!scrub) return;
+  const pts=historyChartPoints(kind,rows); if(!pts.length) return;
+  const W=Number(viewport.dataset.plotW)||HISTORY_CHART_W,
+        H=Number(viewport.dataset.plotH)||240,
+        left=Number(viewport.dataset.plotLeft)||10,
+        right=Number(viewport.dataset.plotRight)||W-10,
+        ymin=Number(viewport.dataset.yMin)||0,
+        ymax=Number(viewport.dataset.yMax)||1,
+        top=Number(viewport.dataset.plotTop)||16,
+        bottom=Number(viewport.dataset.plotBottom)||H-42;
+  const line=scrub.querySelector('.historyscrubline'), band=scrub.querySelector('.historyscrubband'), tip=scrub.querySelector('.historycharttip');
+  const tipDate=tip?.querySelector('b'), tipValue=tip?.querySelector('span');
+  const dotHi=scrub.querySelector('.temp-hi'), dotLo=scrub.querySelector('.temp-lo'), dotRain=scrub.querySelector('.historyscrubdot.rain');
+  const xFor=i=>pts.length===1?W/2:left+i*(right-left)/(pts.length-1);
+  const yFor=v=>top+(ymax-v)*(bottom-top)/(ymax-ymin||1);
+  const pctX=i=>100*xFor(i)/W;
+  const pctY=v=>100*yFor(v)/H;
+  const setDot=(dot,v,xp)=>{
+    if(!dot||v==null||!isFinite(v)){ if(dot) dot.hidden=true; return; }
+    dot.hidden=false; dot.style.left=`${xp}%`; dot.style.top=`${pctY(v)}%`;
+  };
+  let raf=0,pending=-1,dragging=false,dragRect=null;
+  function paint(i){
+    i=Math.max(0,Math.min(pts.length-1,i));
+    const r=pts[i], xp=pctX(i), clampedTip=Math.max(18,Math.min(82,xp));
+    scrub.classList.add('is-active');
+    line.style.left=`${xp}%`; band.style.left=`${xp}%`; tip.style.left=`${clampedTip}%`;
+    tipDate.textContent=historyDateLabel(r.date);
+    if(kind==='temp'){
+      const hi=historyTempValue(r.hiC), lo=historyTempValue(r.loC);
+      setDot(dotHi,hi,xp); setDot(dotLo,lo,xp);
+      const parts=[];
+      if(hi!=null) parts.push(`High ${Number.isInteger(hi)?hi:hi.toFixed(1)}${historyTempUnit()}`);
+      if(lo!=null) parts.push(`Low ${Number.isInteger(lo)?lo:lo.toFixed(1)}${historyTempUnit()}`);
+      tipValue.textContent=parts.join('  ·  ')||'No temperature value';
+    }else{
+      const rain=historyRainValue(r.rainMm); setDot(dotRain,rain,xp);
+      tipValue.textContent=rain==null?'No rainfall value':`Rain ${rain.toFixed(state.unit==='F'?(rain<1?2:1):(rain<10?1:0))} ${historyRainUnit()}`;
+    }
+    historyChartSelectionYears[kind]=r.year;
+    viewport.setAttribute('aria-valuenow',String(r.year));
+    viewport.setAttribute('aria-valuetext',`${historyDateLabel(r.date)}. ${tipValue.textContent}`);
+  }
+  function schedule(i){ pending=i; if(raf) return; raf=requestAnimationFrame(()=>{ raf=0; paint(pending); }); }
+  function indexFromEvent(e){
+    const rect=dragRect||surface.getBoundingClientRect();
+    const frac=Math.max(0,Math.min(1,(e.clientX-rect.left)/Math.max(1,rect.width)));
+    const coord=frac*W;
+    return Math.max(0,Math.min(pts.length-1,Math.round((coord-left)/Math.max(1,right-left)*(pts.length-1))));
+  }
+  viewport.addEventListener('pointerdown',e=>{
+    dragging=true; dragRect=surface.getBoundingClientRect(); viewport.classList.add('is-scrubbing');
+    try{ viewport.setPointerCapture(e.pointerId); }catch(_e){}
+    schedule(indexFromEvent(e));
+  });
+  viewport.addEventListener('pointermove',e=>{
+    if(dragging || e.pointerType==='mouse') schedule(indexFromEvent(e));
+  });
+  const endDrag=e=>{ dragging=false; dragRect=null; viewport.classList.remove('is-scrubbing'); try{ viewport.releasePointerCapture(e.pointerId); }catch(_e){} };
+  viewport.addEventListener('pointerup',endDrag); viewport.addEventListener('pointercancel',endDrag);
+  viewport.addEventListener('keydown',e=>{
+    if(!['ArrowLeft','ArrowRight','Home','End'].includes(e.key)) return;
+    e.preventDefault();
+    const currentYear=historyChartSelectionYears[kind], current=Math.max(0,pts.findIndex(r=>r.year===currentYear));
+    let next=current;
+    if(e.key==='ArrowLeft') next=Math.max(0,current-1);
+    if(e.key==='ArrowRight') next=Math.min(pts.length-1,current+1);
+    if(e.key==='Home') next=0;
+    if(e.key==='End') next=pts.length-1;
+    schedule(next);
+  });
+  const remembered=historyChartSelectionYears[kind];
+  if(remembered!=null){ const i=pts.findIndex(r=>r.year===remembered); if(i>=0) requestAnimationFrame(()=>paint(i)); }
+}
+function setupHistoryChartControls(rows,root){
+  root.querySelectorAll('[data-history-chart][data-history-mode]').forEach(btn=>btn.addEventListener('click',()=>{
+    const kind=btn.dataset.historyChart, mode=btn.dataset.historyMode;
+    if(!['line','bar','area'].includes(mode)||!['temp','rain'].includes(kind)) return;
+    const shell=root.querySelector(`[data-history-chart-shell="${kind}"]`);
+    historyChartModes[kind]=mode;
+    shell?.querySelectorAll('[data-history-mode]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.historyMode===mode)));
+    const body=shell?.querySelector('.historychartbody');
+    if(body) body.innerHTML=kind==='temp'?historyTempChartBody(rows,mode):historyRainChartBody(rows,mode);
+    setupHistoryGraphScrubber(kind,rows,shell);
+  }));
+  ['temp','rain'].forEach(kind=>setupHistoryGraphScrubber(kind,rows,root.querySelector(`[data-history-chart-shell="${kind}"]`)));
+}
+async function renderHistoryPage(date,day){
   const el=$('#dailyDetailContent'); if(!el) return;
-  el.innerHTML='<div class="historyload">Squeezing the archive…</div>';
-  const h=await fetchHistoryForDate(date);
-  if(!$('#dailyDetailContent') || !$('#forecastDetail [data-dtab="history"][aria-selected="true"]')) return;
-  if(!h){ el.innerHTML='<div class="historyload">History did not come back for this spot.</div>'; return; }
-  el.innerHTML=`<div class="historytable"><div class="historyhead"><span></span><b>High</b><b>Low</b></div>
-    <div><span>This forecast</span><b>${T(day.hiC)}°</b><b>${T(day.loC)}°</b></div>
-    <div><span>Recent same-date avg <small>(${h.count} yr)</small></span><b>${T(h.avgHiC)}°</b><b>${T(h.avgLoC)}°</b></div>
-    ${h.last?`<div><span>Last year on this date</span><b>${T(h.last.hiC)}°</b><b>${T(h.last.loC)}°</b></div>`:''}
-  </div><p class="detailnote">History uses Open-Meteo archive data for this exact calendar date; it is a recent same-date average, not a 30-year climate normal.</p>`;
+  const seq=++historyRenderSeq;
+  historyChartModes={temp:'line',rain:'line'};
+  historyChartSelectionYears={temp:null,rain:null};
+  el.innerHTML=historyLoadingMarkup(); el.setAttribute('aria-busy','true');
+  const archive=await fetchAllHistory(date);
+  if(seq!==historyRenderSeq || !historyActive()) return;
+  if(!archive){
+    el.removeAttribute('aria-busy');
+    el.innerHTML=`<div class="historyerror"><b>History did not come back for this spot.</b><span>Check your connection, then try the full record again.</span><button class="linkish" id="historyRetry">retry</button></div>`;
+    $('#historyRetry')?.addEventListener('click',()=>renderHistoryPage(date,day));
+    return;
+  }
+  const rows=archive.rows, newest=[...rows].sort((a,b)=>b.year-a.year), recentRows=newest.slice(0,10), latest=newest[0]||null;
+  const avgHi=avg(recentRows.map(r=>r.hiC)), avgLo=avg(recentRows.map(r=>r.loC));
+  const initialEnd=historyInitialEndYear(date), exactLast=rows.find(r=>r.year===initialEnd)||null;
+  const lastRow=exactLast||latest;
+  const lastLabel=exactLast?'Last year on this date':(lastRow?`Most recent same-date record · ${lastRow.year}`:'Most recent same-date record');
+  el.removeAttribute('aria-busy');
+  el.innerHTML=`<div class="historytable"><div class="historyhead"><span></span><b>High <small>${historyTempUnit()}</small></b><b>Low <small>${historyTempUnit()}</small></b></div>
+    <div><span>${day.extended?'Extended model estimate':'This forecast'}</span><b>${T(day.hiC)}°</b><b>${T(day.loC)}°</b></div>
+    ${recentRows.length?`<div><span>Recent same-date avg <small>(${recentRows.length} records)</small></span><b>${T(avgHi)}°</b><b>${T(avgLo)}°</b></div>`:''}
+    ${lastRow?`<div><span>${esc(lastLabel)}</span><b>${T(lastRow.hiC)}°</b><b>${T(lastRow.loC)}°</b></div>`:''}
+  </div>
+  <div class="historyarchive">
+    <div class="historyarchiveintro"><div><h2>Same-date archive</h2><p>${archive.count} records from ${archive.firstYear}–${archive.lastYear}${archive.partial?' · some archive slices were unavailable':''}</p></div><span>${historyDateLabel(rows[0].date).replace(/,?\s*\d{4}$/,'')}</span></div>
+    ${historyTempChart(rows)}
+    ${historyRainChart(rows)}
+    ${historyRowsMarkup(rows)}
+  </div>
+  <p class="detailnote historynote">Historical rows use Open-Meteo's ERA5 reanalysis for this exact calendar date. ERA5 is a consistent gridded reconstruction rather than an official weather-station log. Missing years are simply omitted; the record ends at the oldest date the archive returns.</p>`;
+  setupHistoryChartControls(rows,el);
+}
+async function renderHistoryTab(date,day){
+  return renderHistoryPage(date,day);
 }
 
 function aqiLabel(v){
