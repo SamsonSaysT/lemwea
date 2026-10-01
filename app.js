@@ -7,6 +7,35 @@
 const $ = s => document.querySelector(s);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const avg = arr => { const v = arr.filter(x => typeof x === 'number' && isFinite(x)); return v.length ? v.reduce((a,b)=>a+b,0)/v.length : null; };
+const median = arr => {
+  const v = arr.filter(x => typeof x === 'number' && isFinite(x)).sort((a,b)=>a-b);
+  if(!v.length) return null;
+  const m = Math.floor(v.length/2);
+  return v.length%2 ? v[m] : (v[m-1]+v[m])/2;
+};
+/* Robust source squeeze: weather models occasionally throw a single absurd value.
+   We use a median/MAD gate with a humane minimum band, then average only the core cluster. */
+function robustSelect(items, valueFn, minBandC=2.8){
+  const valid = items.filter(item=>{ const v=valueFn(item); return typeof v==='number' && isFinite(v); });
+  if(valid.length < 4) return {kept:valid, omitted:[], median:median(valid.map(valueFn)), bandC:Infinity};
+  const vals = valid.map(valueFn), med = median(vals);
+  const mad = median(vals.map(v=>Math.abs(v-med))) || 0;
+  const bandC = Math.max(minBandC, mad * 1.4826 * 2.8);
+  let kept = valid.filter(item=>Math.abs(valueFn(item)-med) <= bandC);
+  /* Never let a weirdly tight MAD throw away a large chunk of otherwise coherent models. */
+  const floor = Math.max(3, Math.ceil(valid.length*0.67));
+  if(kept.length < floor){
+    kept = [...valid].sort((a,b)=>Math.abs(valueFn(a)-med)-Math.abs(valueFn(b)-med)).slice(0,floor);
+  }
+  const keepSet = new Set(kept);
+  return {kept, omitted:valid.filter(x=>!keepSet.has(x)), median:med, bandC};
+}
+function robustAvg(values, minBand=0){
+  const items=values.filter(v=>typeof v==='number'&&isFinite(v)).map(value=>({value}));
+  if(!items.length) return null;
+  const sel=robustSelect(items,x=>x.value,minBand);
+  return avg(sel.kept.map(x=>x.value));
+}
 const store = {
   get(k){ try { return JSON.parse(localStorage.getItem(k)); } catch(e){ return null; } },
   set(k,v){ try { localStorage.setItem(k, JSON.stringify(v)); } catch(e){} }
@@ -52,6 +81,8 @@ const state = {
   sources: [],                            // normalized per-source data
   alerts: [],
   air: null,
+  detail: null,                           // richer best-match metrics for click-through views
+  historyCache: {},
   tab: 'current',
   radar: null
 };
@@ -71,18 +102,28 @@ function codeLabel(c){
   if(c>=95) return 'Thunderstorm';
   return 'Mixed';
 }
-function iconFor(c, size=24){
-  const S = `width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"`;
-  const cloud = 'M7 17.5h9a4 4 0 0 0 .6-7.96A5.5 5.5 0 0 0 6 8.7 3.9 3.9 0 0 0 7 17.5z';
-  if(c===0||c===1) return `<svg ${S}><circle cx="12" cy="12" r="4.2"/><path d="M12 2.5v2.4M12 19.1v2.4M2.5 12h2.4M19.1 12h2.4M5.3 5.3l1.7 1.7M17 17l1.7 1.7M18.7 5.3L17 7M7 17l-1.7 1.7"/></svg>`;
-  if(c===2) return `<svg ${S}><circle cx="8.5" cy="8" r="3.4"/><path d="M8.5 1.8v1.6M2.3 8h1.6M4.1 3.6l1.1 1.1M12.9 3.6l-1.1 1.1"/><path d="M10 20h7.5a3.4 3.4 0 0 0 .5-6.77A4.6 4.6 0 0 0 9.2 12 3.3 3.3 0 0 0 10 20z" fill="var(--pith)"/></svg>`;
-  if(c===3) return `<svg ${S}><path d="${cloud}"/></svg>`;
-  if(c===45||c===48) return `<svg ${S}><path d="M7 13.5h9a4 4 0 0 0 .6-7.96A5.5 5.5 0 0 0 6 4.7 3.9 3.9 0 0 0 7 13.5z"/><path d="M5 17.5h13M7.5 20.8h9"/></svg>`;
-  if(c>=51&&c<=57) return `<svg ${S}><path d="${cloud}"/><path d="M9 20.4v.1M13 20.4v.1M11 22.6v.1"/></svg>`;
-  if((c>=71&&c<=77)||c===85||c===86) return `<svg ${S}><path d="${cloud}"/><path d="M9 20.2l.01.01M12 22l.01.01M15 20.2l.01.01M10.5 22.6l.01.01M13.5 22.6l.01.01" stroke-width="2.4"/></svg>`;
-  if(c>=95) return `<svg ${S}><path d="${cloud}"/><path d="M12 19l-1.8 3h3L11.4 25" transform="translate(0,-1.2)"/></svg>`;
-  if(c>=61) return `<svg ${S}><path d="${cloud}"/><path d="M8.5 20l-.8 2.2M12 20l-.8 2.2M15.5 20l-.8 2.2"/></svg>`;
-  return `<svg ${S}><path d="${cloud}"/></svg>`;
+function iconFor(c, size=24, night=false){
+  /* Filled, two-tone Lemons weather glyphs: more legible than the old hairline icons,
+     but still flat and native to the cream / zest / leaf palette. */
+  const S = `class="wxicon" width="${size}" height="${size}" viewBox="0 0 48 48" aria-hidden="true"`;
+  const sun = `<g class="wxsun"><circle cx="18" cy="17" r="8"/><g fill="none" stroke="var(--rind)" stroke-width="2.4" stroke-linecap="round"><path d="M18 3v4M18 27v4M4 17h4M28 17h4M8.1 7.1l2.8 2.8M25.1 24.1l2.8 2.8M27.9 7.1l-2.8 2.8M10.9 24.1l-2.8 2.8"/></g></g>`;
+  const moon = `<path class="wxmoon" d="M27.4 6.2A11 11 0 1 0 36 24.8 12.3 12.3 0 0 1 27.4 6.2Z"/>`;
+  const cloud = `<path class="wxcloud" d="M13 35h22.5a7.5 7.5 0 0 0 1.2-14.9A10.2 10.2 0 0 0 17 18.3 7.5 7.5 0 0 0 13 35Z"/>`;
+  const smallCloud = `<path class="wxcloud" d="M16 36h19a6.4 6.4 0 0 0 1-12.7 8.7 8.7 0 0 0-16.8-1.5A6.4 6.4 0 0 0 16 36Z"/>`;
+  const drops = `<g class="wxrain" fill="none" stroke-width="3" stroke-linecap="round"><path d="M18 39l-2 5M27 39l-2 5M36 39l-2 5"/></g>`;
+  const drizzle = `<g class="wxrain" fill="none" stroke-width="2.5" stroke-linecap="round"><path d="M19 40l-1 2M27 40l-1 2M35 40l-1 2"/></g>`;
+  const snow = `<g class="wxsnow" fill="currentColor"><circle cx="18" cy="41" r="1.8"/><circle cx="27" cy="44" r="1.8"/><circle cx="36" cy="41" r="1.8"/></g>`;
+  let body='';
+  if(c===0||c===1) body = night ? moon : sun;
+  else if(c===2) body = `${night?moon:sun}${smallCloud}`;
+  else if(c===3) body = cloud;
+  else if(c===45||c===48) body = `${smallCloud}<g class="wxfog" fill="none" stroke-width="2.2" stroke-linecap="round"><path d="M10 39h28M15 44h20"/></g>`;
+  else if(c>=51&&c<=57) body = `${cloud}${drizzle}`;
+  else if((c>=71&&c<=77)||c===85||c===86) body = `${cloud}${snow}`;
+  else if(c>=95) body = `${cloud}<path class="wxbolt" d="M26 35h7l-5 6h5l-9 7 3-6h-5Z"/>`;
+  else if(c>=61) body = `${cloud}${drops}`;
+  else body = cloud;
+  return `<svg ${S}>${body}</svg>`;
 }
 function codeSeverity(c){
   if(c==null) return 99;
@@ -247,6 +288,68 @@ async function fetchSunTimes(lat, lon){
     state.tz = state.tz || d.timezone;
     state.sun = { sunrise: d.daily?.sunrise?.[0] ?? null, sunset: d.daily?.sunset?.[0] ?? null };
   }catch(e){ state.sun = null; }
+}
+
+/* One best-match feed supplies the richer secondary metrics used only after a row is opened.
+   Headline temperatures/precip still come from the multi-source squeeze above. */
+async function fetchForecastDetails(lat, lon){
+  const hourlyFields = [
+    'temperature_2m','apparent_temperature','relative_humidity_2m','dew_point_2m',
+    'precipitation_probability','precipitation','rain','snowfall','weather_code','cloud_cover',
+    'visibility','surface_pressure','wind_speed_10m','wind_direction_10m','wind_gusts_10m','is_day'
+  ].join(',');
+  const dailyFields = [
+    'temperature_2m_max','temperature_2m_min','apparent_temperature_max','apparent_temperature_min',
+    'precipitation_probability_max','precipitation_sum','rain_sum','snowfall_sum','precipitation_hours',
+    'weather_code','uv_index_max','wind_speed_10m_max','wind_gusts_10m_max','wind_direction_10m_dominant',
+    'sunrise','sunset','daylight_duration','sunshine_duration'
+  ].join(',');
+  const d = await fetchJSON(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`
+    + `&hourly=${hourlyFields}&daily=${dailyFields}&timezone=auto&forecast_days=16&wind_speed_unit=kmh`);
+  state.tz = d.timezone || state.tz;
+  const hourly = new Map();
+  const hh = d.hourly || {};
+  (hh.time||[]).forEach((iso,i)=> hourly.set(epochHour(iso), {
+    tempC:hh.temperature_2m?.[i] ?? null,
+    feelsC:hh.apparent_temperature?.[i] ?? null,
+    humidity:hh.relative_humidity_2m?.[i] ?? null,
+    dewC:hh.dew_point_2m?.[i] ?? null,
+    precip:hh.precipitation_probability?.[i] ?? null,
+    precipMm:hh.precipitation?.[i] ?? null,
+    rainMm:hh.rain?.[i] ?? null,
+    snowCm:hh.snowfall?.[i] ?? null,
+    code:hh.weather_code?.[i] ?? null,
+    cloud:hh.cloud_cover?.[i] ?? null,
+    visibilityM:hh.visibility?.[i] ?? null,
+    pressureHpa:hh.surface_pressure?.[i] ?? null,
+    windKmh:hh.wind_speed_10m?.[i] ?? null,
+    windDir:hh.wind_direction_10m?.[i] ?? null,
+    gustKmh:hh.wind_gusts_10m?.[i] ?? null,
+    isDay:hh.is_day?.[i] ?? null
+  }));
+  const daily = new Map();
+  const dd = d.daily || {};
+  (dd.time||[]).forEach((date,i)=> daily.set(date, {
+    hiC:dd.temperature_2m_max?.[i] ?? null,
+    loC:dd.temperature_2m_min?.[i] ?? null,
+    feelsHiC:dd.apparent_temperature_max?.[i] ?? null,
+    feelsLoC:dd.apparent_temperature_min?.[i] ?? null,
+    precip:dd.precipitation_probability_max?.[i] ?? null,
+    precipMm:dd.precipitation_sum?.[i] ?? null,
+    rainMm:dd.rain_sum?.[i] ?? null,
+    snowCm:dd.snowfall_sum?.[i] ?? null,
+    precipHours:dd.precipitation_hours?.[i] ?? null,
+    code:dd.weather_code?.[i] ?? null,
+    uv:dd.uv_index_max?.[i] ?? null,
+    windKmh:dd.wind_speed_10m_max?.[i] ?? null,
+    gustKmh:dd.wind_gusts_10m_max?.[i] ?? null,
+    windDir:dd.wind_direction_10m_dominant?.[i] ?? null,
+    sunrise:dd.sunrise?.[i] ?? null,
+    sunset:dd.sunset?.[i] ?? null,
+    daylightSec:dd.daylight_duration?.[i] ?? null,
+    sunshineSec:dd.sunshine_duration?.[i] ?? null
+  }));
+  return {ok:true, hourly, daily};
 }
 
 /* ---- 2. NWS / weather.gov (US only) ---- */
@@ -587,10 +690,11 @@ async function fetchAirModel(lat, lon){
 async function loadWeather(){
   renderLoading();
   const {lat, lon} = state.loc;
-  const [weatherResults, alertResult, airResult] = await Promise.all([
+  const [weatherResults, alertResult, airResult, detailResult] = await Promise.all([
     Promise.allSettled([fetchOpenMeteo(lat, lon), fetchNWS(lat, lon), fetchMetNo(lat, lon), fetchBrightSky(lat, lon)]),
     fetchNWSAlerts(lat, lon).then(v=>({ok:true, value:v})).catch(()=>({ok:false, value:[]})),
     fetchAirQuality(lat, lon).then(v=>({ok:true, value:v})).catch(()=>({ok:false, value:{ok:false}})),
+    fetchForecastDetails(lat, lon).then(v=>({ok:true, value:v})).catch(()=>({ok:false, value:null})),
     fetchSunTimes(lat, lon)
   ]);
   let sources = [];
@@ -601,6 +705,7 @@ async function loadWeather(){
   state.sources = sources;
   state.alerts = alertResult.value || [];
   state.air = airResult.value || {ok:false};
+  state.detail = detailResult.value || null;
   state.updated = Date.now();
   if(!sources.some(s=>s.ok)){
     $('#app').innerHTML = `<div class="msg"><h2>The lemon came up dry.</h2>
@@ -612,26 +717,36 @@ async function loadWeather(){
 const okSources = () => state.sources.filter(s=>s.ok);
 
 function consensusCurrent(){
-  const s = okSources().filter(x=>x.current && x.current.tempC!=null);
-  const temps = s.map(x=>x.current.tempC);
+  const pairs = okSources().filter(x=>x.current && x.current.tempC!=null).map(source=>({source,row:source.current}));
+  const sel = robustSelect(pairs, x=>x.row.tempC, 2.8);
+  const s = sel.kept;
+  const temps = s.map(x=>x.row.tempC);
   return {
     tempC: avg(temps),
-    feelsC: avg(s.map(x=>x.current.feelsC)),
-    humidity: avg(s.map(x=>x.current.humidity)),
-    windKmh: avg(s.map(x=>x.current.windKmh)),
-    code: pickWeatherCode(s.map(x=>x.current.code), avg(s.map(x=>x.current.precip))),
+    feelsC: robustAvg(s.map(x=>x.row.feelsC), 2.8),
+    humidity: robustAvg(s.map(x=>x.row.humidity), 18),
+    windKmh: robustAvg(s.map(x=>x.row.windKmh), 18),
+    code: pickWeatherCode(s.map(x=>x.row.code), robustAvg(s.map(x=>x.row.precip), 35)),
+    precip: robustAvg(s.map(x=>x.row.precip), 35),
     spreadC: temps.length>1 ? Math.max(...temps)-Math.min(...temps) : 0,
-    count: s.length
+    count: s.length,
+    totalCount: pairs.length,
+    omittedIds: sel.omitted.map(x=>x.source.id),
+    includedIds: s.map(x=>x.source.id)
   };
 }
 function consensusHourly(hours=24){
   const start = Math.floor(Date.now()/3600000);
   const out = [];
   for(let h=start; h<start+hours; h++){
-    const rows = okSources().map(s=>s.hourly?.get(h)).filter(Boolean);
-    if(!rows.length) continue;
-    out.push({ epochH:h, tempC:avg(rows.map(r=>r.tempC)), precip:avg(rows.map(r=>r.precip)),
-      code:pickWeatherCode(rows.map(r=>r.code), avg(rows.map(r=>r.precip))), count:rows.length });
+    const pairs = okSources().map(source=>({source,row:source.hourly?.get(h)})).filter(x=>x.row && x.row.tempC!=null);
+    if(!pairs.length) continue;
+    const sel = robustSelect(pairs, x=>x.row.tempC, 2.8);
+    const rows = sel.kept.map(x=>x.row);
+    const precip=robustAvg(rows.map(r=>r.precip), 35);
+    out.push({ epochH:h, tempC:avg(rows.map(r=>r.tempC)), precip,
+      code:pickWeatherCode(rows.map(r=>r.code), precip), count:rows.length,
+      totalCount:pairs.length, omittedCount:sel.omitted.length });
   }
   return out;
 }
@@ -640,10 +755,21 @@ function consensusDaily(days=16){
   okSources().forEach(s=> s.daily && [...s.daily.keys()].forEach(d=>dates.add(d)));
   const todayStr = new Intl.DateTimeFormat('en-CA',{timeZone:state.tz||undefined}).format(new Date());
   return [...dates].filter(d=>d>=todayStr).sort().slice(0,days).map(date=>{
-    const rows = okSources().map(s=>s.daily?.get(date)).filter(Boolean);
+    const pairs = okSources().map(source=>({source,row:source.daily?.get(date)})).filter(x=>x.row && (x.row.hiC!=null || x.row.loC!=null));
+    const hiSel=robustSelect(pairs.filter(x=>x.row.hiC!=null), x=>x.row.hiC, 3.3);
+    const loSel=robustSelect(pairs.filter(x=>x.row.loC!=null), x=>x.row.loC, 3.3);
+    const badIds=new Set([...hiSel.omitted,...loSel.omitted].map(x=>x.source.id));
+    let keptPairs=pairs.filter(x=>!badIds.has(x.source.id));
+    if(keptPairs.length<Math.max(3,Math.ceil(pairs.length*0.67))){
+      keptPairs=robustSelect(pairs,x=>avg([x.row.hiC,x.row.loC]),3.3).kept;
+    }
+    const rows = keptPairs.map(x=>x.row);
+    const precip=robustAvg(rows.map(r=>r.precip),35);
     return { date, hiC:avg(rows.map(r=>r.hiC)), loC:avg(rows.map(r=>r.loC)),
-      precip:avg(rows.map(r=>r.precip)), code:representativeDailyCode(date, rows), count:rows.length,
-      sunrise:(rows.find(r=>r.sunrise)?.sunrise ?? null), sunset:(rows.find(r=>r.sunset)?.sunset ?? null) };
+      precip, code:representativeDailyCode(date, rows), count:rows.length,
+      totalCount:pairs.length, omittedCount:pairs.length-keptPairs.length,
+      sunrise:(rows.find(r=>r.sunrise)?.sunrise ?? state.detail?.daily?.get(date)?.sunrise ?? null),
+      sunset:(rows.find(r=>r.sunset)?.sunset ?? state.detail?.daily?.get(date)?.sunset ?? null) };
   }).filter(d=>d.hiC!=null||d.loC!=null);
 }
 
@@ -654,6 +780,27 @@ const T = c => c==null ? '—' : Math.round(state.unit==='F' ? cToF(c) : c);
 const W = k => k==null ? '—' : Math.round(state.unit==='F' ? kmhToMph(k) : k);
 const windUnit = () => state.unit==='F' ? 'mph' : 'km/h';
 const degSpread = c => (state.unit==='F' ? c*9/5 : c);
+const P = mm => mm==null ? '—' : state.unit==='F' ? `${(mm/25.4).toFixed(mm/25.4<0.1?2:1)} in` : `${mm.toFixed(mm<10?1:0)} mm`;
+const SNOW = cm => cm==null ? '—' : state.unit==='F' ? `${(cm/2.54).toFixed(cm/2.54<1?1:0)} in` : `${cm.toFixed(cm<10?1:0)} cm`;
+function windDir(deg){
+  if(deg==null || !isFinite(deg)) return '';
+  const dirs=['N','NNE','NE','ENE','E','ESE','SE','SSE','S','SSW','SW','WSW','W','WNW','NW','NNW'];
+  return dirs[Math.round((((deg%360)+360)%360)/22.5)%16];
+}
+function windText(kmh, dir){
+  if(kmh==null) return '—';
+  const d=windDir(dir); return `${d?d+' ':''}${W(kmh)} ${windUnit()}`;
+}
+function visText(m){
+  if(m==null) return '—';
+  return state.unit==='F' ? `${(m/1609.344).toFixed(m<16093?1:0)} mi` : `${(m/1000).toFixed(m<10000?1:0)} km`;
+}
+function durText(sec){
+  if(sec==null || !isFinite(sec)) return '—';
+  const h=Math.floor(sec/3600), m=Math.round((sec-h*3600)/60);
+  return `${h} hr${h===1?'':'s'} ${m} min`;
+}
+function localDateForHour(epochH){ return localDateHour(epochH).date; }
 
 function lemonSpinner(){
   return `<svg class="spin" viewBox="0 0 100 100" aria-hidden="true">
@@ -1050,7 +1197,7 @@ function lemonsSays(cur, today){
 }
 function renderApp(){
   const cur = consensusCurrent();
-  const daily = consensusDaily(10);
+  const daily = consensusDaily(16);
   const today = daily[0];
   const app = $('#app');
   setTopActions(`
@@ -1070,36 +1217,47 @@ function renderApp(){
       ${TABS.map(t=>
         `<button role="tab" data-tab="${t}" aria-selected="${state.tab===t}">${t==='air'?'Air':t[0].toUpperCase()+t.slice(1)}</button>`).join('')}
     </nav>
-    <section id="view-current" class="panelview" role="tabpanel"></section>
-    <section id="view-hourly" class="panelview" role="tabpanel"></section>
-    <section id="view-daily" class="panelview" role="tabpanel"></section>
-    <section id="view-radar" class="panelview" role="tabpanel">
-      <div class="radarwrap">
-        <div id="map" aria-label="Precipitation radar map"></div>
-        <div class="modetoggle" role="group" aria-label="Radar layer">
-          <button id="modeRain" aria-pressed="true">Rain</button>
-          <button id="modeSat" aria-pressed="false">Satellite</button>
-        </div>
-        <div class="radarui">
-          <button class="playbtn" id="radarplay" aria-label="Play radar animation">
-            <svg id="playicon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l13-7.5z"/></svg>
-          </button>
-          <input class="scrub" id="radarscrub" type="range" min="0" max="0" value="0" aria-label="Radar frame">
-          <span class="frametime" id="radartime">—</span>
-        </div>
-        <p class="radarnote" id="radaroutlook"></p>
-        <p class="radarnote">Past two hours of precipitation plus a short nowcast. Tiles by RainViewer.</p>
-        <p class="mapcredit">Basemap © OpenStreetMap/CARTO · radar © RainViewer</p>
+    <div class="viewstage" id="viewstage">
+      <div class="viewtrack" id="viewtrack">
+        <section id="view-current" class="panelview" role="tabpanel"></section>
+        <section id="view-hourly" class="panelview" role="tabpanel"></section>
+        <section id="view-daily" class="panelview" role="tabpanel"></section>
+        <section id="view-radar" class="panelview" role="tabpanel">
+          <div class="radarwrap">
+            <div class="radarmapframe maplocked" id="radarmapframe">
+              <div id="map" aria-label="Precipitation radar map"></div>
+              <button class="maplock" id="maplock" type="button" aria-pressed="true" aria-label="Unlock radar map">
+                <svg class="maplockicon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M7.5 10V7.7a4.5 4.5 0 0 1 9 0V10M6 10h12v10H6z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                <span>unlock map</span>
+              </button>
+            </div>
+            <div class="modetoggle basemaptoggle" role="group" aria-label="Radar basemap">
+              <button data-basemap="street" aria-pressed="true">Street</button>
+              <button data-basemap="topo" aria-pressed="false">USGS Topo</button>
+              <button data-basemap="satellite" aria-pressed="false">Satellite</button>
+            </div>
+            <div class="radarui">
+              <button class="playbtn" id="radarplay" aria-label="Play radar animation">
+                <svg id="playicon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l13-7.5z"/></svg>
+              </button>
+              <input class="scrub" id="radarscrub" type="range" min="0" max="0" value="0" aria-label="Radar frame">
+              <span class="frametime" id="radartime">—</span>
+            </div>
+            <p class="radarnote" id="radaroutlook"></p>
+            <p class="radarnote">Up to 6 hours of radar history in the contiguous U.S., plus the latest RainViewer nowcast.</p>
+            <p class="mapcredit">Basemaps © OpenStreetMap · USGS · Esri · radar © RainViewer / Iowa Environmental Mesonet</p>
+          </div>
+        </section>
+        <section id="view-air" class="panelview" role="tabpanel"></section>
       </div>
-    </section>
-    <section id="view-air" class="panelview" role="tabpanel"></section>`;
+    </div>`;
 
   $('#changeloc').addEventListener('click', ()=>{ state.loc = null; state.tab = 'current'; renderLocationScreen(); });
   $('#saveplace').addEventListener('click', saveCurrentPlace);
   $('#openplaces').addEventListener('click', ()=>togglePlacesPanel());
   $('#shareloc').addEventListener('click', shareCurrentLocation);
   app.querySelectorAll('[data-tab]').forEach(b=>b.addEventListener('click', ()=>switchTab(b.dataset.tab)));
-  initSwipeNav(app);
+  initSwipeNav($('#viewstage'));
 
   renderCurrent(cur, today);
   renderHourly();
@@ -1135,16 +1293,19 @@ function todayHiLo(today){
   return {hi, lo};
 }
 function renderCurrent(cur, today){
+  const omitted = new Set(cur.omittedIds || []);
   const chips = state.sources.map(s=>{
     if(s.ok===false) return `<span class="chip err">${esc(s.name)}</span>`;
     if(!s.current || s.current.tempC==null) return '';
-    return `<span class="chip">${esc(s.name)} <span class="t">${T(s.current.tempC)}°</span></span>`;
+    const out = omitted.has(s.id);
+    return `<span class="chip${out?' outlier':''}"${out?' title="Ignored as an outlier for the current squeeze"':''}>${esc(s.name)} <span class="t">${T(s.current.tempC)}°</span>${out?'<span class="outtag">outlier</span>':''}</span>`;
   }).join('');
   const spread = degSpread(cur.spreadC||0);
+  const outCount = Math.max(0,(cur.totalCount||cur.count)-cur.count);
   $('#view-current').innerHTML = `
     <div class="current">
       <div class="bigtemp">${T(cur.tempC)}<sup>°${state.unit}</sup></div>
-      <div class="cond">${iconFor(cur.code,22)} ${codeLabel(cur.code)}</div>
+      <div class="cond">${iconFor(cur.code,30)} ${codeLabel(cur.code)}</div>
       ${(()=>{ const hl = todayHiLo(today); return (hl.hi!=null||hl.lo!=null) ? `<div class="hilo">H ${T(hl.hi)}° · L ${T(hl.lo)}°</div>` : ''; })()}
       <div class="lemonsays"><span>Lemons says</span><p>${esc(lemonsSays(cur, today))}</p></div>
       <div class="statrow">
@@ -1155,70 +1316,222 @@ function renderCurrent(cur, today){
     </div>
     <div class="opinions">
       <h3>Second opinions</h3>
-      <p class="agree">${cur.count} sources squeezed · they agree within <b>${spread.toFixed(1)}°</b></p>
+      <p class="agree">${cur.count}${cur.totalCount&&cur.totalCount!==cur.count?` of ${cur.totalCount}`:''} sources squeezed${outCount?` · <b>${outCount} wild ${outCount===1?'outlier':'outliers'} ignored</b>`:` · they agree within <b>${spread.toFixed(1)}°</b>`}${outCount?` · core spread ${spread.toFixed(1)}°`:''}</p>
       <div class="chips">${chips}</div>
     </div>`;
 }
 
+function hourRowDetail(h){ return state.detail?.hourly?.get(h.epochH) || null; }
+function isNightHour(h){ const d=hourRowDetail(h); if(d?.isDay!=null) return !d.isDay; const hr=localDateHour(h.epochH).hour; return hr<7||hr>=20; }
+
 function renderHourly(){
   const hours = consensusHourly(state.hourlyHours);
   const timeFmt = new Intl.DateTimeFormat('en-US', {hour:'numeric', timeZone: state.tz || undefined});
-  const dowFmt = new Intl.DateTimeFormat('en-US', {weekday:'short', timeZone: state.tz || undefined});
-  const dateFmt = new Intl.DateTimeFormat('en-US', {month:'numeric', day:'numeric', timeZone: state.tz || undefined});
+  const dayFmt = new Intl.DateTimeFormat('en-US', {weekday:'long', month:'short', day:'numeric', timeZone: state.tz || undefined});
   const counts = hours.map(h=>h.count);
   let lastDate = '';
   $('#view-hourly').innerHTML = `
     <div class="hourlyhead">
-      <h2>${state.hourlyHours}-hour lemon table</h2>
+      <div><h2>Hourly forecast</h2><p>Tap an hour for the full squeeze.</p></div>
       <div class="hrange" role="group" aria-label="Hourly forecast range">
         ${[24,48,72].map(n=>`<button data-hours="${n}" aria-pressed="${state.hourlyHours===n}">${n}h</button>`).join('')}
       </div>
     </div>
-    <div class="hscroll">
+    <div class="hourlist">
       ${hours.map((h,i)=>{
-        const d = new Date(h.epochH*3600000);
-        const dateKey = dateFmt.format(d);
-        const isNewDay = i>0 && dateKey !== lastDate;
-        lastDate = dateKey;
-        return `<div class="hcol${i===0?' now':''}${isNewDay?' newday':''}">
-          <div class="dow">${i===0?'Now':esc(dowFmt.format(d))}</div>
-          <div class="date">${esc(dateKey)}</div>
-          <div class="h">${esc(timeFmt.format(d))}</div>
-          ${iconFor(h.code,22)}
-          <div class="t">${T(h.tempC)}°</div>
-          <div class="p">${h.precip!=null&&h.precip>=5?Math.round(h.precip)+'%':''}</div>
-        </div>`}).join('')}
+        const d = new Date(h.epochH*3600000), dateKey=localDateForHour(h.epochH), det=hourRowDetail(h);
+        const heading = dateKey!==lastDate ? `<div class="hourday">${esc(i===0?'Today · '+dayFmt.format(d):dayFmt.format(d))}</div>` : '';
+        lastDate=dateKey;
+        const pop=h.precip!=null?Math.round(h.precip):null;
+        const amt=det?.precipMm;
+        return `${heading}<button class="hourrow${i===0?' now':''}" data-hour="${h.epochH}" aria-label="Open details for ${esc(timeFmt.format(d))}">
+          <span class="hourtime">${i===0?'Now':esc(timeFmt.format(d))}</span>
+          <span class="houricon">${iconFor(h.code,38,isNightHour(h))}</span>
+          <span class="hourtemp">${T(h.tempC)}°</span>
+          <span class="hourfeel">Feels ${T(det?.feelsC ?? h.tempC)}°</span>
+          <span class="hourprecip">${pop!=null?`<b>◔ ${pop}%</b>`:''}${amt!=null&&amt>0.02?`<small>${P(amt)}</small>`:''}</span>
+        </button>`;
+      }).join('')}
     </div>
-    <p class="blendnote">Each hour is the average of ${counts.length?Math.min(...counts):0}–${counts.length?Math.max(...counts):0} available models. Green % is chance of precipitation.</p>`;
+    <p class="blendnote">Headline temperatures average ${counts.length?Math.min(...counts):0}–${counts.length?Math.max(...counts):0} in-family models per hour. A rogue source is dropped automatically before the squeeze.</p>`;
   $('#view-hourly').querySelectorAll('[data-hours]').forEach(b=>b.addEventListener('click', ()=>{
     state.hourlyHours = +b.dataset.hours; store.set('lemons.hourlyHours', state.hourlyHours); renderHourly();
   }));
+  $('#view-hourly').querySelectorAll('[data-hour]').forEach(b=>b.addEventListener('click', ()=>openHourlyDetail(+b.dataset.hour)));
 }
 
 function renderDaily(daily){
   if(!daily.length){ $('#view-daily').innerHTML = `<div class="msg">No daily data came back.</div>`; return; }
-  const allLo = Math.min(...daily.map(d=>d.loC ?? d.hiC));
-  const allHi = Math.max(...daily.map(d=>d.hiC ?? d.loC));
-  const span = Math.max(allHi-allLo, 1);
-  const dayFmt = new Intl.DateTimeFormat('en-US', {weekday:'short'});
-  const dateFmt = new Intl.DateTimeFormat('en-US', {month:'short', day:'numeric'});
+  const monthFmt = new Intl.DateTimeFormat('en-US', {month:'long'});
   const todayStr = new Intl.DateTimeFormat('en-CA',{timeZone:state.tz||undefined}).format(new Date());
-  $('#view-daily').innerHTML = `
-    <div class="days">
-      ${daily.map(d=>{
-        const dt = new Date(d.date+'T12:00:00');
-        const lo = d.loC ?? d.hiC, hi = d.hiC ?? d.loC;
-        const left = ((lo-allLo)/span*100).toFixed(1), width = Math.max(((hi-lo)/span*100),4).toFixed(1);
-        return `<div class="dayrow">
-          <span class="d">${d.date===todayStr?'Today':esc(dayFmt.format(dt))}<span class="date">${esc(dateFmt.format(dt))}</span></span>
-          ${iconFor(d.code,24)}
-          <span class="p">${d.precip!=null&&d.precip>=5?Math.round(d.precip)+'%':''}</span>
-          <span class="range"><span class="lo">${T(lo)}°</span>
-            <span class="rangebar"><i style="left:${left}%;width:${width}%"></i></span>
-            <span class="hi">${T(hi)}°</span></span>
-        </div>`;}).join('')}
+  const groups=[];
+  daily.forEach(d=>{
+    const key=d.date.slice(0,7);
+    let g=groups.find(x=>x.key===key);
+    if(!g){ g={key,days:[]}; groups.push(g); }
+    g.days.push(d);
+  });
+  const blockHtml=groups.map((g,gi)=>{
+    const first=new Date(g.days[0].date+'T12:00:00');
+    const blanks=Array.from({length:first.getDay()},()=>'<span class="dayblank" aria-hidden="true"></span>');
+    const cells=g.days.map(d=>{
+      const dt=new Date(d.date+'T12:00:00');
+      return `<button class="daycell${d.date===todayStr?' today':''}" data-date="${d.date}" aria-label="Open details for ${esc(dt.toDateString())}">
+        <span class="daynum">${dt.getDate()}</span>
+        ${iconFor(d.code,36,false)}
+        <span class="dayhi">${T(d.hiC)}°</span>
+        <span class="daylo">${T(d.loC)}°</span>
+        ${d.precip!=null&&d.precip>=10?`<span class="daypop">${Math.round(d.precip)}%</span>`:''}
+      </button>`;
+    });
+    return `<section class="monthblock${gi?' nextmonth':''}">
+      <div class="dailyhead"><div><h2>${esc(monthFmt.format(first))}</h2>${gi===0?'<p>16-day outlook · tap a day for day / night details</p>':''}</div>${gi===0?'<span>16 days</span>':''}</div>
+      <div class="weekdayrow">${['S','M','T','W','T','F','S'].map(x=>`<span>${x}</span>`).join('')}</div>
+      <div class="daygrid">${[...blanks,...cells].join('')}</div>
+    </section>`;
+  }).join('');
+  $('#view-daily').innerHTML = `${blockHtml}
+    <p class="blendnote">Daily highs and lows use the same outlier-resistant squeeze. Detail rows come from the local best-match feed so wind, humidity, visibility, UV, rain amount and sun times stay internally consistent.</p>`;
+  $('#view-daily').querySelectorAll('[data-date]').forEach(b=>b.addEventListener('click', ()=>openDailyDetail(b.dataset.date)));
+}
+
+function metricRow(label, value, cls=''){
+  if(value==null || value==='—' || value==='') return '';
+  return `<div class="detailrow"><span>${esc(label)}</span><b class="${cls}">${value}</b></div>`;
+}
+function detailModalShell(title, subtitle, body){
+  closeForecastDetail();
+  const el=document.createElement('div'); el.id='forecastDetail'; el.className='forecastdetail';
+  el.innerHTML=`<div class="detailinner"><div class="detailtop"><button id="detailClose" class="detailclose" aria-label="Close">×</button><div><strong>${esc(title)}</strong>${subtitle?`<small>${esc(subtitle)}</small>`:''}</div></div><div id="detailBody">${body}</div></div>`;
+  document.body.appendChild(el); document.body.style.overflow='hidden';
+  $('#detailClose').addEventListener('click', closeForecastDetail);
+  document.addEventListener('keydown', forecastDetailEsc);
+  return el;
+}
+function closeForecastDetail(){ const el=$('#forecastDetail'); if(el) el.remove(); document.body.style.overflow=''; document.removeEventListener('keydown', forecastDetailEsc); }
+function forecastDetailEsc(e){ if(e.key==='Escape') closeForecastDetail(); }
+
+function openHourlyDetail(epochH){
+  const h = consensusHourly(Math.max(1,epochH-Math.floor(Date.now()/3600000)+1)).find(x=>x.epochH===epochH);
+  if(!h) return;
+  const d=state.detail?.hourly?.get(epochH)||{};
+  const dt=new Date(epochH*3600000);
+  const title=new Intl.DateTimeFormat('en-US',{hour:'numeric',weekday:'long',timeZone:state.tz||undefined}).format(dt);
+  const subtitle=new Intl.DateTimeFormat('en-US',{month:'long',day:'numeric',timeZone:state.tz||undefined}).format(dt);
+  const precip=h.precip ?? d.precip;
+  const airHour=(state.air?.hourly||[]).find(x=>x.epochH===epochH);
+  const body=`<div class="detailhero">
+      ${iconFor(h.code,76,isNightHour(h))}<div class="detailtemp">${T(h.tempC)}°</div>
+      <div class="detailprecip">${precip!=null?`Precipitation: ${Math.round(precip)}%`:''}</div>
+      <div class="detailcond">${esc(codeLabel(h.code))}</div>
     </div>
-    <p class="blendnote">Highs and lows averaged across every source with an opinion that day. Free no-key forecast data is shown out to 16 days.</p>`;
+    <div class="detailrows">
+      ${metricRow('Feels like', `${T(d.feelsC ?? h.tempC)}°${state.unit}`)}
+      ${metricRow('Humidity', d.humidity!=null?`${Math.round(d.humidity)}%`:'—')}
+      ${metricRow('Air quality', airHour?.aqi!=null?`${Math.round(airHour.aqi)} AQI · ${esc(aqiLabel(airHour.aqi))}`:'—')}
+      ${metricRow('Wind', windText(d.windKmh,d.windDir))}
+      ${metricRow('Wind gusts', d.gustKmh!=null?`${W(d.gustKmh)} ${windUnit()}`:'—')}
+      ${metricRow('Precipitation probability', precip!=null?`${Math.round(precip)}%`:'—')}
+      ${metricRow(d.snowCm>0?'Snow amount':'Rain amount', d.snowCm>0?SNOW(d.snowCm):P(d.rainMm ?? d.precipMm))}
+      ${metricRow('Cloud cover', d.cloud!=null?`${Math.round(d.cloud)}%`:'—')}
+      ${metricRow('Dew point', d.dewC!=null?`${T(d.dewC)}°${state.unit}`:'—')}
+      ${metricRow('Visibility', visText(d.visibilityM))}
+      ${metricRow('Pressure', d.pressureHpa!=null?`${Math.round(d.pressureHpa)} hPa`:'—')}
+    </div><p class="detailnote">Temperature and precipitation headline = Lemons multi-source squeeze. Secondary metrics = local best-match detail feed.</p>`;
+  detailModalShell(title, subtitle, body);
+}
+
+function dayHourlySlice(date, night=false){
+  const out=[];
+  state.detail?.hourly?.forEach((r,h)=>{ if(localDateForHour(h)!==date) return; const day=r.isDay!=null?!!r.isDay:(localDateHour(h).hour>=7&&localDateHour(h).hour<20); if(night?!day:day) out.push(r); });
+  return out;
+}
+function summarizePeriod(date, night=false){
+  const arr=dayHourlySlice(date,night), d=state.detail?.daily?.get(date)||{};
+  return {
+    feelsC: night ? (d.feelsLoC ?? avg(arr.map(x=>x.feelsC))) : (d.feelsHiC ?? avg(arr.map(x=>x.feelsC))),
+    windKmh: avg(arr.map(x=>x.windKmh)) ?? d.windKmh,
+    windDir: median(arr.map(x=>x.windDir)) ?? d.windDir,
+    gustKmh: Math.max(...arr.map(x=>x.gustKmh).filter(x=>x!=null), d.gustKmh??-Infinity),
+    cloud: avg(arr.map(x=>x.cloud)),
+    precip: Math.max(...arr.map(x=>x.precip).filter(x=>x!=null), d.precip??-Infinity),
+    rainMm: arr.reduce((a,x)=>a+(x.rainMm||0),0),
+    snowCm: arr.reduce((a,x)=>a+(x.snowCm||0),0),
+    precipHours: arr.filter(x=>(x.precipMm||0)>0.05).length,
+    humidity: avg(arr.map(x=>x.humidity)), dewC:avg(arr.map(x=>x.dewC))
+  };
+}
+function safeMax(v){ return v===-Infinity?null:v; }
+
+function openDailyDetail(date){
+  const day=consensusDaily(16).find(x=>x.date===date); if(!day) return;
+  const dt=new Date(date+'T12:00:00');
+  const title=state.loc.name;
+  const subtitle=new Intl.DateTimeFormat('en-US',{weekday:'short',month:'short',day:'numeric'}).format(dt);
+  detailModalShell(title, subtitle, `<div class="detailtabs" role="tablist"><button data-dtab="day" aria-selected="true">Day</button><button data-dtab="night" aria-selected="false">Night</button><button data-dtab="history" aria-selected="false">History</button></div><div id="dailyDetailContent"></div>`);
+  const renderTab=async tab=>{
+    $('#forecastDetail').querySelectorAll('[data-dtab]').forEach(b=>b.setAttribute('aria-selected',b.dataset.dtab===tab));
+    if(tab==='history'){ await renderHistoryTab(date,day); return; }
+    const night=tab==='night', sum=summarizePeriod(date,night), det=state.detail?.daily?.get(date)||{};
+    sum.gustKmh=safeMax(sum.gustKmh); sum.precip=safeMax(sum.precip);
+    const temp=night?day.loC:day.hiC, code=det.code??day.code, pop=sum.precip??day.precip;
+    const amount=sum.snowCm>0?SNOW(sum.snowCm):P(sum.rainMm || (night?null:det.rainMm));
+    const sunMoon = night
+      ? `<div class="celestial"><span class="sectioncap">Moon</span>${metricRow('Moon phase', moonPhaseAt(dt).name)}${metricRow('Illumination', `${Math.round(moonPhaseAt(dt).frac*100)}%`)}</div>`
+      : `<div class="celestial"><span class="sectioncap">Sun</span>${metricRow('Rise', det.sunrise?skyTime(det.sunrise):'—')}${metricRow('Set', det.sunset?skyTime(det.sunset):'—')}${metricRow('Total daylight', durText(det.daylightSec))}</div>`;
+    $('#dailyDetailContent').innerHTML=`<div class="detailhero dailyhero">${iconFor(code,76,night)}<div class="detailtemp">${T(temp)}°</div><div class="detailprecip">${pop!=null?`Precipitation: ${Math.round(pop)}%`:''}</div><div class="detailcond">${esc(codeLabel(code))}</div></div>
+      <div class="detailrows">
+        ${metricRow('Feels like', `${T(sum.feelsC ?? temp)}°${state.unit}`)}
+        ${metricRow('Humidity', sum.humidity!=null?`${Math.round(sum.humidity)}%`:'—')}
+        ${metricRow('Wind', windText(sum.windKmh,sum.windDir))}
+        ${metricRow('Max wind gusts', sum.gustKmh!=null?`${W(sum.gustKmh)} ${windUnit()}`:'—')}
+        ${metricRow('Total hours of precipitation', `${sum.precipHours} hr${sum.precipHours===1?'':'s'}`)}
+        ${metricRow('Precipitation probability', pop!=null?`${Math.round(pop)}%`:'—')}
+        ${metricRow(sum.snowCm>0?'Snow amount':'Rain amount', amount)}
+        ${!night?metricRow('Max UV index', det.uv!=null?`${det.uv.toFixed(1)}${det.uv<3?' (Low)':det.uv<6?' (Moderate)':det.uv<8?' (High)':' (Very high)'}`:'—'):''}
+        ${metricRow('Cloud cover', sum.cloud!=null?`${Math.round(sum.cloud)}%`:'—')}
+        ${metricRow('Dew point', sum.dewC!=null?`${T(sum.dewC)}°${state.unit}`:'—')}
+      </div>${sunMoon}`;
+  };
+  $('#forecastDetail').querySelectorAll('[data-dtab]').forEach(b=>b.addEventListener('click',()=>renderTab(b.dataset.dtab)));
+  renderTab('day');
+}
+
+function moonPhaseAt(dateLike){
+  const at = dateLike instanceof Date ? dateLike.getTime() : new Date(dateLike).getTime();
+  const synodic=29.530588853, days=at/86400000-Date.UTC(2000,0,6,18,14)/86400000;
+  const age=((days%synodic)+synodic)%synodic, frac=(1-Math.cos(2*Math.PI*age/synodic))/2, waxing=age<synodic/2;
+  const name=frac<0.06?'New moon':frac<0.35?(waxing?'Waxing crescent':'Waning crescent'):frac<0.65?(waxing?'First quarter':'Last quarter'):frac<0.94?(waxing?'Waxing gibbous':'Waning gibbous'):'Full moon';
+  return {age,frac,waxing,name};
+}
+
+async function fetchHistoryForDate(date){
+  const key=`${state.loc.lat.toFixed(3)},${state.loc.lon.toFixed(3)}:${date.slice(5)}`;
+  if(state.historyCache[key]) return state.historyCache[key];
+  const target=new Date(date+'T12:00:00'), month=target.getMonth(), day=target.getDate(), y=target.getFullYear();
+  const startY=y-10, endY=y-1;
+  const pad=n=>String(n).padStart(2,'0');
+  const start=`${startY}-${pad(month+1)}-${pad(day)}`, end=`${endY}-${pad(month+1)}-${pad(day)}`;
+  try{
+    const d=await fetchJSON(`https://archive-api.open-meteo.com/v1/archive?latitude=${state.loc.lat}&longitude=${state.loc.lon}&start_date=${start}&end_date=${end}&daily=temperature_2m_max,temperature_2m_min&timezone=auto`,{},15000);
+    const rows=[];
+    (d.daily?.time||[]).forEach((ds,i)=>{ const x=new Date(ds+'T12:00:00'); if(x.getMonth()===month&&x.getDate()===day) rows.push({date:ds,hiC:d.daily.temperature_2m_max?.[i]??null,loC:d.daily.temperature_2m_min?.[i]??null}); });
+    const last=rows.find(r=>r.date.startsWith(String(endY)))||rows.at(-1)||null;
+    const out={avgHiC:avg(rows.map(r=>r.hiC)),avgLoC:avg(rows.map(r=>r.loC)),last,count:rows.length};
+    state.historyCache[key]=out; return out;
+  }catch(e){ return null; }
+}
+async function renderHistoryTab(date,day){
+  const el=$('#dailyDetailContent'); if(!el) return;
+  el.innerHTML='<div class="historyload">Squeezing the archive…</div>';
+  const h=await fetchHistoryForDate(date);
+  if(!$('#dailyDetailContent') || !$('#forecastDetail [data-dtab="history"][aria-selected="true"]')) return;
+  if(!h){ el.innerHTML='<div class="historyload">History did not come back for this spot.</div>'; return; }
+  el.innerHTML=`<div class="historytable"><div class="historyhead"><span></span><b>High</b><b>Low</b></div>
+    <div><span>This forecast</span><b>${T(day.hiC)}°</b><b>${T(day.loC)}°</b></div>
+    <div><span>Recent same-date avg <small>(${h.count} yr)</small></span><b>${T(h.avgHiC)}°</b><b>${T(h.avgLoC)}°</b></div>
+    ${h.last?`<div><span>Last year on this date</span><b>${T(h.last.hiC)}°</b><b>${T(h.last.loC)}°</b></div>`:''}
+  </div><p class="detailnote">History uses Open-Meteo archive data for this exact calendar date; it is a recent same-date average, not a 30-year climate normal.</p>`;
 }
 
 function aqiLabel(v){
@@ -1331,48 +1644,199 @@ function renderAir(){
 }
 
 /* ---------- mobile swipe between sections ---------- */
-function initSwipeNav(el){
-  // Bind only once; renderApp can re-run when units/location update.
-  if(el.dataset.swipeBound === 'true') return;
-  el.dataset.swipeBound = 'true';
+let swipeCtl = null;
 
-  const tabs = TABS;
-  let startX=0, startY=0, startT=0, tracking=false;
+function initSwipeNav(stage){
+  if(!stage) return;
+  const track = stage.querySelector('.viewtrack');
+  const panels = [...stage.querySelectorAll('.panelview')];
+  const nav = document.querySelector('nav.tabs');
+  if(!track || !panels.length || !nav) return;
 
-  const ignore = target => !!target.closest(
-    'button,input,select,textarea,a,.hscroll,.airtimeline,#map,.leaflet-container,.scrub'
+  if(swipeCtl?.destroy) swipeCtl.destroy();
+
+  let index = Math.max(0, TABS.indexOf(state.tab));
+  let tracking = false, horizontal = false;
+  let startX = 0, startY = 0, lastX = 0, lastT = 0, velocityX = 0;
+  let width = Math.max(1, stage.clientWidth);
+  let raf = 0, pendingDx = 0, trackX = 0, suppressClickUntil = 0;
+
+  const ignored = target => !!target.closest(
+    'input,select,textarea,a,.hrange button,.basemaptoggle button,.playbtn,.maplock,.hscroll,.airtimeline,.scrub,.forecastdetail'
   );
+  const panelHeight = i => Math.max(1, panels[i]?.scrollHeight || 1);
+  const xFor = (i, dx=0) => -i * width + dx;
+  const setTrack = (x, animate=false, duration=240) => {
+    track.style.transition = animate ? `transform ${duration}ms cubic-bezier(.22,1,.36,1)` : 'none';
+    trackX = x;
+    track.style.transform = `translate3d(${x}px,0,0)`;
+  };
+  const setHeight = (h, animate=false, duration=220) => {
+    stage.style.transition = animate ? `height ${duration}ms cubic-bezier(.22,1,.36,1)` : 'none';
+    stage.style.height = `${Math.max(1, Math.ceil(h))}px`;
+  };
+  const setIndicator = (pos, dragging=false) => {
+    nav.classList.toggle('swiping', dragging);
+    nav.style.setProperty('--tab-x', `${pos * (100/TABS.length)}%`);
+  };
+  const updateAria = i => {
+    document.querySelectorAll('nav.tabs [data-tab]').forEach(b=>b.setAttribute('aria-selected', b.dataset.tab===TABS[i]));
+    panels.forEach((p,pi)=>{
+      p.classList.toggle('active', pi===i);
+      p.setAttribute('aria-hidden', pi===i ? 'false' : 'true');
+    });
+  };
+  const maybeInitNeighbor = dx => {
+    const dir = dx < 0 ? 1 : -1;
+    const ni = index + dir;
+    if(ni>=0 && ni<TABS.length && TABS[ni]==='radar') initRadar();
+  };
+  const renderDrag = dx => {
+    width = Math.max(1, stage.clientWidth);
+    let applied = dx;
+    if((index===0 && dx>0) || (index===TABS.length-1 && dx<0)) applied = dx * 0.22;
+    setTrack(xFor(index, applied), false);
 
-  el.addEventListener('touchstart', e=>{
-    if(e.touches.length !== 1 || ignore(e.target)) return;
-    tracking = true;
-    startX = e.touches[0].clientX;
+    const rawPos = index - applied/width;
+    setIndicator(Math.max(0, Math.min(TABS.length-1, rawPos)), true);
+
+    const dir = applied < 0 ? 1 : -1;
+    const ni = index + dir;
+    if(ni>=0 && ni<TABS.length){
+      const p = Math.min(1, Math.abs(applied)/width);
+      const h = panelHeight(index) + (panelHeight(ni)-panelHeight(index))*p;
+      setHeight(h, false);
+    }
+  };
+  const settle = (nextIndex, fromDrag=true) => {
+    nextIndex = Math.max(0, Math.min(TABS.length-1, nextIndex));
+    index = nextIndex;
+    state.tab = TABS[index];
+    updateAria(index);
+    setIndicator(index, false);
+
+    const dist = Math.abs(xFor(index)-trackX);
+    const duration = fromDrag ? Math.max(150, Math.min(270, 150 + dist/width*130)) : 250;
+    setTrack(xFor(index), true, duration);
+    setHeight(panelHeight(index), true, Math.min(duration,230));
+
+    if(state.tab==='radar'){
+      initRadar();
+      setTimeout(()=>state.radar?.map?.invalidateSize(), duration+30);
+    }
+  };
+
+  const onStart = e => {
+    if(e.touches.length!==1 || ignored(e.target)) return;
+    /* An unlocked Leaflet map owns its gestures. A locked map has pointer-events
+       disabled, so the event lands on the frame and naturally becomes section swipe. */
+    if(e.target.closest('#map,.leaflet-container')) return;
+    tracking = true; horizontal = false;
+    startX = lastX = e.touches[0].clientX;
     startY = e.touches[0].clientY;
-    startT = Date.now();
-  }, {passive:true});
+    lastT = performance.now(); velocityX = 0;
+    track.style.transition = 'none';
+    stage.style.transition = 'none';
+  };
+  const onMove = e => {
+    if(!tracking || e.touches.length!==1) return;
+    const x=e.touches[0].clientX, y=e.touches[0].clientY;
+    const dx=x-startX, dy=y-startY;
+    if(!horizontal){
+      if(Math.abs(dx)<7 && Math.abs(dy)<7) return;
+      if(Math.abs(dy)>Math.abs(dx)*1.05){ tracking=false; return; }
+      horizontal=true;
+      stage.classList.add('dragging');
+      maybeInitNeighbor(dx);
+    }
+    e.preventDefault();
+    const now=performance.now(), dt=Math.max(1,now-lastT);
+    velocityX = velocityX*.55 + ((x-lastX)/dt)*.45;
+    lastX=x; lastT=now;
+    pendingDx=dx;
+    if(!raf) raf=requestAnimationFrame(()=>{ raf=0; renderDrag(pendingDx); });
+  };
+  const finish = e => {
+    if(!tracking && !horizontal) return;
+    const wasHorizontal=horizontal;
+    tracking=false; horizontal=false; stage.classList.remove('dragging');
+    if(!wasHorizontal){ setIndicator(index,false); return; }
+    const endX = e.changedTouches?.[0]?.clientX ?? lastX;
+    const dx=endX-startX;
+    if(Math.abs(dx)>10) suppressClickUntil = performance.now()+360;
+    const travel=Math.abs(dx)/Math.max(1,width);
+    const flick=Math.abs(velocityX)>0.42;
+    let next=index;
+    if((travel>0.18 || flick) && Math.abs(dx)>24){
+      next = dx<0 ? index+1 : index-1;
+    }
+    settle(next,true);
+  };
+  const onCancel = ()=>{
+    if(!tracking && !horizontal) return;
+    tracking=false; horizontal=false; stage.classList.remove('dragging');
+    settle(index,true);
+  };
+  const onResize = ()=>{
+    width=Math.max(1,stage.clientWidth);
+    setTrack(xFor(index),false);
+    setHeight(panelHeight(index),false);
+  };
 
-  el.addEventListener('touchend', e=>{
-    if(!tracking || !e.changedTouches.length) return;
-    tracking = false;
-    const dx = e.changedTouches[0].clientX - startX;
-    const dy = e.changedTouches[0].clientY - startY;
-    const fastEnough = Date.now() - startT < 800;
+  const onClickCapture = e=>{
+    if(performance.now() < suppressClickUntil){ e.preventDefault(); e.stopPropagation(); }
+  };
+  stage.addEventListener('click',onClickCapture,true);
+  stage.addEventListener('touchstart',onStart,{passive:true});
+  stage.addEventListener('touchmove',onMove,{passive:false});
+  stage.addEventListener('touchend',finish,{passive:true});
+  stage.addEventListener('touchcancel',onCancel,{passive:true});
+  window.addEventListener('resize',onResize,{passive:true});
 
-    // Only treat it as tab navigation when the gesture is clearly horizontal.
-    if(!fastEnough || Math.abs(dx) < 65 || Math.abs(dx) < Math.abs(dy)*1.6) return;
+  const ro = typeof ResizeObserver!=='undefined' ? new ResizeObserver(entries=>{
+    for(const entry of entries){
+      const pi=panels.indexOf(entry.target);
+      if(pi===index && !horizontal) setHeight(panelHeight(index),false);
+    }
+  }) : null;
+  panels.forEach(p=>ro?.observe(p));
 
-    const i = tabs.indexOf(state.tab);
-    const next = dx < 0 ? Math.min(i+1, tabs.length-1) : Math.max(i-1, 0);
-    if(next !== i) switchTab(tabs[next]);
-  }, {passive:true});
+  swipeCtl = {
+    go(tab){
+      const ni=TABS.indexOf(tab); if(ni<0) return;
+      if(ni===index){
+        state.tab=tab; updateAria(index); setIndicator(index,false); setHeight(panelHeight(index),false);
+        if(tab==='radar') initRadar();
+        return;
+      }
+      if(tab==='radar') initRadar();
+      settle(ni,false);
+    },
+    refresh(){ onResize(); },
+    destroy(){
+      if(raf) cancelAnimationFrame(raf);
+      ro?.disconnect();
+      stage.removeEventListener('click',onClickCapture,true);
+      stage.removeEventListener('touchstart',onStart);
+      stage.removeEventListener('touchmove',onMove);
+      stage.removeEventListener('touchend',finish);
+      stage.removeEventListener('touchcancel',onCancel);
+      window.removeEventListener('resize',onResize);
+    }
+  };
+
+  updateAria(index);
+  setIndicator(index,false);
+  requestAnimationFrame(()=>onResize());
 }
 
 /* ---------- tabs ---------- */
 function switchTab(tab){
+  if(!TABS.includes(tab)) return;
   state.tab = tab;
+  if(swipeCtl){ swipeCtl.go(tab,true); return; }
   document.querySelectorAll('nav.tabs [data-tab]').forEach(b=>b.setAttribute('aria-selected', b.dataset.tab===tab));
-  document.querySelectorAll('.panelview').forEach(p=>p.classList.remove('active'));
-  const view = $('#view-'+tab); if(view) view.classList.add('active');
+  document.querySelectorAll('.panelview').forEach(p=>p.classList.toggle('active',p.id==='view-'+tab));
   if(tab==='radar') initRadar();
 }
 
@@ -1380,32 +1844,163 @@ function switchTab(tab){
 function initRadar(){
   if(state.radar){ state.radar.map.invalidateSize(); return; }
   if(typeof L === 'undefined'){ $('#map').innerHTML = '<p class="msg">Map library failed to load.</p>'; return; }
-  const map = L.map('map', {zoomControl:true, attributionControl:true}).setView([state.loc.lat, state.loc.lon], 7);
-  setTimeout(()=>map.invalidateSize(), 80);
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {maxZoom:12, subdomains:'abcd', attribution:'&copy; OpenStreetMap & CARTO'}).addTo(map);
-  L.circleMarker([state.loc.lat, state.loc.lon], {radius:6, color:'#23241B', weight:2, fillColor:'#F4CE3E', fillOpacity:1}).addTo(map);
 
-  const radar = state.radar = { map, frames:[], layers:{}, idx:0, playing:false, timer:null,
-    destroy(){ clearInterval(this.timer); this.map.remove(); } };
+  const map = L.map('map', {zoomControl:true, attributionControl:true, minZoom:1}).setView([state.loc.lat, state.loc.lon], 7);
+  setTimeout(()=>map.invalidateSize(), 80);
+
+  /* Keep the animated RainViewer layer independent from the basemap.  Custom
+     panes guarantee that switching maps can never cover the precipitation. */
+  map.createPane('lemonsBase');
+  map.getPane('lemonsBase').style.zIndex = 200;
+  map.createPane('lemonsRadar');
+  map.getPane('lemonsRadar').style.zIndex = 380;
+  map.getPane('lemonsRadar').style.pointerEvents = 'none';
+  map.createPane('lemonsMarker');
+  map.getPane('lemonsMarker').style.zIndex = 520;
+
+  const basemaps = {
+    street: L.tileLayer('https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png', {
+      pane:'lemonsBase', subdomains:'abc', maxNativeZoom:19, maxZoom:19,
+      attribution:'&copy; OpenStreetMap contributors · tiles &copy; HOT / OpenStreetMap France'
+    }),
+    topo: L.tileLayer('https://basemap.nationalmap.gov/arcgis/rest/services/USGSTopo/MapServer/tile/{z}/{y}/{x}', {
+      pane:'lemonsBase', maxNativeZoom:17, maxZoom:19,
+      attribution:'Tiles courtesy of the U.S. Geological Survey'
+    }),
+    satellite: L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      pane:'lemonsBase', maxZoom:19,
+      attribution:'Tiles &copy; Esri, Maxar, Earthstar Geographics, and the GIS User Community'
+    })
+  };
+
+  const savedBase = store.get('lemons.radarBase', 'street');
+  let baseName = basemaps[savedBase] ? savedBase : 'street';
+  basemaps[baseName].addTo(map);
+
+  L.circleMarker([state.loc.lat, state.loc.lon], {
+    pane:'lemonsMarker', radius:6, color:'#23241B', weight:2,
+    fillColor:'#F4CE3E', fillOpacity:1
+  }).addTo(map);
+
+  const radar = state.radar = {
+    map, frames:[], layers:{}, layerMeta:{}, layerIndex:{}, basemaps, baseName, idx:0, displayedIdx:-1, desiredIdx:0,
+    playing:false, timer:null, frameRaf:null, swapTimer:null, moveTimer:null, locked:true, scrubbing:false,
+    activeLayer:null, pendingLayer:null, pendingIdx:-1, swapSeq:0,
+    hotIndices:new Set(), hotRadius:2, preloadGen:0, preloadQueue:[], preloadActive:0, preloadConcurrency:4, bgStarted:false,
+    destroy(){
+      clearTimeout(this.timer); clearTimeout(this.swapTimer); clearTimeout(this.moveTimer);
+      if(this.frameRaf) cancelAnimationFrame(this.frameRaf);
+      this.preloadGen++;
+      this.map.remove();
+    }
+  };
+
+  /* LemonCoords-style gesture lock: locked by default so a swipe over the map
+     belongs to section navigation. Unlocking hands every gesture back to Leaflet. */
+  const mapFrame = $('#radarmapframe');
+  const mapLock = $('#maplock');
+  const lockIcon = locked => locked
+    ? '<svg class="maplockicon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M7.5 10V7.7a4.5 4.5 0 0 1 9 0V10M6 10h12v10H6z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    : '<svg class="maplockicon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M15.8 10V7.7a4.5 4.5 0 0 0-8.3-2.4M6 10h12v10H6z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  function setMapLocked(locked){
+    radar.locked = !!locked;
+    mapFrame?.classList.toggle('maplocked', radar.locked);
+    if(mapLock){
+      mapLock.setAttribute('aria-pressed', radar.locked ? 'true' : 'false');
+      mapLock.setAttribute('aria-label', radar.locked ? 'Unlock radar map' : 'Lock radar map');
+      mapLock.innerHTML = `${lockIcon(radar.locked)}<span>${radar.locked ? 'unlock map' : 'lock map'}</span>`;
+    }
+    const method = radar.locked ? 'disable' : 'enable';
+    map.dragging?.[method]();
+    map.touchZoom?.[method]();
+    map.doubleClickZoom?.[method]();
+    map.scrollWheelZoom?.[method]();
+    map.boxZoom?.[method]();
+    map.keyboard?.[method]();
+  }
+  mapLock?.addEventListener('click', e=>{
+    e.preventDefault(); e.stopPropagation();
+    setMapLocked(!radar.locked);
+  });
+  setMapLocked(true);
+
+  function setBasemap(name){
+    if(!radar.basemaps[name] || radar.baseName===name) return;
+    Object.entries(radar.basemaps).forEach(([key, layer])=>{
+      if(key===name){
+        if(!map.hasLayer(layer)) layer.addTo(map);
+      }else if(map.hasLayer(layer)){
+        map.removeLayer(layer);
+      }
+    });
+    radar.baseName = name;
+    store.set('lemons.radarBase', name);
+    document.querySelectorAll('[data-basemap]').forEach(btn=>{
+      btn.setAttribute('aria-pressed', btn.dataset.basemap===name);
+    });
+    /* Reassert radar opacity after a base switch; the custom pane keeps it on top. */
+    if(radar.activeLayer) radar.activeLayer.setOpacity(0.75);
+  }
+
+  document.querySelectorAll('[data-basemap]').forEach(btn=>{
+    btn.setAttribute('aria-pressed', btn.dataset.basemap===baseName);
+    btn.addEventListener('click', ()=>setBasemap(btn.dataset.basemap));
+  });
 
   fetchJSON('https://api.rainviewer.com/public/weather-maps.json').then(d=>{
-    radar.sets = {
-      rain: { frames: [...(d.radar?.past||[]), ...(d.radar?.nowcast||[])], startIdx: Math.max(0,(d.radar?.past||[]).length-1) },
-      sat:  { frames: [...(d.satellite?.infrared||[])], startIdx: Math.max(0,(d.satellite?.infrared||[]).length-1) }
-    };
+    const rvPast = (d.radar?.past||[]).map(f=>({...f, provider:'rainviewer'}));
+    const rvNowcast = (d.radar?.nowcast||[]).map(f=>({...f, provider:'rainviewer'}));
     radar.host = d.host || 'https://tilecache.rainviewer.com';
-    const scrub = $('#radarscrub');
-    scrub.addEventListener('input', ()=>{ stopRadar(); showFrame(+scrub.value); });
-    $('#radarplay').addEventListener('click', ()=> radar.playing ? stopRadar() : playRadar());
-    $('#modeRain').addEventListener('click', ()=>setMode('rain'));
-    $('#modeSat').addEventListener('click', ()=>setMode('sat'));
-    /* satellite coverage is regional; if there are no frames, grey out that
-       one button but ALWAYS keep the rain radar showing */
-    if(!radar.sets.sat.frames.length){
-      const sb = $('#modeSat');
-      if(sb){ sb.disabled = true; sb.title = 'No satellite coverage here right now'; }
+
+    /* RainViewer's public tiled timeline exposes only the latest two hours.
+       In the contiguous U.S., fill the older side of the slider out to six hours
+       with Iowa Environmental Mesonet's time-aware NEXRAD mosaic archive. */
+    const inConus = state.loc.lat >= 24 && state.loc.lat <= 50 && state.loc.lon >= -125 && state.loc.lon <= -66;
+    let extended = [];
+    if(inConus && rvPast.length){
+      const step = 10 * 60;
+      const earliestRv = rvPast[0].time;
+      const cutoff = Math.floor((Date.now()/1000 - 6*3600) / step) * step;
+      for(let t=cutoff; t < earliestRv; t += step){
+        extended.push({time:t, path:`iem-${t}`, provider:'iem'});
+      }
     }
-    setMode('rain');
+
+    radar.frames = [...extended, ...rvPast, ...rvNowcast];
+    radar.startIdx = Math.max(0, extended.length + rvPast.length - 1);
+    radar.desiredIdx = radar.startIdx;
+
+    const scrub = $('#radarscrub');
+    const beginScrub = ()=>{
+      if(!radar.scrubbing){
+        radar.scrubbing = true;
+        stopTimelinePreload();
+      }
+      stopRadar();
+    };
+    const endScrub = ()=>{
+      if(!radar.scrubbing) return;
+      radar.scrubbing = false;
+      showFrame(+scrub.value);
+      startTimelinePreload(+scrub.value);
+    };
+    scrub.addEventListener('pointerdown', beginScrub);
+    scrub.addEventListener('input', ()=>{
+      beginScrub();
+      queueFrame(+scrub.value);
+    });
+    scrub.addEventListener('pointerup', endScrub);
+    scrub.addEventListener('pointercancel', endScrub);
+    scrub.addEventListener('change', endScrub);
+    $('#radarplay').addEventListener('click', ()=> radar.playing ? stopRadar() : playRadar());
+
+    if(!radar.frames.length){
+      $('#radartime').textContent = 'no data';
+      scrub.max = 0;
+      return;
+    }
+    scrub.max = radar.frames.length-1;
+    showFrame(radar.startIdx);
   }).catch(()=>{ $('#radartime').textContent = 'radar offline'; });
 
   /* rain outlook: Open-Meteo 15-minute nowcast — "rain around 4:15" under the map */
@@ -1429,54 +2024,350 @@ function initRadar(){
         : 'Nothing hitting this spot in the next 6 hours.';
     }).catch(()=>{});
 
-  function setMode(mode){
-    stopRadar();
-    radar.mode = mode;
-    $('#modeRain').setAttribute('aria-pressed', mode==='rain');
-    $('#modeSat').setAttribute('aria-pressed', mode==='sat');
-    Object.values(radar.layers).forEach(l=>l.setOpacity(0));
-    radar.frames = radar.sets[mode].frames;
-    const scrub = $('#radarscrub');
-    if(!radar.frames.length){ $('#radartime').textContent = 'no data'; scrub.max = 0; return; }
-    scrub.max = radar.frames.length-1;
-    showFrame(radar.sets[mode].startIdx);
+  function layerKey(f){
+    return f.provider === 'iem' ? `iem:${f.time}` : `rv:${f.path}`;
   }
+
+  function metaFor(i){
+    const f = radar.frames[i];
+    if(!f) return null;
+    const key = layerKey(f);
+    layerFor(i);
+    return radar.layerMeta[key] || null;
+  }
+
   function layerFor(i){
     const f = radar.frames[i];
-    if(!radar.layers[f.path]){
-      const isSat = f.path.includes('satellite');
-      const style = isSat ? '0/0_0' : '2/1_1'; // satellite: infrared palette · radar: universal blue w/ smoothing
-      radar.layers[f.path] = L.tileLayer(`${radar.host}${f.path}/256/{z}/{x}/{y}/${style}.png`, {opacity:0, maxZoom:12, tileSize:256, crossOrigin:true, attribution:'Imagery &copy; RainViewer'});
+    if(!f) return null;
+    const key = layerKey(f);
+    if(!radar.layers[key]){
+      let layer;
+      if(f.provider === 'iem'){
+        layer = L.tileLayer.wms('https://mesonet.agron.iastate.edu/cgi-bin/wms/nexrad/n0r-t.cgi', {
+          layers:'nexrad-n0r-wmst',
+          time:new Date(f.time*1000).toISOString(),
+          format:'image/png', transparent:true,
+          pane:'lemonsRadar', opacity:0,
+          minZoom:1, maxZoom:19,
+          updateWhenIdle:true, updateWhenZooming:false, keepBuffer:0,
+          attribution:'Older U.S. radar &copy; Iowa Environmental Mesonet'
+        });
+      }else{
+        layer = L.tileLayer(`${radar.host}${f.path}/512/{z}/{x}/{y}/2/1_1.png`, {
+          pane:'lemonsRadar', opacity:0, tileSize:512, zoomOffset:-1,
+          minZoom:1, maxNativeZoom:8, maxZoom:19, noWrap:true,
+          updateWhenIdle:true, updateWhenZooming:false, keepBuffer:0,
+          crossOrigin:true, attribution:'Radar &copy; RainViewer'
+        });
+      }
+      const meta = radar.layerMeta[key] = {
+        index:i, ready:false, warmed:false, promise:null, preloading:false
+      };
+      layer.on('loading', ()=>{ meta.ready = false; });
+      layer.on('load', ()=>{ meta.ready = true; meta.warmed = true; });
+      radar.layers[key] = layer;
+      radar.layerIndex[key] = i;
     }
-    return radar.layers[f.path];
+    return radar.layers[key];
   }
-  function showFrame(i){
+
+  function indexForLayer(layer){
+    if(!layer) return -1;
+    for(const [key, value] of Object.entries(radar.layers)){
+      if(value === layer) return radar.layerIndex[key] ?? -1;
+    }
+    return -1;
+  }
+
+  function detachFrame(i){
+    const layer = layerFor(i);
+    const meta = metaFor(i);
+    if(layer && map.hasLayer(layer) && layer!==radar.activeLayer && layer!==radar.pendingLayer){
+      map.removeLayer(layer);
+      if(meta) meta.ready = false;
+    }
+  }
+
+  function shouldKeepFrame(i, layer){
+    return layer===radar.activeLayer || layer===radar.pendingLayer || radar.hotIndices.has(i);
+  }
+
+  /* Load a frame invisibly and resolve only after its visible-viewport tiles are
+     ready.  Background preloading uses this exact path, so the browser HTTP cache
+     is warm even after an offscreen layer is removed. */
+  function ensureFrameReady(i, preloading=false){
+    const layer = layerFor(i);
+    const meta = metaFor(i);
+    if(!layer || !meta) return Promise.resolve(null);
+    if(map.hasLayer(layer) && meta.ready) return Promise.resolve(layer);
+    if(meta.promise) return meta.promise;
+
+    meta.preloading = preloading;
+    layer.setOpacity(0);
+
+    meta.promise = new Promise(resolve=>{
+      let finished = false;
+      let loadedTiles = 0;
+      const onTileLoad = ()=>{ loadedTiles++; };
+      const cleanup = ()=>{
+        layer.off('tileload', onTileLoad);
+        layer.off('load', onLoad);
+        clearTimeout(fallback);
+      };
+      const finish = ok=>{
+        if(finished) return;
+        finished = true;
+        cleanup();
+        meta.promise = null;
+        meta.preloading = false;
+        if(ok){ meta.ready = true; meta.warmed = true; }
+        if(!shouldKeepFrame(i, layer) && map.hasLayer(layer)){
+          map.removeLayer(layer);
+          meta.ready = false;
+        }
+        resolve(ok ? layer : null);
+      };
+      const onLoad = ()=>finish(true);
+      layer.on('tileload', onTileLoad);
+      layer.once('load', onLoad);
+      const fallback = setTimeout(()=>finish(loadedTiles > 0 || meta.ready), 2400);
+      if(!map.hasLayer(layer)) layer.addTo(map);
+      else if(meta.ready) queueMicrotask(()=>finish(true));
+    });
+    return meta.promise;
+  }
+
+  function updateFrameUI(i){
+    if(!radar.frames.length) return;
+    i = Math.max(0, Math.min(i, radar.frames.length-1));
     radar.idx = i;
-    const active = layerFor(i);
-    if(!radar.map.hasLayer(active)) active.addTo(radar.map);
-    active.setOpacity(radar.mode==='sat' ? 0.55 : 0.75);
-    Object.values(radar.layers).forEach(l=>{ if(l!==active) l.setOpacity(0); });
-    layerFor(Math.min(i+1, radar.frames.length-1)); // preload next
+    radar.desiredIdx = i;
     $('#radarscrub').value = i;
-    const t = new Date(radar.frames[i].time*1000);
-    const isNowcast = radar.frames[i].time*1000 > Date.now();
+    const f = radar.frames[i];
+    const t = new Date(f.time*1000);
+    const isNowcast = f.time*1000 > Date.now();
     $('#radartime').textContent = (isNowcast?'+':'') + t.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
   }
+
+  function setHotWindow(center){
+    const next = new Set();
+    for(let d=-radar.hotRadius; d<=radar.hotRadius; d++){
+      const i = center + d;
+      if(i>=0 && i<radar.frames.length) next.add(i);
+    }
+    radar.hotIndices = next;
+
+    /* Five frames stay resident (current ±2).  That's enough for immediate
+       finger-dragging without keeping dozens of decoded 512 px tiles in memory. */
+    for(const [key, layer] of Object.entries(radar.layers)){
+      const i = radar.layerIndex[key];
+      const meta = radar.layerMeta[key];
+      if(map.hasLayer(layer) && !next.has(i) && layer!==radar.activeLayer && layer!==radar.pendingLayer && !meta?.preloading){
+        map.removeLayer(layer);
+        if(meta) meta.ready = false;
+      }
+    }
+
+    for(const i of next){
+      if(i===radar.displayedIdx) continue;
+      ensureFrameReady(i, true);
+    }
+  }
+
+  function stopTimelinePreload(){
+    radar.preloadGen++;
+    radar.preloadQueue = [];
+    radar.bgStarted = false;
+  }
+
+  function startTimelinePreload(center){
+    if(!radar.frames.length) return;
+    const gen = ++radar.preloadGen;
+    radar.bgStarted = true;
+
+    /* Nearest timestamps first, then fan out through the whole six-hour strip.
+       Four concurrent layers fills the cache quickly without flooding RainViewer
+       / IEM or making the browser decode fifty radar frames at the same instant. */
+    const order = radar.frames.map((_,i)=>i).sort((a,b)=>{
+      const da = Math.abs(a-center), db = Math.abs(b-center);
+      return da===db ? a-b : da-db;
+    });
+    radar.preloadQueue = order.filter(i=>i!==radar.displayedIdx && !radar.hotIndices.has(i));
+    let active = 0;
+
+    const pump = ()=>{
+      if(gen!==radar.preloadGen || radar.scrubbing) return;
+      while(active < radar.preloadConcurrency && radar.preloadQueue.length){
+        const i = radar.preloadQueue.shift();
+        const meta = metaFor(i);
+        if(meta?.warmed && !map.hasLayer(layerFor(i))) continue;
+        active++;
+        ensureFrameReady(i, true).finally(()=>{
+          active--;
+          if(gen!==radar.preloadGen) return;
+          setTimeout(pump, 0);
+        });
+      }
+    };
+    pump();
+  }
+
+  function cancelPending(except=null){
+    clearTimeout(radar.swapTimer);
+    radar.swapTimer = null;
+    if(radar.pendingLayer && radar.pendingLayer!==except && radar.pendingLayer!==radar.activeLayer){
+      const oldIdx = radar.pendingIdx;
+      const oldMeta = oldIdx>=0 ? metaFor(oldIdx) : null;
+      if(map.hasLayer(radar.pendingLayer) && !radar.hotIndices.has(oldIdx) && !oldMeta?.preloading){
+        map.removeLayer(radar.pendingLayer);
+        if(oldMeta) oldMeta.ready = false;
+      }
+    }
+    if(radar.pendingLayer!==except){
+      radar.pendingLayer = null;
+      radar.pendingIdx = -1;
+    }
+  }
+
+  function commitFrame(i, incoming, previous, seq){
+    if(seq!==radar.swapSeq || radar.desiredIdx!==i || radar.pendingLayer!==incoming) return;
+    cancelPending(incoming);
+    radar.pendingLayer = null;
+    radar.pendingIdx = -1;
+    radar.activeLayer = incoming;
+    radar.displayedIdx = i;
+
+    setHotWindow(i);
+
+    const instant = radar.scrubbing;
+    const container = incoming.getContainer?.();
+    if(container) container.style.transition = instant ? 'none' : 'opacity 70ms linear';
+    incoming.setOpacity(instant ? 0.75 : 0);
+    if(!instant){
+      requestAnimationFrame(()=>{
+        if(seq===radar.swapSeq && incoming===radar.activeLayer) incoming.setOpacity(0.75);
+      });
+    }
+
+    if(previous && previous!==incoming){
+      const previousIdx = indexForLayer(previous);
+      const removePrevious = ()=>{
+        previous.setOpacity(0);
+        if(!radar.hotIndices.has(previousIdx) && map.hasLayer(previous)){
+          map.removeLayer(previous);
+          const m = previousIdx>=0 ? metaFor(previousIdx) : null;
+          if(m) m.ready = false;
+        }
+      };
+      if(instant) requestAnimationFrame(removePrevious);
+      else radar.swapTimer = setTimeout(removePrevious, 85);
+    }
+
+    if(container && !instant){
+      setTimeout(()=>{ if(container) container.style.transition = ''; }, 100);
+    }
+
+    /* Start the one-time full-timeline warm-up only after the first useful frame
+       is actually on screen. */
+    if(!radar.bgStarted && !radar.scrubbing) startTimelinePreload(i);
+  }
+
+  function loadFrame(i){
+    if(!radar.frames.length) return;
+    i = Math.max(0, Math.min(i, radar.frames.length-1));
+    const incoming = layerFor(i);
+    const meta = metaFor(i);
+    if(!incoming || !meta) return;
+
+    if(incoming===radar.activeLayer){
+      radar.displayedIdx = i;
+      incoming.setOpacity(0.75);
+      setHotWindow(i);
+      return;
+    }
+
+    const previous = radar.activeLayer;
+    const seq = ++radar.swapSeq;
+    cancelPending(incoming);
+    radar.pendingLayer = incoming;
+    radar.pendingIdx = i;
+
+    /* If this timestamp is one of the resident hot frames, swapping is immediate.
+       Otherwise keep the old radar visible until the requested frame is complete. */
+    if(map.hasLayer(incoming) && meta.ready){
+      commitFrame(i, incoming, previous, seq);
+      return;
+    }
+
+    ensureFrameReady(i, false).then(layer=>{
+      if(!layer) return;
+      if(seq!==radar.swapSeq || radar.desiredIdx!==i || radar.pendingLayer!==incoming) return;
+      commitFrame(i, incoming, previous, seq);
+    });
+  }
+
+  function queueFrame(i){
+    updateFrameUI(i);
+    radar.queuedIdx = radar.desiredIdx;
+    if(radar.frameRaf) return;
+    radar.frameRaf = requestAnimationFrame(()=>{
+      radar.frameRaf = null;
+      loadFrame(radar.queuedIdx);
+    });
+  }
+
+  function showFrame(i){
+    updateFrameUI(i);
+    loadFrame(i);
+  }
+
   function playRadar(){
+    if(!radar.frames.length) return;
     radar.playing = true;
     $('#playicon').innerHTML = '<path d="M6 5h4v14H6zM14 5h4v14h-4z"/>';
     $('#radarplay').setAttribute('aria-label','Pause radar animation');
-    radar.timer = setInterval(()=> showFrame((radar.idx+1) % radar.frames.length), 600);
+    const tick = ()=>{
+      if(!radar.playing) return;
+      showFrame((radar.idx+1) % radar.frames.length);
+      radar.timer = setTimeout(tick, 720);
+    };
+    radar.timer = setTimeout(tick, 300);
   }
+
   function stopRadar(){
-    radar.playing = false; clearInterval(radar.timer);
+    radar.playing = false;
+    clearTimeout(radar.timer);
+    radar.timer = null;
     $('#playicon').innerHTML = '<path d="M7 4.5v15l13-7.5z"/>';
     $('#radarplay').setAttribute('aria-label','Play radar animation');
   }
+
+  /* Panning/zooming gets network priority.  Pause animation/background warming,
+     then rebuild the five-frame hot window and re-warm the timeline for the new
+     viewport once the map settles. */
+  map.on('movestart zoomstart', ()=>{
+    if(radar.playing) stopRadar();
+    stopTimelinePreload();
+    for(const i of [...radar.hotIndices]){
+      if(i!==radar.displayedIdx) detachFrame(i);
+    }
+  });
+  map.on('moveend zoomend', ()=>{
+    clearTimeout(radar.moveTimer);
+    radar.moveTimer = setTimeout(()=>{
+      for(const meta of Object.values(radar.layerMeta)) meta.warmed = false;
+      const center = radar.displayedIdx>=0 ? radar.displayedIdx : radar.desiredIdx;
+      if(center>=0){
+        setHotWindow(center);
+        startTimelinePreload(center);
+      }
+    }, 120);
+  });
 }
 
 /* ---------- unit toggle ---------- */
 function setUnit(u){
+  if(state.radar){ state.radar.destroy(); state.radar = null; }
   state.unit = u; store.set('lemons.unit', u);
   $('#unitF').setAttribute('aria-pressed', u==='F');
   $('#unitC').setAttribute('aria-pressed', u==='C');
