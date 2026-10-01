@@ -1224,24 +1224,35 @@ function renderApp(){
         <section id="view-daily" class="panelview" role="tabpanel"></section>
         <section id="view-radar" class="panelview" role="tabpanel">
           <div class="radarwrap">
-            <div class="radarmapframe maplocked" id="radarmapframe">
-              <div id="map" aria-label="Precipitation radar map"></div>
-              <button class="maplock" id="maplock" type="button" aria-pressed="true" aria-label="Unlock radar map">
-                <svg class="maplockicon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M7.5 10V7.7a4.5 4.5 0 0 1 9 0V10M6 10h12v10H6z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-                <span>unlock map</span>
-              </button>
-            </div>
-            <div class="modetoggle basemaptoggle" role="group" aria-label="Radar basemap">
-              <button data-basemap="street" aria-pressed="true">Street</button>
-              <button data-basemap="topo" aria-pressed="false">USGS Topo</button>
-              <button data-basemap="satellite" aria-pressed="false">Satellite</button>
-            </div>
-            <div class="radarui">
-              <button class="playbtn" id="radarplay" aria-label="Play radar animation">
-                <svg id="playicon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l13-7.5z"/></svg>
-              </button>
-              <input class="scrub" id="radarscrub" type="range" min="0" max="0" value="0" aria-label="Radar frame">
-              <span class="frametime" id="radartime">—</span>
+            <div class="radarstage" id="radarstage">
+              <div class="radarmapframe maplocked" id="radarmapframe">
+                <div id="map" aria-label="Precipitation radar map"></div>
+                <button class="maptool mapfullscreen" id="mapfullscreen" type="button" aria-label="Open radar fullscreen" title="Fullscreen map">
+                  <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M21 16v5h-5M8 21H3v-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+                <button class="maptool maplemon" id="maplemon" type="button" aria-pressed="true" aria-label="Hide location lemon" title="Show or hide location lemon">
+                  ${lemonFruit(18, '')}
+                </button>
+                <button class="maplock" id="maplock" type="button" aria-pressed="true" aria-label="Unlock radar map">
+                  <svg class="maplockicon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M7.5 10V7.7a4.5 4.5 0 0 1 9 0V10M6 10h12v10H6z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                  <span>unlock map</span>
+                </button>
+                <button class="maptool mapclose" id="mapclose" type="button" aria-label="Exit radar fullscreen" title="Exit fullscreen">×</button>
+              </div>
+              <div class="radarcontrols">
+                <div class="modetoggle basemaptoggle" role="group" aria-label="Radar basemap">
+                  <button data-basemap="street" aria-pressed="true">Street</button>
+                  <button data-basemap="topo" aria-pressed="false">USGS Topo</button>
+                  <button data-basemap="satellite" aria-pressed="false">Satellite</button>
+                </div>
+                <div class="radarui">
+                  <button class="playbtn" id="radarplay" aria-label="Play radar animation">
+                    <svg id="playicon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l13-7.5z"/></svg>
+                  </button>
+                  <input class="scrub" id="radarscrub" type="range" min="0" max="0" value="0" aria-label="Radar frame">
+                  <span class="frametime" id="radartime">—</span>
+                </div>
+              </div>
             </div>
             <p class="radarnote" id="radaroutlook"></p>
             <p class="radarnote">Up to 6 hours of radar history in the contiguous U.S., plus the latest RainViewer nowcast.</p>
@@ -1662,7 +1673,7 @@ function initSwipeNav(stage){
   let raf = 0, pendingDx = 0, trackX = 0, suppressClickUntil = 0;
 
   const ignored = target => !!target.closest(
-    'input,select,textarea,a,.hrange button,.basemaptoggle button,.playbtn,.maplock,.hscroll,.airtimeline,.scrub,.forecastdetail'
+    'input,select,textarea,a,.hrange button,.basemaptoggle button,.playbtn,.maplock,.maptool,.hscroll,.airtimeline,.scrub,.forecastdetail'
   );
   const panelHeight = i => Math.max(1, panels[i]?.scrollHeight || 1);
   const xFor = (i, dx=0) => -i * width + dx;
@@ -1877,20 +1888,32 @@ function initRadar(){
   let baseName = basemaps[savedBase] ? savedBase : 'street';
   basemaps[baseName].addTo(map);
 
-  L.circleMarker([state.loc.lat, state.loc.lon], {
-    pane:'lemonsMarker', radius:6, color:'#23241B', weight:2,
-    fillColor:'#F4CE3E', fillOpacity:1
-  }).addTo(map);
+  const lemonMarkerIcon = L.divIcon({
+    className:'lemonmapmarker',
+    html:lemonFruit(30, state.loc.name || 'Forecast location'),
+    iconSize:[30,30], iconAnchor:[15,15]
+  });
+  const locationMarker = L.marker([state.loc.lat, state.loc.lon], {
+    pane:'lemonsMarker', icon:lemonMarkerIcon, interactive:false, keyboard:false
+  });
+  const markerVisible = store.get('lemons.radarPinVisible') !== false;
+  if(markerVisible) locationMarker.addTo(map);
 
   const radar = state.radar = {
     map, frames:[], layers:{}, layerMeta:{}, layerIndex:{}, basemaps, baseName, idx:0, displayedIdx:-1, desiredIdx:0,
     playing:false, timer:null, frameRaf:null, swapTimer:null, moveTimer:null, locked:true, scrubbing:false,
     activeLayer:null, pendingLayer:null, pendingIdx:-1, swapSeq:0,
+    locationMarker, markerVisible, fsHandler:null, fallbackFullscreen:false, fsPlaceholder:null,
     hotIndices:new Set(), hotRadius:2, preloadGen:0, preloadQueue:[], preloadActive:0, preloadConcurrency:4, bgStarted:false,
     destroy(){
       clearTimeout(this.timer); clearTimeout(this.swapTimer); clearTimeout(this.moveTimer);
       if(this.frameRaf) cancelAnimationFrame(this.frameRaf);
       this.preloadGen++;
+      if(this.fsHandler){
+        document.removeEventListener('fullscreenchange', this.fsHandler);
+        document.removeEventListener('webkitfullscreenchange', this.fsHandler);
+      }
+      restoreFallbackFullscreen();
       this.map.remove();
     }
   };
@@ -1923,6 +1946,94 @@ function initRadar(){
     setMapLocked(!radar.locked);
   });
   setMapLocked(true);
+
+  /* Location lemon: the forecast point itself, not the browser/device location. */
+  const lemonToggle = $('#maplemon');
+  function setMarkerVisible(show){
+    radar.markerVisible = !!show;
+    if(radar.markerVisible){
+      if(!map.hasLayer(radar.locationMarker)) radar.locationMarker.addTo(map);
+    }else if(map.hasLayer(radar.locationMarker)){
+      map.removeLayer(radar.locationMarker);
+    }
+    store.set('lemons.radarPinVisible', radar.markerVisible);
+    if(lemonToggle){
+      lemonToggle.setAttribute('aria-pressed', radar.markerVisible ? 'true' : 'false');
+      lemonToggle.setAttribute('aria-label', radar.markerVisible ? 'Hide location lemon' : 'Show location lemon');
+      lemonToggle.title = radar.markerVisible ? 'Hide location lemon' : 'Show location lemon';
+    }
+  }
+  lemonToggle?.addEventListener('click', e=>{
+    e.preventDefault(); e.stopPropagation();
+    setMarkerVisible(!radar.markerVisible);
+  });
+  setMarkerVisible(radar.markerVisible);
+
+  /* Fullscreen the map + its basemap buttons + timeline as one unit. */
+  const radarStage = $('#radarstage');
+  const fsButton = $('#mapfullscreen');
+  const fsClose = $('#mapclose');
+  const enterFsIcon = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M21 16v5h-5M8 21H3v-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  const exitFsIcon = '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M9 3v6H3M15 3v6h6M21 15h-6v6M3 15h6v6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  const fullscreenElement = ()=>document.fullscreenElement || document.webkitFullscreenElement || null;
+  function restoreFallbackFullscreen(){
+    if(!radar.fallbackFullscreen) return;
+    radar.fallbackFullscreen = false;
+    radarStage?.classList.remove('isfullscreen');
+    if(radar.fsPlaceholder?.parentNode && radarStage){
+      radar.fsPlaceholder.parentNode.insertBefore(radarStage, radar.fsPlaceholder);
+      radar.fsPlaceholder.remove();
+    }
+    radar.fsPlaceholder = null;
+  }
+  function syncFullscreen(){
+    const active = fullscreenElement()===radarStage || radar.fallbackFullscreen;
+    if(fsButton){
+      fsButton.innerHTML = active ? exitFsIcon : enterFsIcon;
+      fsButton.setAttribute('aria-label', active ? 'Exit radar fullscreen' : 'Open radar fullscreen');
+      fsButton.title = active ? 'Exit fullscreen' : 'Fullscreen map';
+      fsButton.setAttribute('aria-pressed', active ? 'true' : 'false');
+    }
+    requestAnimationFrame(()=>{
+      map.invalidateSize();
+      setTimeout(()=>map.invalidateSize(), 120);
+    });
+  }
+  function enterFallbackFullscreen(){
+    if(!radarStage || radar.fallbackFullscreen) return;
+    radar.fsPlaceholder = document.createComment('lemons-radar-fullscreen');
+    radarStage.parentNode?.insertBefore(radar.fsPlaceholder, radarStage);
+    document.body.appendChild(radarStage);
+    radar.fallbackFullscreen = true;
+    radarStage.classList.add('isfullscreen');
+  }
+  async function enterFullscreen(){
+    if(!radarStage) return;
+    try{
+      if(radarStage.requestFullscreen) await radarStage.requestFullscreen();
+      else if(radarStage.webkitRequestFullscreen) radarStage.webkitRequestFullscreen();
+      else enterFallbackFullscreen();
+    }catch(e){ enterFallbackFullscreen(); }
+    syncFullscreen();
+  }
+  async function exitFullscreen(){
+    try{
+      if(fullscreenElement() && document.exitFullscreen) await document.exitFullscreen();
+      else if(fullscreenElement() && document.webkitExitFullscreen) document.webkitExitFullscreen();
+      else restoreFallbackFullscreen();
+    }catch(e){ restoreFallbackFullscreen(); }
+    syncFullscreen();
+  }
+  function toggleFullscreen(e){
+    e?.preventDefault(); e?.stopPropagation();
+    const active = fullscreenElement()===radarStage || radar.fallbackFullscreen;
+    active ? exitFullscreen() : enterFullscreen();
+  }
+  fsButton?.addEventListener('click', toggleFullscreen);
+  fsClose?.addEventListener('click', e=>{ e.preventDefault(); e.stopPropagation(); exitFullscreen(); });
+  radar.fsHandler = syncFullscreen;
+  document.addEventListener('fullscreenchange', radar.fsHandler);
+  document.addEventListener('webkitfullscreenchange', radar.fsHandler);
 
   function setBasemap(name){
     if(!radar.basemaps[name] || radar.baseName===name) return;

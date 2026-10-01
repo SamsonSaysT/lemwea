@@ -332,9 +332,24 @@ nav.tabs button[aria-selected="true"]{color:var(--ink)}
 
 /* ---------- radar ---------- */
 .radarwrap{padding:24px 0 40px}
+.radarstage{background:var(--pith)}
 .radarmapframe{position:relative;touch-action:pan-y}
 #map{height:min(62vh,520px);min-height:360px;border-radius:14px;border:1px solid var(--ink);z-index:var(--z-map);background:#EDEBDD;overflow:hidden}
 .radarmapframe.maplocked #map{pointer-events:none}
+/* Put our fullscreen button above Leaflet's +/- control, then the lemon toggle below it. */
+.radarmapframe .leaflet-top.leaflet-left{top:40px}
+.maptool{
+  position:absolute;z-index:1002;width:34px;height:34px;display:grid;place-items:center;
+  background:var(--pith);border:1px solid var(--ink);border-radius:8px;color:var(--ink);
+  box-shadow:0 1px 0 rgba(35,36,27,.06);line-height:1;
+}
+.maptool:active{transform:translateY(1px)}
+.mapfullscreen{left:10px;top:10px}
+.maplemon{left:10px;top:126px}
+.maplemon svg{display:block;width:18px;height:18px;transition:opacity .12s ease,filter .12s ease}
+.maplemon[aria-pressed="false"] svg{opacity:.34;filter:grayscale(1)}
+.maplemon[aria-pressed="false"]::after{content:"";position:absolute;width:20px;height:1px;background:currentColor;transform:rotate(-42deg)}
+.mapclose{display:none;right:10px;top:10px;border-radius:999px;font-size:1.25rem;font-weight:350;padding-bottom:2px}
 .maplock{
   position:absolute;right:10px;top:10px;z-index:1002;display:inline-flex;align-items:center;gap:6px;
   padding:6px 9px;background:var(--pith);border:1px solid var(--ink);border-radius:999px;
@@ -344,6 +359,9 @@ nav.tabs button[aria-selected="true"]{color:var(--ink)}
 .maplock:active{transform:translateY(1px)}
 .maplockicon{display:block;flex:none}
 .radarmapframe:not(.maplocked) .maplock{background:var(--ink);color:var(--pith)}
+.lemonmapmarker{background:transparent!important;border:0!important}
+.lemonmapmarker svg{display:block;filter:drop-shadow(0 1px 1px rgba(35,36,27,.28))}
+.radarcontrols{background:var(--pith)}
 .radarui{display:flex;align-items:center;gap:14px;margin-top:12px}
 .playbtn{
   width:42px;height:42px;border-radius:50%;background:var(--ink);color:var(--pith);
@@ -354,6 +372,37 @@ nav.tabs button[aria-selected="true"]{color:var(--ink)}
 .scrub{flex:1;accent-color:var(--rind);height:4px}
 .radarnote{color:var(--muted);font-size:.8rem;margin-top:8px}
 .mapcredit{color:var(--muted);font-size:.68rem;text-align:right;margin-top:4px}
+
+/* Native fullscreen keeps the useful radar controls with the map.  .isfullscreen
+   is also a fallback for browsers that reject the Fullscreen API. */
+.radarstage:fullscreen,
+.radarstage:-webkit-full-screen,
+.radarstage.isfullscreen{
+  width:100vw;height:100dvh;max-width:none;margin:0;padding:10px;
+  display:flex;flex-direction:column;background:var(--pith);overflow:hidden;
+}
+.radarstage.isfullscreen:not(:fullscreen){position:fixed;inset:0;z-index:9999}
+.radarstage:fullscreen .radarmapframe,
+.radarstage:-webkit-full-screen .radarmapframe,
+.radarstage.isfullscreen .radarmapframe{flex:1;min-height:0}
+.radarstage:fullscreen #map,
+.radarstage:-webkit-full-screen #map,
+.radarstage.isfullscreen #map{height:100%;min-height:0;border-radius:12px}
+.radarstage:fullscreen .radarcontrols,
+.radarstage:-webkit-full-screen .radarcontrols,
+.radarstage.isfullscreen .radarcontrols{flex:none;padding:10px 2px 0}
+.radarstage:fullscreen .basemaptoggle,
+.radarstage:-webkit-full-screen .basemaptoggle,
+.radarstage.isfullscreen .basemaptoggle{margin-bottom:8px}
+.radarstage:fullscreen .radarui,
+.radarstage:-webkit-full-screen .radarui,
+.radarstage.isfullscreen .radarui{margin-top:0}
+.radarstage:fullscreen .mapclose,
+.radarstage:-webkit-full-screen .mapclose,
+.radarstage.isfullscreen .mapclose{display:grid}
+.radarstage:fullscreen .maplock,
+.radarstage:-webkit-full-screen .maplock,
+.radarstage.isfullscreen .maplock{top:52px}
 
 /* ---------- footer ---------- */
 footer.site{border-top:1px solid var(--ink);padding:20px 0 40px;color:var(--muted);font-size:.78rem;line-height:1.7}
