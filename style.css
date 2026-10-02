@@ -946,3 +946,14 @@ footer.site b{color:var(--ink);font-weight:600}
   .predtag{font-size:.4rem;right:3px}
   .daysignal{font-size:.44rem}
 }
+
+/* ---------- daily v8: lead-time confidence / ensemble weighting ---------- */
+.conftag{position:absolute;top:6px;right:4px;font-size:.39rem;line-height:1;letter-spacing:.055em;font-weight:850;color:var(--rind-text);text-transform:uppercase;white-space:nowrap}
+.daycell:has(.conftag){background:color-mix(in srgb,var(--pith) 95%,var(--zest) 5%)}
+.extendedlegend strong{color:var(--rind-text);font-weight:820}
+.forecastconfidence{margin:0 0 15px;padding:9px 0;border-top:1px solid var(--hairline);border-bottom:1px solid var(--hairline);display:grid;grid-template-columns:1fr auto;gap:2px 12px;align-items:baseline}
+.forecastconfidence>span{font-size:.69rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:760}
+.forecastconfidence>b{font-size:.8rem;color:var(--ink)}
+.forecastconfidence>small{grid-column:1/-1;color:var(--muted);font-size:.68rem;line-height:1.4}
+.forecastconfidence.low>b{color:var(--rind-text)}
+@media(max-width:560px){.conftag{font-size:.35rem;right:2px;top:5px}}

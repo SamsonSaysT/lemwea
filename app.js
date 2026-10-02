@@ -36,6 +36,26 @@ function robustAvg(values, minBand=0){
   const sel=robustSelect(items,x=>x.value,minBand);
   return avg(sel.kept.map(x=>x.value));
 }
+function weightedMedian(items, valueFn, weightFn=()=>1){
+  const valid=items.map(item=>({item,value:valueFn(item),weight:Math.max(0,+weightFn(item)||0)}))
+    .filter(x=>typeof x.value==='number'&&isFinite(x.value)&&x.weight>0)
+    .sort((a,b)=>a.value-b.value);
+  if(!valid.length) return null;
+  const total=valid.reduce((n,x)=>n+x.weight,0), half=total/2;
+  let run=0;
+  for(const x of valid){ run+=x.weight; if(run>=half) return x.value; }
+  return valid.at(-1).value;
+}
+function weightedMeanParts(parts){
+  const valid=parts.filter(x=>x && typeof x.value==='number'&&isFinite(x.value)&&x.weight>0);
+  if(!valid.length) return null;
+  const w=valid.reduce((n,x)=>n+x.weight,0);
+  return valid.reduce((n,x)=>n+x.value*x.weight,0)/w;
+}
+function rangeOf(values){
+  const v=values.filter(x=>typeof x==='number'&&isFinite(x));
+  return v.length>1 ? Math.max(...v)-Math.min(...v) : 0;
+}
 const store = {
   get(k){ try { return JSON.parse(localStorage.getItem(k)); } catch(e){ return null; } },
   set(k,v){ try { localStorage.setItem(k, JSON.stringify(v)); } catch(e){} }
@@ -83,6 +103,7 @@ const state = {
   air: null,
   detail: null,                           // richer best-match metrics for click-through views
   extended: null,                         // ECMWF EC46 ensemble-mean guidance beyond normal forecast range
+  dailyGuidance: null,                    // NBM + medium-range ensemble guidance for safer daily temperatures
   historyCache: {},
   tab: 'current',
   radar: null
@@ -202,7 +223,7 @@ const epochHour = iso => Math.floor(Date.parse(iso)/3600000);
 
 /* ---- 1. Open-Meteo multi-model (7 independent models, one call) ---- */
 const OM_MODELS = [
-  {key:'ecmwf_ifs025',        name:'ECMWF'},
+  {key:'ecmwf_ifs_hres',       name:'ECMWF IFS 9km'},
   {key:'gfs_seamless',        name:'NOAA GFS'},
   {key:'icon_seamless',       name:'DWD ICON'},
   {key:'ukmo_seamless',       name:'UK Met Office'},
@@ -355,6 +376,87 @@ async function fetchForecastDetails(lat, lon){
   }));
   return {ok:true, hourly, daily};
 }
+
+
+/* ---- daily accuracy guidance -------------------------------------------------
+   Daily headline temperatures use model-family weighting rather than letting a
+   large cluster of deterministic models out-vote every other signal. For the US,
+   NBM acts as a calibrated local anchor through its horizon. Farther out, three
+   independent ensemble means pull the blend toward the broader probability
+   signal instead of one deterministic warm/cold cluster. */
+function probablyConus(lat, lon){ return lat>=20 && lat<=55 && lon>=-130 && lon<=-60; }
+
+async function fetchNBMDaily(lat, lon){
+  if(!probablyConus(lat,lon)) return null;
+  try{
+    const d=await fetchJSON(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`
+      + `&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code`
+      + `&models=ncep_nbm_conus&timezone=auto&forecast_days=11`,{},12000);
+    const daily=new Map(), dd=d.daily||{};
+    (dd.time||[]).forEach((date,i)=>daily.set(date,{
+      hiC:dd.temperature_2m_max?.[i]??null,
+      loC:dd.temperature_2m_min?.[i]??null,
+      precip:dd.precipitation_probability_max?.[i]??null,
+      code:dd.weather_code?.[i]??null
+    }));
+    return {id:'nbm',name:'NOAA NBM',daily};
+  }catch(e){ return null; }
+}
+
+const DAILY_ENSEMBLES=[
+  {id:'ens_ecmwf',name:'ECMWF ensemble',model:'ecmwf_ifs025_ensemble_mean',weight:1.35},
+  {id:'ens_gefs',name:'NOAA GEFS ensemble',model:'ncep_gefs05_ensemble_mean',weight:1.0},
+  {id:'ens_gem',name:'Canada GEPS ensemble',model:'gem_global_ensemble_mean',weight:.9}
+];
+async function fetchOneDailyEnsemble(lat,lon,def){
+  try{
+    const d=await fetchJSON(`https://ensemble-api.open-meteo.com/v1/ensemble?latitude=${lat}&longitude=${lon}`
+      + `&hourly=temperature_2m,temperature_2m_spread&daily=temperature_2m_max,temperature_2m_min&models=${def.model}`
+      + `&timezone=auto&forecast_days=16`,{},15000);
+    const hh=d.hourly||{}, byDate={};
+    (hh.time||[]).forEach((iso,i)=>{
+      const date=String(iso).slice(0,10), t=hh.temperature_2m?.[i], sp=hh.temperature_2m_spread?.[i];
+      const rec=byDate[date]||(byDate[date]={temps:[],spreads:[]});
+      if(typeof t==='number'&&isFinite(t)) rec.temps.push(t);
+      if(typeof sp==='number'&&isFinite(sp)) rec.spreads.push(sp);
+    });
+    const daily=new Map(), dd=d.daily||{};
+    (dd.time||Object.keys(byDate)).forEach((date,i)=>{
+      const r=byDate[date]||{temps:[],spreads:[]};
+      const hi=dd.temperature_2m_max?.[i], lo=dd.temperature_2m_min?.[i];
+      const hiC=typeof hi==='number'&&isFinite(hi)?hi:(r.temps.length?Math.max(...r.temps):null);
+      const loC=typeof lo==='number'&&isFinite(lo)?lo:(r.temps.length?Math.min(...r.temps):null);
+      if(hiC==null&&loC==null) return;
+      daily.set(date,{hiC,loC,spreadC:r.spreads.length?median(r.spreads):null});
+    });
+    return {...def,daily};
+  }catch(e){ return null; }
+}
+async function fetchDailyGuidance(lat,lon){
+  const [nbm,...ens]=await Promise.all([fetchNBMDaily(lat,lon),...DAILY_ENSEMBLES.map(x=>fetchOneDailyEnsemble(lat,lon,x))]);
+  return {nbm,ensembles:ens.filter(Boolean)};
+}
+
+function deterministicWeight(id,lead){
+  const early={ecmwf_ifs_hres:1.45,gfs_seamless:1.25,ukmo_seamless:1.18,icon_seamless:1.05,gem_seamless:1.0,meteofrance_seamless:.95,jma_seamless:.9,metno:1.0,brightsky:1.0,nws:1};
+  const medium={ecmwf_ifs_hres:1.55,gfs_seamless:1.3,ukmo_seamless:1.18,icon_seamless:1.0,gem_seamless:1.0,meteofrance_seamless:.85,jma_seamless:.82,metno:.9,brightsky:.9,nws:1};
+  return (lead<=4?early:medium)[id] ?? 1;
+}
+function dailyConfidence(lead, spreadC, ensembleSpreadC, ensembleCount){
+  const s=typeof spreadC==='number'?spreadC:0, es=typeof ensembleSpreadC==='number'?ensembleSpreadC:0;
+  if(lead<=4){
+    if(s>5.5 || es>3.5) return 'low';
+    if(s>3.5 || es>2.6) return 'moderate';
+    return 'high';
+  }
+  if(lead<=10){
+    if(s>5.5 || es>3.5 || ensembleCount<1) return 'low';
+    return 'moderate';
+  }
+  if(s>4.8 || es>3.2 || ensembleCount<2) return 'low';
+  return 'moderate';
+}
+function confidenceLabel(c){ return c==='high'?'High':c==='moderate'?'Moderate':'Low'; }
 
 
 /* ---- sub-seasonal extension: ECMWF EC46 ensemble mean ----
@@ -760,12 +862,13 @@ async function fetchAirModel(lat, lon){
 async function loadWeather(){
   renderLoading();
   const {lat, lon} = state.loc;
-  const [weatherResults, alertResult, airResult, detailResult, extendedResult] = await Promise.all([
+  const [weatherResults, alertResult, airResult, detailResult, extendedResult, guidanceResult] = await Promise.all([
     Promise.allSettled([fetchOpenMeteo(lat, lon), fetchNWS(lat, lon), fetchMetNo(lat, lon), fetchBrightSky(lat, lon)]),
     fetchNWSAlerts(lat, lon).then(v=>({ok:true, value:v})).catch(()=>({ok:false, value:[]})),
     fetchAirQuality(lat, lon).then(v=>({ok:true, value:v})).catch(()=>({ok:false, value:{ok:false}})),
     fetchForecastDetails(lat, lon).then(v=>({ok:true, value:v})).catch(()=>({ok:false, value:null})),
     fetchExtendedOutlook(lat, lon).then(v=>({ok:true, value:v})).catch(()=>({ok:false, value:null})),
+    fetchDailyGuidance(lat, lon).then(v=>({ok:true, value:v})).catch(()=>({ok:false, value:null})),
     fetchSunTimes(lat, lon)
   ]);
   let sources = [];
@@ -778,6 +881,7 @@ async function loadWeather(){
   state.air = airResult.value || {ok:false};
   state.detail = detailResult.value || null;
   state.extended = extendedResult.value || null;
+  state.dailyGuidance = guidanceResult.value || null;
   state.updated = Date.now();
   if(!sources.some(s=>s.ok)){
     $('#app').innerHTML = `<div class="msg"><h2>The lemon came up dry.</h2>
@@ -827,17 +931,21 @@ function consensusDaily(days=DAILY_EXTENDED_DAYS){
   okSources().forEach(s=> s.daily && [...s.daily.keys()].forEach(d=>dates.add(d)));
   state.detail?.daily && [...state.detail.daily.keys()].forEach(d=>dates.add(d));
   state.extended?.daily && [...state.extended.daily.keys()].forEach(d=>dates.add(d));
+  state.dailyGuidance?.nbm?.daily && [...state.dailyGuidance.nbm.daily.keys()].forEach(d=>dates.add(d));
+  (state.dailyGuidance?.ensembles||[]).forEach(e=>e.daily && [...e.daily.keys()].forEach(d=>dates.add(d)));
   const todayStr = new Intl.DateTimeFormat('en-CA',{timeZone:state.tz||undefined}).format(new Date());
+  const todayNoon=new Date(todayStr+'T12:00:00');
 
-  // Normal forecast data gets absolute priority through its true horizon. The
-  // seasonal feed is deliberately held back until AFTER that horizon so it can
-  // never contaminate the regular Lemons squeeze.
+  // Only normal deterministic/detail data defines the hard boundary between
+  // normal forecast cells and EC46 PRED cells. Ensemble guidance improves the
+  // normal blend but does not silently extend its label.
   const normalDates=[];
   okSources().forEach(s=>s.daily && normalDates.push(...s.daily.keys()));
   state.detail?.daily && normalDates.push(...state.detail.daily.keys());
   const normalMax = normalDates.filter(d=>d>=todayStr).sort().at(-1) || null;
 
   return [...dates].filter(d=>d>=todayStr).sort().slice(0,days).map(date=>{
+    const lead=Math.max(0,Math.round((new Date(date+'T12:00:00')-todayNoon)/86400000));
     const detail = state.detail?.daily?.get(date) || null;
     const ext = state.extended?.daily?.get(date) || null;
     const pairs = okSources().map(source=>({source,row:source.daily?.get(date)})).filter(x=>x.row && (x.row.hiC!=null || x.row.loC!=null));
@@ -847,65 +955,70 @@ function consensusDaily(days=DAILY_EXTENDED_DAYS){
       if(!ext || (ext.hiC==null && ext.loC==null) || insideNormal) return null;
       const week=extendedWeekForDate(date);
       return {
-        date,
-        hiC:ext.hiC ?? null,
-        loC:ext.loC ?? null,
-        precip:null,
-        precipMm:ext.precipMm ?? null,
-        code:ext.code ?? null,
-        count:51,
-        totalCount:51,
-        omittedCount:0,
-        extended:true,
-        fallback:false,
-        tempAnomC:week?.tempAnomC ?? null,
-        precipAnom:week?.precipAnom ?? null,
-        tempSignal:extendedTempSignal(week?.tempAnomC),
-        precipSignal:extendedPrecipSignal(week?.precipAnom),
-        confidence:extendedConfidence(date)
+        date,hiC:ext.hiC??null,loC:ext.loC??null,precip:null,precipMm:ext.precipMm??null,code:ext.code??null,
+        count:51,totalCount:51,omittedCount:0,extended:true,fallback:false,
+        tempAnomC:week?.tempAnomC??null,precipAnom:week?.precipAnom??null,
+        tempSignal:extendedTempSignal(week?.tempAnomC),precipSignal:extendedPrecipSignal(week?.precipAnom),confidence:extendedConfidence(date)
       };
     }
 
     if(!pairs.length){
       if(!detail || (detail.hiC==null && detail.loC==null)) return null;
-      return {
-        date,
-        hiC:detail.hiC ?? null,
-        loC:detail.loC ?? null,
-        precip:detail.precip ?? null,
-        code:detail.code ?? null,
-        count:1,
-        totalCount:1,
-        omittedCount:0,
-        fallback:true,
-        extended:false,
-        sunrise:detail.sunrise ?? null,
-        sunset:detail.sunset ?? null
-      };
+      return {date,hiC:detail.hiC??null,loC:detail.loC??null,precip:detail.precip??null,code:detail.code??null,
+        count:1,totalCount:1,omittedCount:0,fallback:true,extended:false,sunrise:detail.sunrise??null,sunset:detail.sunset??null,
+        confidence:'low',spreadC:null,leadDay:lead,blendMode:'best-match fallback'};
     }
 
-    const hiSel=robustSelect(pairs.filter(x=>x.row.hiC!=null), x=>x.row.hiC, 3.3);
-    const loSel=robustSelect(pairs.filter(x=>x.row.loC!=null), x=>x.row.loC, 3.3);
+    const modelPairs=pairs.filter(x=>x.source.id!=='nws');
+    const hiSel=robustSelect(modelPairs.filter(x=>x.row.hiC!=null),x=>x.row.hiC,lead<=4?3.3:4.0);
+    const loSel=robustSelect(modelPairs.filter(x=>x.row.loC!=null),x=>x.row.loC,lead<=4?3.3:4.0);
     const badIds=new Set([...hiSel.omitted,...loSel.omitted].map(x=>x.source.id));
-    let keptPairs=pairs.filter(x=>!badIds.has(x.source.id));
-    if(keptPairs.length<Math.max(3,Math.ceil(pairs.length*0.67))){
-      keptPairs=robustSelect(pairs,x=>avg([x.row.hiC,x.row.loC]),3.3).kept;
+    let keptPairs=modelPairs.filter(x=>!badIds.has(x.source.id));
+    if(keptPairs.length<Math.max(2,Math.ceil(modelPairs.length*.6))){
+      keptPairs=robustSelect(modelPairs,x=>avg([x.row.hiC,x.row.loC]),lead<=4?3.3:4.0).kept;
     }
-    const rows = keptPairs.map(x=>x.row);
-    const precip=robustAvg(rows.map(r=>r.precip),35) ?? detail?.precip ?? null;
+
+    const nwsPair=pairs.find(x=>x.source.id==='nws')||null;
+    const nbm=state.dailyGuidance?.nbm?.daily?.get(date)||null;
+    const anchors=[];
+    if(nwsPair) anchors.push({id:'nws',row:nwsPair.row,weight:1.15});
+    if(nbm) anchors.push({id:'nbm',row:nbm,weight:1.45});
+    else if(detail && (detail.hiC!=null || detail.loC!=null)) anchors.push({id:'bestmatch',row:detail,weight:1.0});
+    const ensembles=(state.dailyGuidance?.ensembles||[])
+      .map(e=>({id:e.id,name:e.name,weight:e.weight,row:e.daily?.get(date)})).filter(x=>x.row);
+
+    const blendMetric=(key)=>{
+      const det=keptPairs.filter(x=>typeof x.row[key]==='number'&&isFinite(x.row[key]));
+      const anc=anchors.filter(x=>typeof x.row[key]==='number'&&isFinite(x.row[key]));
+      const ens=ensembles.filter(x=>typeof x.row[key]==='number'&&isFinite(x.row[key]));
+      const detCenter=weightedMedian(det,x=>x.row[key],x=>deterministicWeight(x.source.id,lead));
+      const anchorCenter=weightedMedian(anc,x=>x.row[key],x=>x.weight);
+      const ensembleCenter=weightedMedian(ens,x=>x.row[key],x=>x.weight);
+      let parts;
+      if(lead<=4) parts=[{value:detCenter,weight:.48},{value:anchorCenter,weight:.38},{value:ensembleCenter,weight:.14}];
+      else if(lead<=10) parts=[{value:ensembleCenter,weight:.46},{value:detCenter,weight:.30},{value:anchorCenter,weight:.24}];
+      else parts=[{value:ensembleCenter,weight:.76},{value:detCenter,weight:.24},{value:anchorCenter,weight:.18}];
+      return {value:weightedMeanParts(parts),det,anc,ens};
+    };
+
+    const hi=blendMetric('hiC'), lo=blendMetric('loC');
+    const allHi=[...hi.det.map(x=>x.row.hiC),...hi.anc.map(x=>x.row.hiC),...hi.ens.map(x=>x.row.hiC)];
+    const allLo=[...lo.det.map(x=>x.row.loC),...lo.anc.map(x=>x.row.loC),...lo.ens.map(x=>x.row.loC)];
+    const spreadC=Math.max(rangeOf(allHi),rangeOf(allLo));
+    const ensembleSpreadC=median(ensembles.map(x=>x.row.spreadC).filter(x=>typeof x==='number'&&isFinite(x)));
+    const confidence=dailyConfidence(lead,spreadC,ensembleSpreadC,ensembles.length);
+    const rowsForWeather=[...keptPairs.map(x=>x.row),...anchors.map(x=>x.row)];
+    const precip=robustAvg(rowsForWeather.map(r=>r.precip),35) ?? detail?.precip ?? null;
+    const usedIds=new Set([...keptPairs.map(x=>x.source.id),...anchors.map(x=>x.id),...ensembles.map(x=>x.id)]);
+    const blendMode=lead<=4?'local weighted blend':lead<=10?'ensemble-weighted blend':'ensemble-led blend';
+
     return {
-      date,
-      hiC:avg(rows.map(r=>r.hiC)) ?? detail?.hiC ?? null,
-      loC:avg(rows.map(r=>r.loC)) ?? detail?.loC ?? null,
-      precip,
-      code:representativeDailyCode(date, rows) ?? detail?.code ?? null,
-      count:rows.length,
-      totalCount:pairs.length,
-      omittedCount:pairs.length-keptPairs.length,
-      fallback:false,
-      extended:false,
-      sunrise:(rows.find(r=>r.sunrise)?.sunrise ?? detail?.sunrise ?? null),
-      sunset:(rows.find(r=>r.sunset)?.sunset ?? detail?.sunset ?? null)
+      date,hiC:hi.value??detail?.hiC??null,loC:lo.value??detail?.loC??null,precip,
+      code:representativeDailyCode(date,rowsForWeather)??detail?.code??null,
+      count:usedIds.size,totalCount:pairs.length+ensembles.length+(nbm?1:0),omittedCount:badIds.size,
+      fallback:false,extended:false,sunrise:(rowsForWeather.find(r=>r.sunrise)?.sunrise??detail?.sunrise??null),
+      sunset:(rowsForWeather.find(r=>r.sunset)?.sunset??detail?.sunset??null),
+      confidence,spreadC,ensembleSpreadC,ensembleCount:ensembles.length,leadDay:lead,blendMode,anchorCount:anchors.length
     };
   }).filter(d=>d && (d.hiC!=null||d.loC!=null));
 }
@@ -1528,7 +1641,7 @@ function renderDaily(daily){
       const sig=d.extended ? (d.tempSignal==='warmer than normal'?'warmer':d.tempSignal==='cooler than normal'?'cooler':d.precipSignal==='wetter than normal'?'wetter':d.precipSignal==='drier than normal'?'drier':'prediction') : '';
       return `<button class="daycell${d.date===todayStr?' today':''}${d.extended?' extended':''}" data-date="${d.date}" aria-label="Open ${d.extended?'extended prediction':'forecast'} details for ${esc(dt.toDateString())}">
         <span class="daynum">${dt.getDate()}</span>
-        ${d.extended?'<span class="predtag">PRED</span>':''}
+        ${d.extended?'<span class="predtag">PRED</span>':(d.confidence==='low'?'<span class="conftag">LOW CONF</span>':'')}
         ${iconFor(d.code,36,false)}
         <span class="dayhi">${T(d.hiC)}°</span>
         <span class="daylo">${T(d.loC)}°</span>
@@ -1538,13 +1651,13 @@ function renderDaily(daily){
     const dayCountLabel = `${daily.length} day${daily.length===1?'':'s'}`;
     return `<section class="monthblock${gi?' nextmonth':''}">
       <div class="dailyhead"><div><h2>${esc(monthFmt.format(first))}</h2>${gi===0?`<p>${dayCountLabel} outlook · tap a day for details</p>`:''}</div>${gi===0?`<span>${dayCountLabel}</span>`:''}</div>
-      ${gi===0&&extendedCount?`<div class="extendedlegend"><b>${normalCount} days forecast</b><span>then ${extendedCount} days of clearly marked long-range prediction. Those later cells are ECMWF EC46 ensemble guidance — coarse, low confidence, and worth cross-checking with NWS/other sources as the date gets closer.</span></div>`:''}
+      ${gi===0?`<div class="extendedlegend"><b>${normalCount} days forecast</b><span>Days 1–5 favor local/NWS-NBM guidance. Days 6–10 lean harder on ensemble means. Days 11–${normalCount} are ensemble-led; <strong>LOW CONF</strong> appears when the guidance spread gets wide.${extendedCount?` Then ${extendedCount} clearly marked PRED days use coarse EC46 long-range guidance.`:''}</span></div>`:''}
       <div class="weekdayrow">${['S','M','T','W','T','F','S'].map(x=>`<span>${x}</span>`).join('')}</div>
       <div class="daygrid">${[...blanks,...cells].join('')}</div>
     </section>`;
   }).join('');
   $('#view-daily').innerHTML = `${blockHtml}
-    <p class="blendnote">Days 1–${normalCount} use the regular outlier-resistant Lemons squeeze wherever models are available. <b>PRED</b> cells after that are long-range ECMWF EC46 ensemble guidance, not normal day-by-day forecasts. Exact values can move a lot; cross-check other sources before relying on them.</p>`;
+    <p class="blendnote">Daily temperatures now use lead-time weighting: local/NWS-NBM guidance first, then increasingly ensemble-led guidance as the forecast gets farther out. A whole cluster of deterministic models can no longer drag the squeeze by itself. <b>LOW CONF</b> means the surviving guidance is spread out; <b>PRED</b> remains separate long-range EC46 guidance.</p>`;
   $('#view-daily').querySelectorAll('[data-date]').forEach(b=>b.addEventListener('click', ()=>openDailyDetail(b.dataset.date)));
 }
 
@@ -1667,6 +1780,7 @@ function openDailyDetail(date){
       ? `<div class="celestial"><span class="sectioncap">Moon</span>${metricRow('Moon phase', moonPhaseAt(dt).name)}${metricRow('Illumination', `${Math.round(moonPhaseAt(dt).frac*100)}%`)}</div>`
       : `<div class="celestial"><span class="sectioncap">Sun</span>${metricRow('Rise', det.sunrise?skyTime(det.sunrise):'—')}${metricRow('Set', det.sunset?skyTime(det.sunset):'—')}${metricRow('Total daylight', durText(det.daylightSec))}</div>`;
     $('#dailyDetailContent').innerHTML=`<div class="detailhero dailyhero">${iconFor(code,76,night)}<div class="detailtemp">${T(temp)}°</div><div class="detailprecip">${pop!=null?`Precipitation: ${Math.round(pop)}%`:''}</div><div class="detailcond">${esc(codeLabel(code))}</div></div>
+      ${!night&&day.confidence?`<div class="forecastconfidence ${day.confidence}"><span>Forecast confidence</span><b>${confidenceLabel(day.confidence)}</b>${day.spreadC!=null?`<small>${state.unit==='F'?(day.spreadC*9/5).toFixed(1)+'°F':day.spreadC.toFixed(1)+'°C'} guidance spread · ${esc(day.blendMode||'weighted blend')}${day.ensembleCount!=null?` · ${day.ensembleCount} ensemble source${day.ensembleCount===1?'':'s'}`:''}</small>`:''}</div>`:''}
       <div class="detailrows">
         ${metricRow('Feels like', sum.feelsC!=null?`${T(sum.feelsC)}°${state.unit}`:'—')}
         ${metricRow('Humidity', sum.humidity!=null?`${Math.round(sum.humidity)}%`:'—')}
