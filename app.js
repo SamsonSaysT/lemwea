@@ -1923,8 +1923,15 @@ function moonPhaseAt(dateLike){
 }
 
 const HISTORY_FIRST_YEAR = 1940;
-const HISTORY_PAGE_YEARS = 10;
+const HISTORY_PAGE_YEARS = 20;
 const HISTORY_CHART_W = 1000;
+/* History requests are expensive because Open-Meteo returns every day in the
+   requested interval even though the UI only needs one calendar date. Keep the
+   complete 20-year chunks in memory and share in-flight requests so switching
+   Oct 1 -> Oct 2 -> Oct 3 reuses the exact same archive download instead of
+   starting a fresh 80+ year fetch for every date. */
+const historyChunkCache = new Map();
+const historyChunkInflight = new Map();
 let historyRenderSeq = 0;
 let historyChartModes = {temp:'bar', rain:'line'};
 let historyChartSelectionYears = {temp:null, rain:null};
@@ -1948,28 +1955,56 @@ function historyLoadingMarkup(){
     <p class="historyloadcopy">Gathering the full same-date record…</p>
   </div>`;
 }
-async function fetchHistoryPage(date,endYear){
-  const target=new Date(date+'T12:00:00'), month=target.getMonth(), day=target.getDate();
-  const b=historyPageBounds(endYear);
-  const key=`page:${state.loc.lat.toFixed(3)},${state.loc.lon.toFixed(3)}:${month+1}-${day}:${b.startYear}-${b.endYear}`;
-  if(state.historyCache[key]) return state.historyCache[key];
-  const start=`${b.startYear}-01-01`;
-  /* ERA5 trails real time by several days. Clamp a page that reaches the current
-     year so a late-December request never asks the archive for future dates. */
+function historyArchiveEndDate(endYear){
+  /* ERA5 trails real time by about five days. Leave a little safety margin so a
+     chunk that reaches the current year never asks the archive for future data. */
   const safeArchive=new Date(Date.now()-7*86400000).toISOString().slice(0,10);
-  const end=(`${b.endYear}-12-31`<safeArchive)?`${b.endYear}-12-31`:safeArchive;
-  try{
-    /* ERA5 is deliberately pinned here instead of Open-Meteo "best match" so a
-       1940-vs-2020 comparison uses one consistent reanalysis record. */
+  const nominal=`${endYear}-12-31`;
+  return nominal<safeArchive?nominal:safeArchive;
+}
+function historyChunkKey(b){
+  return `era5chunk:${state.loc.lat.toFixed(3)},${state.loc.lon.toFixed(3)}:${b.startYear}-${b.endYear}`;
+}
+async function fetchHistoryChunk(b){
+  const key=historyChunkKey(b);
+  if(historyChunkCache.has(key)) return historyChunkCache.get(key);
+  if(historyChunkInflight.has(key)) return historyChunkInflight.get(key);
+
+  const task=(async()=>{
+    const start=`${b.startYear}-01-01`, end=historyArchiveEndDate(b.endYear);
     const vars='weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,rain_sum,snowfall_sum';
     const url=`https://archive-api.open-meteo.com/v1/archive?latitude=${state.loc.lat}&longitude=${state.loc.lon}&start_date=${start}&end_date=${end}&daily=${vars}&timezone=auto&models=era5`;
-    const d=await fetchJSON(url,{},24000);
+    let lastError=null;
+    for(let attempt=0;attempt<3;attempt++){
+      try{
+        const d=await fetchJSON(url,{},32000);
+        if(!Array.isArray(d.daily?.time) || !d.daily.time.length) throw new Error('Empty history response');
+        historyChunkCache.set(key,d);
+        return d;
+      }catch(e){
+        lastError=e;
+        if(attempt<2) await new Promise(r=>setTimeout(r,350*(attempt+1)));
+      }
+    }
+    throw lastError||new Error('History request failed');
+  })();
+
+  historyChunkInflight.set(key,task);
+  try{ return await task; }
+  finally{ historyChunkInflight.delete(key); }
+}
+async function fetchHistoryPage(date,endYear){
+  const monthDay=date.slice(5);
+  const b=historyPageBounds(endYear);
+  const key=`page:${state.loc.lat.toFixed(3)},${state.loc.lon.toFixed(3)}:${monthDay}:${b.startYear}-${b.endYear}`;
+  if(state.historyCache[key]) return state.historyCache[key];
+  try{
+    const d=await fetchHistoryChunk(b);
     const rows=[];
     (d.daily?.time||[]).forEach((ds,i)=>{
-      const x=new Date(ds+'T12:00:00');
-      if(x.getMonth()!==month || x.getDate()!==day) return;
+      if(ds.slice(5)!==monthDay) return;
       rows.push({
-        date:ds,year:x.getFullYear(),
+        date:ds,year:+ds.slice(0,4),
         code:d.daily.weather_code?.[i]??null,
         hiC:d.daily.temperature_2m_max?.[i]??null,
         loC:d.daily.temperature_2m_min?.[i]??null,
