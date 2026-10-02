@@ -5,56 +5,129 @@
 
 /* ---------- tiny utils ---------- */
 const $ = s => document.querySelector(s);
-const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const avg = arr => { const v = arr.filter(x => typeof x === 'number' && isFinite(x)); return v.length ? v.reduce((a,b)=>a+b,0)/v.length : null; };
-const median = arr => {
-  const v = arr.filter(x => typeof x === 'number' && isFinite(x)).sort((a,b)=>a-b);
-  if(!v.length) return null;
-  const m = Math.floor(v.length/2);
-  return v.length%2 ? v[m] : (v[m-1]+v[m])/2;
+const ESC_HTML = {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
+const esc = s => String(s).replace(/[&<>"']/g, c => ESC_HTML[c]);
+
+/* Small bounded caches keep hot formatting/normalization work off the main
+   thread without letting a long-lived PWA slowly accumulate memory. */
+function boundedMapSet(map, key, value, limit){
+  if(map.has(key)) map.delete(key);
+  map.set(key, value);
+  while(map.size > limit) map.delete(map.keys().next().value);
+  return value;
+}
+const dateFormatterCache = new Map();
+function dateFormatter(key, locale, options){
+  const tz = options?.timeZone || '';
+  const cacheKey = `${key}|${locale}|${tz}`;
+  let fmt = dateFormatterCache.get(cacheKey);
+  if(!fmt){
+    fmt = new Intl.DateTimeFormat(locale, options);
+    boundedMapSet(dateFormatterCache, cacheKey, fmt, 32);
+  }
+  return fmt;
+}
+const localDateHourCache = new Map();
+const historyDateFmt = new Intl.DateTimeFormat('en-US',{month:'short',day:'numeric',year:'numeric',timeZone:'UTC'});
+
+const connectionInfo = navigator.connection || navigator.mozConnection || navigator.webkitConnection || null;
+const deviceHints = {
+  constrainedMemory: typeof navigator.deviceMemory==='number' && navigator.deviceMemory<=4,
+  constrainedCpu: typeof navigator.hardwareConcurrency==='number' && navigator.hardwareConcurrency<=4,
+  saveData: !!connectionInfo?.saveData,
+  slowNetwork: /(^|-)2g$/.test(connectionInfo?.effectiveType||'')
 };
+
+const blendMemo = {current:null, hourly:new Map(), daily:new Map(), dailyCodes:new Map()};
+function resetBlendMemo(){
+  blendMemo.current = null;
+  blendMemo.hourly.clear();
+  blendMemo.daily.clear();
+  blendMemo.dailyCodes.clear();
+}
+function avg(arr){
+  let sum=0, count=0;
+  for(const x of arr){
+    if(typeof x==='number' && isFinite(x)){ sum+=x; count++; }
+  }
+  return count ? sum/count : null;
+}
+function median(arr){
+  const v=[];
+  for(const x of arr) if(typeof x==='number' && isFinite(x)) v.push(x);
+  v.sort((a,b)=>a-b);
+  if(!v.length) return null;
+  const m=Math.floor(v.length/2);
+  return v.length%2 ? v[m] : (v[m-1]+v[m])/2;
+}
 /* Robust source squeeze: weather models occasionally throw a single absurd value.
    We use a median/MAD gate with a humane minimum band, then average only the core cluster. */
 function robustSelect(items, valueFn, minBandC=2.8){
-  const valid = items.filter(item=>{ const v=valueFn(item); return typeof v==='number' && isFinite(v); });
-  if(valid.length < 4) return {kept:valid, omitted:[], median:median(valid.map(valueFn)), bandC:Infinity};
-  const vals = valid.map(valueFn), med = median(vals);
-  const mad = median(vals.map(v=>Math.abs(v-med))) || 0;
-  const bandC = Math.max(minBandC, mad * 1.4826 * 2.8);
-  let kept = valid.filter(item=>Math.abs(valueFn(item)-med) <= bandC);
-  /* Never let a weirdly tight MAD throw away a large chunk of otherwise coherent models. */
-  const floor = Math.max(3, Math.ceil(valid.length*0.67));
-  if(kept.length < floor){
-    kept = [...valid].sort((a,b)=>Math.abs(valueFn(a)-med)-Math.abs(valueFn(b)-med)).slice(0,floor);
+  const valid=[];
+  for(const item of items){
+    const value=valueFn(item);
+    if(typeof value==='number' && isFinite(value)) valid.push({item,value});
   }
-  const keepSet = new Set(kept);
-  return {kept, omitted:valid.filter(x=>!keepSet.has(x)), median:med, bandC};
+  if(valid.length < 4){
+    const kept=valid.map(x=>x.item);
+    return {kept, omitted:[], median:median(valid.map(x=>x.value)), bandC:Infinity};
+  }
+  const vals=valid.map(x=>x.value), med=median(vals);
+  const deviations=valid.map(x=>Math.abs(x.value-med));
+  const mad=median(deviations)||0;
+  const bandC=Math.max(minBandC,mad*1.4826*2.8);
+  let keptDecorated=valid.filter(x=>Math.abs(x.value-med)<=bandC);
+  /* Never let a weirdly tight MAD throw away a large chunk of otherwise coherent models. */
+  const floor=Math.max(3,Math.ceil(valid.length*.67));
+  if(keptDecorated.length<floor){
+    keptDecorated=[...valid].sort((a,b)=>Math.abs(a.value-med)-Math.abs(b.value-med)).slice(0,floor);
+  }
+  const keepSet=new Set(keptDecorated.map(x=>x.item));
+  return {
+    kept:keptDecorated.map(x=>x.item),
+    omitted:valid.filter(x=>!keepSet.has(x.item)).map(x=>x.item),
+    median:med, bandC
+  };
 }
 function robustAvg(values, minBand=0){
-  const items=values.filter(v=>typeof v==='number'&&isFinite(v)).map(value=>({value}));
+  const items=[];
+  for(const value of values) if(typeof value==='number'&&isFinite(value)) items.push({value});
   if(!items.length) return null;
   const sel=robustSelect(items,x=>x.value,minBand);
-  return avg(sel.kept.map(x=>x.value));
+  let sum=0;
+  for(const x of sel.kept) sum+=x.value;
+  return sum/sel.kept.length;
 }
 function weightedMedian(items, valueFn, weightFn=()=>1){
-  const valid=items.map(item=>({item,value:valueFn(item),weight:Math.max(0,+weightFn(item)||0)}))
-    .filter(x=>typeof x.value==='number'&&isFinite(x.value)&&x.weight>0)
-    .sort((a,b)=>a.value-b.value);
+  const valid=[];
+  for(const item of items){
+    const value=valueFn(item), weight=Math.max(0,+weightFn(item)||0);
+    if(typeof value==='number'&&isFinite(value)&&weight>0) valid.push({item,value,weight});
+  }
+  valid.sort((a,b)=>a.value-b.value);
   if(!valid.length) return null;
-  const total=valid.reduce((n,x)=>n+x.weight,0), half=total/2;
+  let total=0;
+  for(const x of valid) total+=x.weight;
+  const half=total/2;
   let run=0;
   for(const x of valid){ run+=x.weight; if(run>=half) return x.value; }
-  return valid.at(-1).value;
+  return valid[valid.length-1].value;
 }
 function weightedMeanParts(parts){
-  const valid=parts.filter(x=>x && typeof x.value==='number'&&isFinite(x.value)&&x.weight>0);
-  if(!valid.length) return null;
-  const w=valid.reduce((n,x)=>n+x.weight,0);
-  return valid.reduce((n,x)=>n+x.value*x.weight,0)/w;
+  let weighted=0, weight=0;
+  for(const x of parts){
+    if(x && typeof x.value==='number'&&isFinite(x.value)&&x.weight>0){
+      weighted+=x.value*x.weight; weight+=x.weight;
+    }
+  }
+  return weight ? weighted/weight : null;
 }
 function rangeOf(values){
-  const v=values.filter(x=>typeof x==='number'&&isFinite(x));
-  return v.length>1 ? Math.max(...v)-Math.min(...v) : 0;
+  let min=Infinity,max=-Infinity,count=0;
+  for(const x of values){
+    if(typeof x==='number'&&isFinite(x)){ if(x<min)min=x;if(x>max)max=x;count++; }
+  }
+  return count>1 ? max-min : 0;
 }
 const store = {
   get(k){ try { return JSON.parse(localStorage.getItem(k)); } catch(e){ return null; } },
@@ -83,6 +156,10 @@ function parseSharedLocation(){
     admin: p.get('admin') || ''
   };
 }
+function isCurrentLocation(lat,lon){
+  return !!state?.loc && Math.abs(+state.loc.lat-(+lat))<1e-7 && Math.abs(+state.loc.lon-(+lon))<1e-7;
+}
+
 /* ---- REAL ground-station air quality (the accuracy fix) ----
    Every accurate AQI on the internet is EPA ground-monitor data via a keyed
    API. Deploy airnow-worker.js (in this repo) to a free Cloudflare Worker
@@ -99,6 +176,7 @@ const state = {
   savedPlaces: store.get('lemons.savedPlaces') || [],
   tz: undefined,
   sources: [],                            // normalized per-source data
+  okSources: [],                          // cached healthy-source subset for hot blend loops
   alerts: [],
   air: null,
   detail: null,                           // richer best-match metrics for click-through views
@@ -127,7 +205,11 @@ function codeLabel(c){
   if(c>=95) return 'Thunderstorm';
   return 'Mixed';
 }
+const weatherIconCache = new Map();
 function iconFor(c, size=24, night=false){
+  const cacheKey = `${c ?? 'null'}|${size}|${night?1:0}`;
+  const cached = weatherIconCache.get(cacheKey);
+  if(cached) return cached;
   /* Filled, two-tone Lemons weather glyphs: more legible than the old hairline icons,
      but still flat and native to the cream / zest / leaf palette. */
   const S = `class="wxicon" width="${size}" height="${size}" viewBox="0 0 48 48" aria-hidden="true"`;
@@ -148,7 +230,7 @@ function iconFor(c, size=24, night=false){
   else if(c>=95) body = `${cloud}<path class="wxbolt" d="M26 35h7l-5 6h5l-9 7 3-6h-5Z"/>`;
   else if(c>=61) body = `${cloud}${drops}`;
   else body = cloud;
-  return `<svg ${S}>${body}</svg>`;
+  return boundedMapSet(weatherIconCache, cacheKey, `<svg ${S}>${body}</svg>`, 96);
 }
 function codeSeverity(c){
   if(c==null) return 99;
@@ -185,19 +267,37 @@ function pickWeatherCode(codes, precipAvg=null){
   })[0][0];
 }
 const localPartFmtCache = new Map();
+function dateKeyAt(date, tz=state.tz||'UTC'){
+  const fmt = dateFormatter('date-key','en-US',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit'});
+  let year='', month='', day='';
+  for(const part of fmt.formatToParts(date)){
+    if(part.type==='year') year=part.value;
+    else if(part.type==='month') month=part.value;
+    else if(part.type==='day') day=part.value;
+  }
+  return `${year}-${month}-${day}`;
+}
 function localDateHour(epochH){
   const tz = state.tz || 'UTC';
+  const key = `${tz}|${epochH}`;
+  const cached = localDateHourCache.get(key);
+  if(cached) return cached;
   let fmt = localPartFmtCache.get(tz);
   if(!fmt){
     fmt = new Intl.DateTimeFormat('en-US', {timeZone:tz, year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', hourCycle:'h23'});
-    localPartFmtCache.set(tz, fmt);
+    boundedMapSet(localPartFmtCache, tz, fmt, 12);
   }
-  const parts = Object.fromEntries(fmt.formatToParts(new Date(epochH*3600000)).map(p=>[p.type,p.value]));
-  return {date:`${parts.year}-${parts.month}-${parts.day}`, hour:+parts.hour};
+  const values = {};
+  for(const part of fmt.formatToParts(new Date(epochH*3600000))){
+    if(part.type==='year'||part.type==='month'||part.type==='day'||part.type==='hour') values[part.type]=part.value;
+  }
+  return boundedMapSet(localDateHourCache, key, {date:`${values.year}-${values.month}-${values.day}`, hour:+values.hour}, 4096);
 }
 function representativeDailyCode(date, fallbackRows=[]){
+  if(blendMemo.dailyCodes.has(date)) return blendMemo.dailyCodes.get(date);
   const dayCodes = [], dayPrecip = [];
-  okSources().forEach(s=>{
+  const sources = okSources();
+  sources.forEach(s=>{
     if(!s.hourly) return;
     for(const [h,row] of s.hourly.entries()){
       const lp = localDateHour(h);
@@ -209,7 +309,11 @@ function representativeDailyCode(date, fallbackRows=[]){
       }
     }
   });
-  if(dayCodes.length) return pickWeatherCode(dayCodes, avg(dayPrecip));
+  if(dayCodes.length){
+    const code = pickWeatherCode(dayCodes, avg(dayPrecip));
+    boundedMapSet(blendMemo.dailyCodes, date, code, 64);
+    return code;
+  }
   return pickWeatherCode(fallbackRows.map(r=>r.code), avg(fallbackRows.map(r=>r.precip)));
 }
 
@@ -245,7 +349,7 @@ async function fetchOpenMeteo(lat, lon){
        single best_match call so the blend never loses Open-Meteo entirely */
     return [await fetchOpenMeteoSingle(lat, lon)];
   }
-  state.tz = d.timezone || state.tz;
+  if(isCurrentLocation(lat,lon)) state.tz = d.timezone || state.tz;
   const times = d.hourly.time.map(epochHour);
   const nowH = Math.floor(Date.now()/3600000);
   const nowIdx = Math.max(0, times.findIndex(t=>t>=nowH));
@@ -255,25 +359,32 @@ async function fetchOpenMeteo(lat, lon){
     const gd = suf => (d.daily[`${suf}_${m.key}`] || d.daily[suf] || []);
     const temps = g('temperature_2m');
     if(!temps.some(v=>v!=null)) return {id:m.key, name:m.name, ok:false};
+    const precipHourly = g('precipitation_probability');
+    const codeHourly = g('weather_code');
+    const feelsHourly = g('apparent_temperature');
+    const humidityHourly = g('relative_humidity_2m');
+    const windHourly = g('wind_speed_10m');
+    const hiDaily = gd('temperature_2m_max');
+    const loDaily = gd('temperature_2m_min');
+    const precipDaily = gd('precipitation_probability_max');
+    const codeDaily = gd('weather_code');
     const hourly = new Map();
     times.forEach((t,i)=>{
       if(temps[i]==null) return;
-      hourly.set(t, { tempC:temps[i], precip:(g('precipitation_probability')[i] ?? null), code:(g('weather_code')[i] ?? null) });
+      hourly.set(t, { tempC:temps[i], precip:(precipHourly[i] ?? null), code:(codeHourly[i] ?? null) });
     });
     const daily = new Map();
     (d.daily.time||[]).forEach((date,i)=>{
-      const hi = gd('temperature_2m_max')[i], lo = gd('temperature_2m_min')[i];
+      const hi = hiDaily[i], lo = loDaily[i];
       if(hi==null&&lo==null) return;
-      daily.set(date, {
-        hiC:hi, loC:lo, precip:(gd('precipitation_probability_max')[i] ?? null), code:(gd('weather_code')[i] ?? null)
-      });
+      daily.set(date, { hiC:hi, loC:lo, precip:(precipDaily[i] ?? null), code:(codeDaily[i] ?? null) });
     });
     const cur = {
-      tempC: temps[nowIdx], feelsC: g('apparent_temperature')[nowIdx] ?? null,
-      humidity: g('relative_humidity_2m')[nowIdx] ?? null,
-      windKmh: g('wind_speed_10m')[nowIdx] ?? null,
-      code: g('weather_code')[nowIdx] ?? null,
-      precip: g('precipitation_probability')[nowIdx] ?? null
+      tempC: temps[nowIdx], feelsC: feelsHourly[nowIdx] ?? null,
+      humidity: humidityHourly[nowIdx] ?? null,
+      windKmh: windHourly[nowIdx] ?? null,
+      code: codeHourly[nowIdx] ?? null,
+      precip: precipHourly[nowIdx] ?? null
     };
     return {id:m.key, name:m.name, ok:true, current:cur, hourly, daily};
   });
@@ -286,7 +397,7 @@ async function fetchOpenMeteoSingle(lat, lon){
       + `&hourly=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation_probability,weather_code,wind_speed_10m`
       + `&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code`
       + `&timezone=auto&forecast_days=16&wind_speed_unit=kmh`);
-    state.tz = d.timezone || state.tz;
+    if(isCurrentLocation(lat,lon)) state.tz = d.timezone || state.tz;
     const times = d.hourly.time.map(epochHour);
     const nowH = Math.floor(Date.now()/3600000);
     const nowIdx = Math.max(0, times.findIndex(t=>t>=nowH));
@@ -310,9 +421,11 @@ async function fetchOpenMeteoSingle(lat, lon){
 async function fetchSunTimes(lat, lon){
   try{
     const d = await fetchJSON(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&daily=sunrise,sunset&timezone=auto&forecast_days=1`);
-    state.tz = state.tz || d.timezone;
-    state.sun = { sunrise: d.daily?.sunrise?.[0] ?? null, sunset: d.daily?.sunset?.[0] ?? null };
-  }catch(e){ state.sun = null; }
+    if(isCurrentLocation(lat,lon)){
+      state.tz = state.tz || d.timezone;
+      state.sun = { sunrise: d.daily?.sunrise?.[0] ?? null, sunset: d.daily?.sunset?.[0] ?? null };
+    }
+  }catch(e){ if(isCurrentLocation(lat,lon)) state.sun = null; }
 }
 
 /* One best-match feed supplies the richer secondary metrics used only after a row is opened.
@@ -331,7 +444,7 @@ async function fetchForecastDetails(lat, lon){
   ].join(',');
   const d = await fetchJSON(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`
     + `&hourly=${hourlyFields}&daily=${dailyFields}&timezone=auto&forecast_days=16&wind_speed_unit=kmh`);
-  state.tz = d.timezone || state.tz;
+  if(isCurrentLocation(lat,lon)) state.tz = d.timezone || state.tz;
   const hourly = new Map();
   const hh = d.hourly || {};
   (hh.time||[]).forEach((iso,i)=> hourly.set(epochHour(iso), {
@@ -519,7 +632,7 @@ function extendedPrecipSignal(v){
   return 'near normal';
 }
 function extendedConfidence(date){
-  const today=new Date(new Intl.DateTimeFormat('en-CA',{timeZone:state.tz||undefined}).format(new Date())+'T12:00:00');
+  const today=new Date(dateKeyAt(new Date())+'T12:00:00');
   const d=Math.max(0,Math.round((new Date(date+'T12:00:00')-today)/86400000));
   return d<=23?'low':d<=34?'very low':'very low · pattern only';
 }
@@ -611,12 +724,11 @@ async function fetchMetNo(lat, lon){
     const ts = d.properties.timeseries || [];
     const hourly = new Map();
     const byDate = {};
-    const fmt = new Intl.DateTimeFormat('en-CA', {timeZone: state.tz || undefined, year:'numeric', month:'2-digit', day:'2-digit'});
     ts.forEach(row=>{
       const det = row.data?.instant?.details; if(!det) return;
       const code = metCode(row.data?.next_1_hours?.summary?.symbol_code || row.data?.next_6_hours?.summary?.symbol_code || '');
       hourly.set(epochHour(row.time), { tempC:det.air_temperature, precip:null, code });
-      const date = fmt.format(new Date(row.time));
+      const date = dateKeyAt(new Date(row.time));
       (byDate[date] = byDate[date] || {temps:[], codes:[]}).temps.push(det.air_temperature);
       if(code!=null) byDate[date].codes.push(code);
     });
@@ -859,9 +971,12 @@ async function fetchAirModel(lat, lon){
 /* =====================================================================
    BLEND — squeeze all sources into one consensus
    ===================================================================== */
+let weatherLoadSeq = 0;
 async function loadWeather(){
+  const seq = ++weatherLoadSeq;
   renderLoading();
   const {lat, lon} = state.loc;
+  const locKey = `${(+lat).toFixed(5)},${(+lon).toFixed(5)}`;
   const [weatherResults, alertResult, airResult, detailResult, extendedResult, guidanceResult] = await Promise.all([
     Promise.allSettled([fetchOpenMeteo(lat, lon), fetchNWS(lat, lon), fetchMetNo(lat, lon), fetchBrightSky(lat, lon)]),
     fetchNWSAlerts(lat, lon).then(v=>({ok:true, value:v})).catch(()=>({ok:false, value:[]})),
@@ -871,33 +986,37 @@ async function loadWeather(){
     fetchDailyGuidance(lat, lon).then(v=>({ok:true, value:v})).catch(()=>({ok:false, value:null})),
     fetchSunTimes(lat, lon)
   ]);
-  let sources = [];
+  if(seq!==weatherLoadSeq || !state.loc || `${(+state.loc.lat).toFixed(5)},${(+state.loc.lon).toFixed(5)}`!==locKey) return;
+  const sources = [];
   weatherResults.forEach(r=>{
     if(r.status!=='fulfilled' || r.value==null) return;
     Array.isArray(r.value) ? sources.push(...r.value) : sources.push(r.value);
   });
   state.sources = sources;
+  state.okSources = sources.filter(s=>s.ok);
   state.alerts = alertResult.value || [];
   state.air = airResult.value || {ok:false};
   state.detail = detailResult.value || null;
   state.extended = extendedResult.value || null;
   state.dailyGuidance = guidanceResult.value || null;
   state.updated = Date.now();
-  if(!sources.some(s=>s.ok)){
+  resetBlendMemo();
+  if(!state.okSources.length){
     $('#app').innerHTML = `<div class="msg"><h2>The lemon came up dry.</h2>
       Couldn't reach any weather source — check the connection and <button class="linkish" onclick="loadWeather()">try again</button>.</div>`;
     return;
   }
   renderApp();
 }
-const okSources = () => state.sources.filter(s=>s.ok);
+const okSources = () => state.okSources;
 
 function consensusCurrent(){
+  if(blendMemo.current) return blendMemo.current;
   const pairs = okSources().filter(x=>x.current && x.current.tempC!=null).map(source=>({source,row:source.current}));
   const sel = robustSelect(pairs, x=>x.row.tempC, 2.8);
   const s = sel.kept;
   const temps = s.map(x=>x.row.tempC);
-  return {
+  return blendMemo.current = {
     tempC: avg(temps),
     feelsC: robustAvg(s.map(x=>x.row.feelsC), 2.8),
     humidity: robustAvg(s.map(x=>x.row.humidity), 18),
@@ -913,9 +1032,12 @@ function consensusCurrent(){
 }
 function consensusHourly(hours=24){
   const start = Math.floor(Date.now()/3600000);
+  const memoKey = `${start}:${hours}`;
+  if(blendMemo.hourly.has(memoKey)) return blendMemo.hourly.get(memoKey);
   const out = [];
+  const sources = okSources();
   for(let h=start; h<start+hours; h++){
-    const pairs = okSources().map(source=>({source,row:source.hourly?.get(h)})).filter(x=>x.row && x.row.tempC!=null);
+    const pairs = sources.map(source=>({source,row:source.hourly?.get(h)})).filter(x=>x.row && x.row.tempC!=null);
     if(!pairs.length) continue;
     const sel = robustSelect(pairs, x=>x.row.tempC, 2.8);
     const rows = sel.kept.map(x=>x.row);
@@ -924,31 +1046,36 @@ function consensusHourly(hours=24){
       code:pickWeatherCode(rows.map(r=>r.code), precip), count:rows.length,
       totalCount:pairs.length, omittedCount:sel.omitted.length });
   }
+  boundedMapSet(blendMemo.hourly, memoKey, out, 12);
   return out;
 }
 function consensusDaily(days=DAILY_EXTENDED_DAYS){
+  const todayStr = dateKeyAt(new Date());
+  const memoKey = `${todayStr}:${days}`;
+  if(blendMemo.daily.has(memoKey)) return blendMemo.daily.get(memoKey);
+  const sources = okSources();
   const dates = new Set();
-  okSources().forEach(s=> s.daily && [...s.daily.keys()].forEach(d=>dates.add(d)));
+  sources.forEach(s=> s.daily && [...s.daily.keys()].forEach(d=>dates.add(d)));
   state.detail?.daily && [...state.detail.daily.keys()].forEach(d=>dates.add(d));
   state.extended?.daily && [...state.extended.daily.keys()].forEach(d=>dates.add(d));
   state.dailyGuidance?.nbm?.daily && [...state.dailyGuidance.nbm.daily.keys()].forEach(d=>dates.add(d));
   (state.dailyGuidance?.ensembles||[]).forEach(e=>e.daily && [...e.daily.keys()].forEach(d=>dates.add(d)));
-  const todayStr = new Intl.DateTimeFormat('en-CA',{timeZone:state.tz||undefined}).format(new Date());
   const todayNoon=new Date(todayStr+'T12:00:00');
 
   // Only normal deterministic/detail data defines the hard boundary between
   // normal forecast cells and EC46 PRED cells. Ensemble guidance improves the
   // normal blend but does not silently extend its label.
   const normalDates=[];
-  okSources().forEach(s=>s.daily && normalDates.push(...s.daily.keys()));
+  sources.forEach(s=>s.daily && normalDates.push(...s.daily.keys()));
   state.detail?.daily && normalDates.push(...state.detail.daily.keys());
-  const normalMax = normalDates.filter(d=>d>=todayStr).sort().at(-1) || null;
+  const sortedNormalDates = normalDates.filter(d=>d>=todayStr).sort();
+  const normalMax = sortedNormalDates.length ? sortedNormalDates[sortedNormalDates.length-1] : null;
 
-  return [...dates].filter(d=>d>=todayStr).sort().slice(0,days).map(date=>{
+  const result = [...dates].filter(d=>d>=todayStr).sort().slice(0,days).map(date=>{
     const lead=Math.max(0,Math.round((new Date(date+'T12:00:00')-todayNoon)/86400000));
     const detail = state.detail?.daily?.get(date) || null;
     const ext = state.extended?.daily?.get(date) || null;
-    const pairs = okSources().map(source=>({source,row:source.daily?.get(date)})).filter(x=>x.row && (x.row.hiC!=null || x.row.loC!=null));
+    const pairs = sources.map(source=>({source,row:source.daily?.get(date)})).filter(x=>x.row && (x.row.hiC!=null || x.row.loC!=null));
     const insideNormal = normalMax && date<=normalMax;
 
     if(!pairs.length && (!detail || (detail.hiC==null && detail.loC==null))){
@@ -1021,6 +1148,8 @@ function consensusDaily(days=DAILY_EXTENDED_DAYS){
       confidence,spreadC,ensembleSpreadC,ensembleCount:ensembles.length,leadDay:lead,blendMode,anchorCount:anchors.length
     };
   }).filter(d=>d && (d.hiC!=null||d.loC!=null));
+  boundedMapSet(blendMemo.daily, memoKey, result, 4);
+  return result;
 }
 
 /* =====================================================================
@@ -1101,11 +1230,20 @@ function renderSavedStrip(){
   if(!state.savedPlaces.length){ el.innerHTML = ''; return; }
   el.innerHTML = `<div class="savedstrip">${state.savedPlaces.map((p,i)=>`
     <span class="savedplace"><button data-place="${i}">${esc(p.name)}</button><button class="saveditsx" data-remove="${i}" aria-label="Remove ${esc(p.name)}">×</button></span>`).join('')}</div>`;
-  el.querySelectorAll('[data-place]').forEach(b=>b.addEventListener('click', ()=>setLocation(state.savedPlaces[+b.dataset.place])));
-  el.querySelectorAll('[data-remove]').forEach(b=>b.addEventListener('click', e=>{ e.stopPropagation(); removeSavedPlace(+b.dataset.remove); }));
+  el.onclick = e=>{
+    const remove=e.target.closest('[data-remove]');
+    if(remove && el.contains(remove)){ e.stopPropagation(); removeSavedPlace(+remove.dataset.remove); return; }
+    const place=e.target.closest('[data-place]');
+    if(place && el.contains(place)){
+      const saved=state.savedPlaces[+place.dataset.place];
+      if(saved) setLocation(saved);
+    }
+  };
 }
 function setLocError(msg){ const el = $('#locerror'); if(el) el.textContent = msg || ''; }
+let geoRequestSeq = 0;
 async function geolocate(){
+  const geoSeq = ++geoRequestSeq;
   const btn = $('#geobtn');
   if(!navigator.geolocation){ setLocError('This browser does not support location. Use search instead.'); return; }
   if(!window.isSecureContext){
@@ -1126,6 +1264,7 @@ async function geolocate(){
   if(btn) btn.textContent = 'Locating…';
   setLocError('');
   navigator.geolocation.getCurrentPosition(async pos=>{
+    if(geoSeq!==geoRequestSeq) return;
     const {latitude:lat, longitude:lon} = pos.coords;
     let name = 'My location', admin = '';
     /* Nominatim (OpenStreetMap) first — it resolves incorporated US suburbs
@@ -1144,8 +1283,10 @@ async function geolocate(){
         admin = g.principalSubdivision || g.countryName || '';
       }catch(_e){}
     }
+    if(geoSeq!==geoRequestSeq) return;
     setLocation({lat, lon, name, admin});
   }, err=>{
+    if(geoSeq!==geoRequestSeq) return;
     const insecure = !window.isSecureContext;
     const msg = insecure ? 'Location is blocked on local/content:// files. Use the GitHub Pages https:// link.'
       : err.code === 1 ? 'Location blocked. Allow Location in browser/site settings, or use search.'
@@ -1174,7 +1315,9 @@ function dedupePlaces(list){
   }
   return out.slice(0,40);
 }
+let citySearchSeq = 0;
 async function searchCity(q){
+  const seq = ++citySearchSeq;
   const ul = $('#cityresults'); if(!ul) return;
   if(q.length<2){ ul.innerHTML=''; return; }
   ul.innerHTML = `<li><button disabled>Searching the map…</button></li>`;
@@ -1188,19 +1331,36 @@ async function searchCity(q){
   }
   try{
     const settled = await Promise.allSettled(jobs);
+    if(seq!==citySearchSeq || !ul.isConnected) return;
     const places = dedupePlaces(settled.flatMap(x => x.status === 'fulfilled' ? x.value : []));
     window.__lemonsPlaces = places;
     ul.innerHTML = places.map((r,i)=>
       `<li><button data-i="${i}">${esc(r.name)} <span class="cc">${esc(r.admin)} · ${esc(r.source)}</span></button></li>`).join('')
       || `<li><button disabled>No luck — try town + state or a ZIP code</button></li>`;
-    ul.querySelectorAll('button[data-i]').forEach(b=>b.addEventListener('click', ()=>{
-      const r = window.__lemonsPlaces[+b.dataset.i];
-      setLocation({lat:r.lat, lon:r.lon, name:r.name, admin:r.admin});
-    }));
-  }catch(e){ ul.innerHTML = `<li><button disabled>Search failed — try again</button></li>`; }
+    ul.onclick = e=>{
+      const b=e.target.closest('button[data-i]');
+      if(!b || !ul.contains(b)) return;
+      const r = window.__lemonsPlaces?.[+b.dataset.i];
+      if(r) setLocation({lat:r.lat, lon:r.lon, name:r.name, admin:r.admin});
+    };
+  }catch(e){
+    if(seq===citySearchSeq && ul.isConnected) ul.innerHTML = `<li><button disabled>Search failed — try again</button></li>`;
+  }
 }
 function setLocation(loc){
+  geoRequestSeq++;
+  citySearchSeq++;
+  if(swipeCtl?.destroy){ swipeCtl.destroy(); swipeCtl = null; }
   state.loc = loc;
+  state.historyCache = {};
+  state.sources = [];
+  state.okSources = [];
+  state.detail = null;
+  state.extended = null;
+  state.dailyGuidance = null;
+  state.tz = undefined;
+  state.sun = null;
+  resetBlendMemo();
   if(state.radar){ state.radar.destroy(); state.radar = null; }
   loadWeather();
 }
@@ -1247,7 +1407,7 @@ function flash(msg){
 function skyTime(iso){
   if(!iso) return '—';
   const d = iso instanceof Date ? iso : new Date(iso);
-  return new Intl.DateTimeFormat('en-US', {hour:'numeric', minute:'2-digit', timeZone:state.tz||undefined})
+  return dateFormatter('time-minute','en-US',{hour:'numeric',minute:'2-digit',timeZone:state.tz||undefined})
     .format(d).replace(' AM','a').replace(' PM','p');
 }
 /* pure-math backup so the strip never goes missing (±2 min) */
@@ -1323,7 +1483,7 @@ function renderSkyStrip(today){
 
 function formatTime(iso){
   if(!iso) return '—';
-  return new Intl.DateTimeFormat('en-US', {hour:'numeric', minute:'2-digit', timeZone:state.tz||undefined}).format(new Date(iso));
+  return dateFormatter('time-minute','en-US',{hour:'numeric',minute:'2-digit',timeZone:state.tz||undefined}).format(new Date(iso));
 }
 function lemonFruit(size=22, label=''){
   return `<svg viewBox="0 0 24 24" width="${size}" height="${size}" role="img" aria-label="${esc(label)}">
@@ -1433,7 +1593,7 @@ function lemonsSays(cur, today){
   }
 
   if(rain && cur.code<51){
-    const when = new Intl.DateTimeFormat('en-US',{hour:'numeric', timeZone:state.tz||undefined}).format(new Date(rain.epochH*3600000));
+    const when = dateFormatter('hour-only','en-US',{hour:'numeric',timeZone:state.tz||undefined}).format(new Date(rain.epochH*3600000));
     lines.push(`Dry for now, but rain shows up around ${when} — plan the errands accordingly.`);
   }else if(!rain && cur.code<51){
     lines.push(pickLine([
@@ -1513,7 +1673,12 @@ function renderApp(){
       </div>
     </div>`;
 
-  $('#changeloc').addEventListener('click', ()=>{ state.loc = null; state.tab = 'current'; renderLocationScreen(); });
+  $('#changeloc').addEventListener('click', ()=>{
+    geoRequestSeq++; citySearchSeq++; weatherLoadSeq++;
+    if(state.radar){ state.radar.destroy(); state.radar = null; }
+    if(swipeCtl?.destroy){ swipeCtl.destroy(); swipeCtl = null; }
+    state.loc = null; state.tab = 'current'; renderLocationScreen();
+  });
   $('#saveplace').addEventListener('click', saveCurrentPlace);
   $('#openplaces').addEventListener('click', ()=>togglePlacesPanel());
   $('#shareloc').addEventListener('click', shareCurrentLocation);
@@ -1532,10 +1697,9 @@ function renderApp(){
 function todayHiLo(today){
   let hi = today?.hiC ?? null, lo = today?.loC ?? null;
   if(hi==null || lo==null){
-    const todayStr = new Intl.DateTimeFormat('en-CA',{timeZone:state.tz||undefined}).format(new Date());
-    const dFmt = new Intl.DateTimeFormat('en-CA',{timeZone:state.tz||undefined});
+    const todayStr = dateKeyAt(new Date());
     const temps = consensusHourly(24)
-      .filter(h => dFmt.format(new Date(h.epochH*3600000)) === todayStr)
+      .filter(h => localDateHour(h.epochH).date === todayStr)
       .map(h => h.tempC).filter(t => t!=null);
     const cur = consensusCurrent().tempC;
     if(cur!=null) temps.push(cur);
@@ -1587,11 +1751,12 @@ function isNightHour(h){ const d=hourRowDetail(h); if(d?.isDay!=null) return !d.
 
 function renderHourly(){
   const hours = consensusHourly(state.hourlyHours);
-  const timeFmt = new Intl.DateTimeFormat('en-US', {hour:'numeric', timeZone: state.tz || undefined});
-  const dayFmt = new Intl.DateTimeFormat('en-US', {weekday:'long', month:'short', day:'numeric', timeZone: state.tz || undefined});
+  const timeFmt = dateFormatter('hour-only','en-US',{hour:'numeric',timeZone:state.tz||undefined});
+  const dayFmt = dateFormatter('hour-day','en-US',{weekday:'long',month:'short',day:'numeric',timeZone:state.tz||undefined});
   const counts = hours.map(h=>h.count);
   let lastDate = '';
-  $('#view-hourly').innerHTML = `
+  const root = $('#view-hourly');
+  root.innerHTML = `
     <div class="hourlyhead">
       <div><h2>Hourly forecast</h2><p>Tap an hour for the full squeeze.</p></div>
       <div class="hrange" role="group" aria-label="Hourly forecast range">
@@ -1615,22 +1780,29 @@ function renderHourly(){
       }).join('')}
     </div>
     <p class="blendnote">Headline temperatures average ${counts.length?Math.min(...counts):0}–${counts.length?Math.max(...counts):0} in-family models per hour. A rogue source is dropped automatically before the squeeze.</p>`;
-  $('#view-hourly').querySelectorAll('[data-hours]').forEach(b=>b.addEventListener('click', ()=>{
-    state.hourlyHours = +b.dataset.hours; store.set('lemons.hourlyHours', state.hourlyHours); renderHourly();
-  }));
-  $('#view-hourly').querySelectorAll('[data-hour]').forEach(b=>b.addEventListener('click', ()=>openHourlyDetail(+b.dataset.hour)));
+  root.onclick = e=>{
+    const hoursBtn=e.target.closest('[data-hours]');
+    if(hoursBtn && root.contains(hoursBtn)){
+      state.hourlyHours = +hoursBtn.dataset.hours;
+      store.set('lemons.hourlyHours', state.hourlyHours);
+      renderHourly();
+      return;
+    }
+    const hourBtn=e.target.closest('[data-hour]');
+    if(hourBtn && root.contains(hourBtn)) openHourlyDetail(+hourBtn.dataset.hour);
+  };
 }
 
 function renderDaily(daily){
   if(!daily.length){ $('#view-daily').innerHTML = `<div class="msg">No daily data came back.</div>`; return; }
-  const monthFmt = new Intl.DateTimeFormat('en-US', {month:'long'});
-  const todayStr = new Intl.DateTimeFormat('en-CA',{timeZone:state.tz||undefined}).format(new Date());
+  const monthFmt = dateFormatter('month-name','en-US',{month:'long'});
+  const todayStr = dateKeyAt(new Date());
   const normalCount=daily.filter(d=>!d.extended).length, extendedCount=daily.filter(d=>d.extended).length;
-  const groups=[];
+  const groups=[], groupByKey=new Map();
   daily.forEach(d=>{
     const key=d.date.slice(0,7);
-    let g=groups.find(x=>x.key===key);
-    if(!g){ g={key,days:[]}; groups.push(g); }
+    let g=groupByKey.get(key);
+    if(!g){ g={key,days:[]}; groupByKey.set(key,g); groups.push(g); }
     g.days.push(d);
   });
   const blockHtml=groups.map((g,gi)=>{
@@ -1656,9 +1828,13 @@ function renderDaily(daily){
       <div class="daygrid">${[...blanks,...cells].join('')}</div>
     </section>`;
   }).join('');
-  $('#view-daily').innerHTML = `${blockHtml}
+  const root=$('#view-daily');
+  root.innerHTML = `${blockHtml}
     <p class="blendnote">Daily temperatures now use lead-time weighting: local/NWS-NBM guidance first, then increasingly ensemble-led guidance as the forecast gets farther out. A whole cluster of deterministic models can no longer drag the squeeze by itself. <b>LOW CONF</b> means the surviving guidance is spread out; <b>PRED</b> remains separate long-range EC46 guidance.</p>`;
-  $('#view-daily').querySelectorAll('[data-date]').forEach(b=>b.addEventListener('click', ()=>openDailyDetail(b.dataset.date)));
+  root.onclick = e=>{
+    const b=e.target.closest('[data-date]');
+    if(b && root.contains(b)) openDailyDetail(b.dataset.date);
+  };
 }
 
 function metricRow(label, value, cls=''){
@@ -1678,12 +1854,12 @@ function closeForecastDetail(){ const el=$('#forecastDetail'); if(el){ try{el._d
 function forecastDetailEsc(e){ if(e.key==='Escape') closeForecastDetail(); }
 
 function openHourlyDetail(epochH){
-  const h = consensusHourly(Math.max(1,epochH-Math.floor(Date.now()/3600000)+1)).find(x=>x.epochH===epochH);
+  const h = consensusHourly(state.hourlyHours).find(x=>x.epochH===epochH);
   if(!h) return;
   const d=state.detail?.hourly?.get(epochH)||{};
   const dt=new Date(epochH*3600000);
-  const title=new Intl.DateTimeFormat('en-US',{hour:'numeric',weekday:'long',timeZone:state.tz||undefined}).format(dt);
-  const subtitle=new Intl.DateTimeFormat('en-US',{month:'long',day:'numeric',timeZone:state.tz||undefined}).format(dt);
+  const title=dateFormatter('detail-hour-title','en-US',{hour:'numeric',weekday:'long',timeZone:state.tz||undefined}).format(dt);
+  const subtitle=dateFormatter('detail-hour-sub','en-US',{month:'long',day:'numeric',timeZone:state.tz||undefined}).format(dt);
   const precip=h.precip ?? d.precip;
   const airHour=(state.air?.hourly||[]).find(x=>x.epochH===epochH);
   const body=`<div class="detailhero">
@@ -1709,7 +1885,12 @@ function openHourlyDetail(epochH){
 
 function dayHourlySlice(date, night=false){
   const out=[];
-  state.detail?.hourly?.forEach((r,h)=>{ if(localDateForHour(h)!==date) return; const day=r.isDay!=null?!!r.isDay:(localDateHour(h).hour>=7&&localDateHour(h).hour<20); if(night?!day:day) out.push(r); });
+  state.detail?.hourly?.forEach((r,h)=>{
+    const local=localDateHour(h);
+    if(local.date!==date) return;
+    const day=r.isDay!=null?!!r.isDay:(local.hour>=7&&local.hour<20);
+    if(night?!day:day) out.push(r);
+  });
   return out;
 }
 function summarizePeriod(date, night=false){
@@ -1871,7 +2052,7 @@ function extendedOutlookMarkup(day,date){
 
 function openExtendedDailyDetail(day){
   const date=day.date,dt=new Date(date+'T12:00:00');
-  const subtitle=new Intl.DateTimeFormat('en-US',{weekday:'short',month:'short',day:'numeric'}).format(dt);
+  const subtitle=dateFormatter('detail-date','en-US',{weekday:'short',month:'short',day:'numeric'}).format(dt);
   detailModalShell(state.loc.name,subtitle,`<div class="detailtabs extendedtabs" role="tablist"><button data-dtab="outlook" aria-selected="true">Outlook</button><button data-dtab="history" aria-selected="false">History</button></div><div class="detailswipestage"><div class="detailswipetrack"><section class="detailswipepanel" data-dpanel="outlook"></section><section class="detailswipepanel" data-dpanel="history"></section></div></div>`);
   initDetailTabSwipe(['outlook','history'],(tab,panel)=>{
     if(tab==='history') return renderHistoryTab(date,day,panel);
@@ -1906,7 +2087,7 @@ function regularDailyDetailMarkup(date,day,night){
 function openDailyDetail(date){
   const day=consensusDaily(DAILY_EXTENDED_DAYS).find(x=>x.date===date);if(!day)return;
   if(day.extended){openExtendedDailyDetail(day);return;}
-  const dt=new Date(date+'T12:00:00'),title=state.loc.name,subtitle=new Intl.DateTimeFormat('en-US',{weekday:'short',month:'short',day:'numeric'}).format(dt);
+  const dt=new Date(date+'T12:00:00'),title=state.loc.name,subtitle=dateFormatter('detail-date','en-US',{weekday:'short',month:'short',day:'numeric'}).format(dt);
   detailModalShell(title,subtitle,`<div class="detailtabs" role="tablist"><button data-dtab="day" aria-selected="true">Day</button><button data-dtab="night" aria-selected="false">Night</button><button data-dtab="history" aria-selected="false">History</button></div><div class="detailswipestage"><div class="detailswipetrack"><section class="detailswipepanel" data-dpanel="day"></section><section class="detailswipepanel" data-dpanel="night"></section><section class="detailswipepanel" data-dpanel="history"></section></div></div>`);
   initDetailTabSwipe(['day','night','history'],(tab,panel)=>{
     if(tab==='history') return renderHistoryTab(date,day,panel);
@@ -1932,6 +2113,7 @@ const HISTORY_CHART_W = 1000;
    starting a fresh 80+ year fetch for every date. */
 const historyChunkCache = new Map();
 const historyChunkInflight = new Map();
+const HISTORY_CHUNK_CACHE_LIMIT = deviceHints.constrainedMemory ? 6 : 10; // one to two complete locations
 let historyRenderSeq = 0;
 let historyChartModes = {temp:'bar', rain:'line'};
 let historyChartSelectionYears = {temp:null, rain:null};
@@ -1965,9 +2147,32 @@ function historyArchiveEndDate(endYear){
 function historyChunkKey(b){
   return `era5chunk:${state.loc.lat.toFixed(3)},${state.loc.lon.toFixed(3)}:${b.startYear}-${b.endYear}`;
 }
+function getHistoryChunkCached(key){
+  if(!historyChunkCache.has(key)) return null;
+  const value=historyChunkCache.get(key);
+  historyChunkCache.delete(key);
+  historyChunkCache.set(key,value);
+  return value;
+}
+function setHistoryChunkCached(key,value){
+  boundedMapSet(historyChunkCache,key,value,HISTORY_CHUNK_CACHE_LIMIT);
+}
+function historyChunkIndex(d){
+  if(d.__lemonsMonthDayIndex) return d.__lemonsMonthDayIndex;
+  const index=new Map();
+  (d.daily?.time||[]).forEach((ds,i)=>{
+    const md=ds.slice(5);
+    let arr=index.get(md);
+    if(!arr){ arr=[]; index.set(md,arr); }
+    arr.push(i);
+  });
+  Object.defineProperty(d,'__lemonsMonthDayIndex',{value:index,enumerable:false,configurable:true});
+  return index;
+}
 async function fetchHistoryChunk(b){
   const key=historyChunkKey(b);
-  if(historyChunkCache.has(key)) return historyChunkCache.get(key);
+  const cached=getHistoryChunkCached(key);
+  if(cached) return cached;
   if(historyChunkInflight.has(key)) return historyChunkInflight.get(key);
 
   const task=(async()=>{
@@ -1979,7 +2184,8 @@ async function fetchHistoryChunk(b){
       try{
         const d=await fetchJSON(url,{},32000);
         if(!Array.isArray(d.daily?.time) || !d.daily.time.length) throw new Error('Empty history response');
-        historyChunkCache.set(key,d);
+        historyChunkIndex(d);
+        setHistoryChunkCached(key,d);
         return d;
       }catch(e){
         lastError=e;
@@ -1996,13 +2202,13 @@ async function fetchHistoryChunk(b){
 async function fetchHistoryPage(date,endYear){
   const monthDay=date.slice(5);
   const b=historyPageBounds(endYear);
-  const key=`page:${state.loc.lat.toFixed(3)},${state.loc.lon.toFixed(3)}:${monthDay}:${b.startYear}-${b.endYear}`;
-  if(state.historyCache[key]) return state.historyCache[key];
   try{
     const d=await fetchHistoryChunk(b);
     const rows=[];
-    (d.daily?.time||[]).forEach((ds,i)=>{
-      if(ds.slice(5)!==monthDay) return;
+    const times=d.daily?.time||[];
+    const indices=historyChunkIndex(d).get(monthDay)||[];
+    for(const i of indices){
+      const ds=times[i];
       rows.push({
         date:ds,year:+ds.slice(0,4),
         code:d.daily.weather_code?.[i]??null,
@@ -2012,22 +2218,22 @@ async function fetchHistoryPage(date,endYear){
         rainMm:d.daily.rain_sum?.[i]??null,
         snowCm:d.daily.snowfall_sum?.[i]??null
       });
-    });
+    }
     const out={...b,rows,count:rows.length,avgHiC:avg(rows.map(r=>r.hiC)),avgLoC:avg(rows.map(r=>r.loC))};
-    state.historyCache[key]=out;
     return out;
   }catch(e){ return null; }
 }
 async function fetchAllHistory(date){
-  const target=new Date(date+'T12:00:00'), month=target.getMonth(), day=target.getDate();
+  const monthDay=date.slice(5);
   const initialEnd=historyInitialEndYear(date);
-  const key=`all:${state.loc.lat.toFixed(3)},${state.loc.lon.toFixed(3)}:${month+1}-${day}:${initialEnd}`;
+  const key=`all:${state.loc.lat.toFixed(3)},${state.loc.lon.toFixed(3)}:${monthDay}:${initialEnd}`;
   if(state.historyCache[key]) return state.historyCache[key];
   const ends=[];
   for(let end=initialEnd; end>=HISTORY_FIRST_YEAR; end-=HISTORY_PAGE_YEARS) ends.push(end);
   const pages=new Array(ends.length);
   let cursor=0;
-  const workers=Array.from({length:Math.min(3,ends.length)},async()=>{
+  const historyConcurrency = deviceHints.saveData || deviceHints.slowNetwork ? 1 : (deviceHints.constrainedMemory ? 2 : 3);
+  const workers=Array.from({length:Math.min(historyConcurrency,ends.length)},async()=>{
     while(cursor<ends.length){
       const i=cursor++;
       pages[i]=await fetchHistoryPage(date,ends[i]);
@@ -2051,8 +2257,7 @@ async function fetchAllHistory(date){
   return out;
 }
 function historyDateLabel(ds){
-  const d=new Date(ds+'T12:00:00Z');
-  return new Intl.DateTimeFormat('en-US',{month:'short',day:'numeric',year:'numeric',timeZone:'UTC'}).format(d);
+  return historyDateFmt.format(new Date(ds+'T12:00:00Z'));
 }
 function historyNiceTicks(min,max,target=6){
   if(!isFinite(min)||!isFinite(max)) return [0,1];
@@ -2377,7 +2582,7 @@ function renderAir(){
     return;
   }
   const topPollen = (a.pollen || []).slice(0,4);
-  const timeFmt = new Intl.DateTimeFormat('en-US', {hour:'numeric', timeZone: state.tz || undefined});
+  const timeFmt = dateFormatter('hour-only','en-US',{hour:'numeric',timeZone:state.tz||undefined});
   const hourlyAir = (a.hourly||[]).filter((_,i)=>i%3===0).slice(0,8);
   $('#view-air').innerHTML = `
     <div class="airwrap">
@@ -2502,7 +2707,10 @@ function initSwipeNav(stage){
 
     if(state.tab==='radar'){
       initRadar();
+      state.radar?.setActive?.(true);
       setTimeout(()=>state.radar?.map?.invalidateSize(), duration+30);
+    }else{
+      state.radar?.setActive?.(false);
     }
   };
 
@@ -2617,7 +2825,8 @@ function switchTab(tab){
   if(swipeCtl){ swipeCtl.go(tab,true); return; }
   document.querySelectorAll('nav.tabs [data-tab]').forEach(b=>b.setAttribute('aria-selected', b.dataset.tab===tab));
   document.querySelectorAll('.panelview').forEach(p=>p.classList.toggle('active',p.id==='view-'+tab));
-  if(tab==='radar') initRadar();
+  if(tab==='radar'){ initRadar(); state.radar?.setActive?.(true); }
+  else state.radar?.setActive?.(false);
 }
 
 /* ---------- radar (Leaflet + RainViewer) ---------- */
@@ -2670,12 +2879,13 @@ function initRadar(){
 
   const radar = state.radar = {
     map, frames:[], layers:{}, layerMeta:{}, layerIndex:{}, basemaps, baseName, idx:0, displayedIdx:-1, desiredIdx:0,
-    playing:false, timer:null, frameRaf:null, swapTimer:null, moveTimer:null, locked:true, scrubbing:false,
+    playing:false, timer:null, frameRaf:null, swapTimer:null, moveTimer:null, locked:true, scrubbing:false, tabActive:true, resumePlayingOnTab:false,
     activeLayer:null, pendingLayer:null, pendingIdx:-1, swapSeq:0,
-    locationMarker, markerVisible, fsHandler:null, fitHandler:null, orientationHandler:null,
+    locationMarker, markerVisible, fsHandler:null, fitHandler:null, orientationHandler:null, visibilityHandler:null, resumePlaying:false,
     fitWidth:0, normalStageHeight:'', normalStageWidth:0, fallbackFullscreen:false, fsPlaceholder:null,
     fullscreenSession:false, fullscreenLockWasLocked:null, fullscreenStageHeight:'', fullscreenStageWidth:0,
-    hotIndices:new Set(), hotRadius:2, preloadGen:0, preloadQueue:[], preloadActive:0, preloadConcurrency:4, bgStarted:false,
+    hotIndices:new Set(), hotRadius:2, preloadGen:0, preloadQueue:[], preloadActive:0,
+    preloadConcurrency:(deviceHints.saveData||deviceHints.slowNetwork)?2:(deviceHints.constrainedMemory||deviceHints.constrainedCpu?3:4), bgStarted:false,
     destroy(){
       clearTimeout(this.timer); clearTimeout(this.swapTimer); clearTimeout(this.moveTimer);
       if(this.frameRaf) cancelAnimationFrame(this.frameRaf);
@@ -2686,10 +2896,17 @@ function initRadar(){
       }
       if(this.fitHandler) window.removeEventListener('resize', this.fitHandler);
       if(this.orientationHandler) window.removeEventListener('orientationchange', this.orientationHandler);
+      if(this.visibilityHandler) document.removeEventListener('visibilitychange', this.visibilityHandler);
       restoreFallbackFullscreen();
       this.map.remove();
     }
   };
+
+  const radarTimeFmt = dateFormatter('time-minute','en-US',{hour:'numeric',minute:'2-digit',timeZone:state.tz||undefined});
+  const radarScrub = $('#radarscrub');
+  const radarTimeEl = $('#radartime');
+  const radarPlay = $('#radarplay');
+  const radarPlayIcon = $('#playicon');
 
   /* LemonCoords-style gesture lock: locked by default so a swipe over the map
      belongs to section navigation. Unlocking hands every gesture back to Leaflet. */
@@ -2961,7 +3178,7 @@ function initRadar(){
     radar.startIdx = Math.max(0, extended.length + rvPast.length - 1);
     radar.desiredIdx = radar.startIdx;
 
-    const scrub = $('#radarscrub');
+    const scrub = radarScrub;
     const beginScrub = ()=>{
       if(!radar.scrubbing){
         radar.scrubbing = true;
@@ -2983,16 +3200,16 @@ function initRadar(){
     scrub.addEventListener('pointerup', endScrub);
     scrub.addEventListener('pointercancel', endScrub);
     scrub.addEventListener('change', endScrub);
-    $('#radarplay').addEventListener('click', ()=> radar.playing ? stopRadar() : playRadar());
+    radarPlay?.addEventListener('click', ()=> radar.playing ? stopRadar() : playRadar());
 
     if(!radar.frames.length){
-      $('#radartime').textContent = 'no data';
+      if(radarTimeEl) radarTimeEl.textContent = 'no data';
       scrub.max = 0;
       return;
     }
     scrub.max = radar.frames.length-1;
     showFrame(radar.startIdx);
-  }).catch(()=>{ $('#radartime').textContent = 'radar offline'; });
+  }).catch(()=>{ if(radarTimeEl) radarTimeEl.textContent = 'radar offline'; });
 
   /* rain outlook: Open-Meteo 15-minute nowcast — "rain around 4:15" under the map */
   fetchJSON(`https://api.open-meteo.com/v1/forecast?latitude=${state.loc.lat}&longitude=${state.loc.lon}&minutely_15=precipitation&forecast_minutely_15=24&timezone=auto`)
@@ -3009,7 +3226,7 @@ function initRadar(){
           firstRain = t; break;
         }
       }
-      const fmt = new Intl.DateTimeFormat('en-US', {hour:'numeric', minute:'2-digit', timeZone: state.tz || undefined});
+      const fmt = dateFormatter('time-minute','en-US',{hour:'numeric',minute:'2-digit',timeZone:state.tz||undefined});
       el.textContent = rainingNow ? 'Precipitation over the spot right now.'
         : firstRain ? `Next precipitation near here around ${fmt.format(new Date(firstRain))}.`
         : 'Nothing hitting this spot in the next 6 hours.';
@@ -3133,11 +3350,11 @@ function initRadar(){
     i = Math.max(0, Math.min(i, radar.frames.length-1));
     radar.idx = i;
     radar.desiredIdx = i;
-    $('#radarscrub').value = i;
+    if(radarScrub) radarScrub.value = i;
     const f = radar.frames[i];
     const t = new Date(f.time*1000);
     const isNowcast = f.time*1000 > Date.now();
-    $('#radartime').textContent = (isNowcast?'+':'') + t.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
+    if(radarTimeEl) radarTimeEl.textContent = (isNowcast?'+':'') + radarTimeFmt.format(t);
   }
 
   function setHotWindow(center){
@@ -3159,9 +3376,11 @@ function initRadar(){
       }
     }
 
-    for(const i of next){
-      if(i===radar.displayedIdx) continue;
-      ensureFrameReady(i, true);
+    if(radar.tabActive){
+      for(const i of next){
+        if(i===radar.displayedIdx) continue;
+        ensureFrameReady(i, true);
+      }
     }
   }
 
@@ -3172,7 +3391,7 @@ function initRadar(){
   }
 
   function startTimelinePreload(center){
-    if(!radar.frames.length) return;
+    if(!radar.frames.length || !radar.tabActive || document.hidden) return;
     const gen = ++radar.preloadGen;
     radar.bgStarted = true;
 
@@ -3260,7 +3479,7 @@ function initRadar(){
 
     /* Start the one-time full-timeline warm-up only after the first useful frame
        is actually on screen. */
-    if(!radar.bgStarted && !radar.scrubbing) startTimelinePreload(i);
+    if(radar.tabActive && !radar.bgStarted && !radar.scrubbing) startTimelinePreload(i);
   }
 
   function loadFrame(i){
@@ -3315,8 +3534,8 @@ function initRadar(){
   function playRadar(){
     if(!radar.frames.length) return;
     radar.playing = true;
-    $('#playicon').innerHTML = '<path d="M6 5h4v14H6zM14 5h4v14h-4z"/>';
-    $('#radarplay').setAttribute('aria-label','Pause radar animation');
+    if(radarPlayIcon) radarPlayIcon.innerHTML = '<path d="M6 5h4v14H6zM14 5h4v14h-4z"/>';
+    radarPlay?.setAttribute('aria-label','Pause radar animation');
     const tick = ()=>{
       if(!radar.playing) return;
       showFrame((radar.idx+1) % radar.frames.length);
@@ -3329,9 +3548,44 @@ function initRadar(){
     radar.playing = false;
     clearTimeout(radar.timer);
     radar.timer = null;
-    $('#playicon').innerHTML = '<path d="M7 4.5v15l13-7.5z"/>';
-    $('#radarplay').setAttribute('aria-label','Play radar animation');
+    if(radarPlayIcon) radarPlayIcon.innerHTML = '<path d="M7 4.5v15l13-7.5z"/>';
+    radarPlay?.setAttribute('aria-label','Play radar animation');
   }
+
+  radar.setActive = active=>{
+    radar.tabActive = !!active;
+    if(!radar.tabActive){
+      radar.resumePlayingOnTab = radar.playing;
+      if(radar.playing) stopRadar();
+      stopTimelinePreload();
+      return;
+    }
+    const center = radar.displayedIdx>=0 ? radar.displayedIdx : radar.desiredIdx;
+    if(center>=0){ setHotWindow(center); startTimelinePreload(center); }
+    if(radar.resumePlayingOnTab){ radar.resumePlayingOnTab=false; playRadar(); }
+  };
+
+  /* Background tabs should not burn battery/network animating and warming radar
+     frames. Resume exactly what the user was doing when the page becomes visible. */
+  radar.visibilityHandler = ()=>{
+    if(document.hidden){
+      radar.resumePlaying = radar.playing;
+      if(radar.playing) stopRadar();
+      stopTimelinePreload();
+      return;
+    }
+    if(state.tab!=='radar'){ radar.resumePlaying=false; return; }
+    const center = radar.displayedIdx>=0 ? radar.displayedIdx : radar.desiredIdx;
+    if(center>=0){
+      setHotWindow(center);
+      startTimelinePreload(center);
+    }
+    if(radar.resumePlaying){
+      radar.resumePlaying = false;
+      playRadar();
+    }
+  };
+  document.addEventListener('visibilitychange', radar.visibilityHandler, {passive:true});
 
   /* Panning/zooming gets network priority.  Pause animation/background warming,
      then rebuild the five-frame hot window and re-warm the timeline for the new
@@ -3450,7 +3704,7 @@ function moonFactLine(moon){
 function openMoonScreen(){
   closeMoonScreen();
   const moon = moonPhase();
-  const dFmt = new Intl.DateTimeFormat('en-US', {month:'short', day:'numeric'});
+  const dFmt = dateFormatter('month-day','en-US',{month:'short',day:'numeric'});
   const el = document.createElement('div');
   el.id = 'moonmodal'; el.className = 'moonmodal';
   el.setAttribute('role','dialog'); el.setAttribute('aria-label','Moon');
@@ -4195,6 +4449,8 @@ function closeSolitaire(){
   if(!SOL.open) return;
   SOL.open = false;
   clearInterval(SOL.tInt);
+  SOL.tInt = null;
+  document.removeEventListener('keydown', moonEsc);
   const el = $('#solmodal'); if(el) el.remove();
   document.body.style.overflow = '';
 }
@@ -4809,6 +5065,7 @@ function closeAscent(){
   window.removeEventListener('keyup', ASC.onKeyUp);
   window.removeEventListener('resize', ASC.onResize);
   window.removeEventListener('deviceorientation', ASC.onTilt);
+  document.removeEventListener('keydown', moonEsc);
   ASC.keys = {}; ASC.touchDir = 0; ASC.tiltOn = false; ASC.gamma = null;
   const el = $('#ascmodal'); if(el) el.remove();
   document.body.style.overflow = '';
@@ -5276,6 +5533,7 @@ function closeBmx(){
   window.removeEventListener('keydown', BMX.onKeyDown);
   window.removeEventListener('keyup', BMX.onKeyUp);
   window.removeEventListener('resize', BMX.onResize);
+  document.removeEventListener('keydown', moonEsc);
   BMX.keys = {};
   const el = $('#bmxmodal'); if(el) el.remove();
   document.body.style.overflow = '';

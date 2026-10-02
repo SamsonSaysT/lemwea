@@ -964,3 +964,11 @@ footer.site b{color:var(--ink);font-weight:600}
 .forecastconfidence>small{grid-column:1/-1;color:var(--muted);font-size:.68rem;line-height:1.4}
 .forecastconfidence.low>b{color:var(--rind-text)}
 @media(max-width:560px){.conftag{font-size:.35rem;right:2px;top:5px}}
+
+/* ---------- rendering performance ----------
+   Long forecast/history lists stay visually identical, but browsers that support
+   content-visibility can skip paint/layout work for rows far outside the viewport. */
+@supports (content-visibility:auto){
+  .hourrow{content-visibility:auto;contain-intrinsic-size:auto 76px}
+  .historyyearrow{content-visibility:auto;contain-intrinsic-size:auto 76px}
+}
