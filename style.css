@@ -296,9 +296,16 @@ nav.tabs button[aria-selected="true"]{color:var(--ink)}
 .detailrow span{font-size:.91rem;color:var(--ink)}
 .detailrow b{font-family:var(--display);font-weight:560;font-size:1rem;text-align:right;font-variant-numeric:tabular-nums}
 .detailnote{font-size:.72rem;color:var(--muted);line-height:1.45;text-align:center;padding:16px 8px 0;max-width:520px;margin:0 auto}
-.detailtabs{display:grid;grid-template-columns:repeat(3,1fr);margin-top:18px;border-bottom:1px solid var(--hairline)}
-.detailtabs button{padding:10px 4px 9px;color:var(--muted);font-size:.78rem;font-weight:750;border-bottom:2px solid transparent;margin-bottom:-1px}
-.detailtabs button[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--zest)}
+.detailtabs{--detail-count:3;--detail-pos:0;display:grid;grid-template-columns:repeat(3,1fr);margin-top:18px;border-bottom:1px solid var(--hairline);position:relative}
+.detailtabs::after{content:"";position:absolute;left:0;bottom:-1px;width:calc(100% / var(--detail-count));height:2px;background:var(--zest);transform:translate3d(calc(var(--detail-pos) * 100%),0,0);transform-origin:left center;transition:transform .24s cubic-bezier(.22,1,.36,1);will-change:transform;pointer-events:none}
+.detailtabs.swiping::after{transition:none}
+.detailtabs button{padding:10px 4px 9px;color:var(--muted);font-size:.78rem;font-weight:750;border-bottom:2px solid transparent;margin-bottom:-1px;position:relative;z-index:1}
+.detailtabs button[aria-selected="true"]{color:var(--ink)}
+.detailswipestage{position:relative;overflow:hidden;min-height:1px;touch-action:pan-y;transition:height .22s cubic-bezier(.22,1,.36,1)}
+.detailswipestage.dragging{user-select:none}
+.detailswipetrack{display:flex;width:100%;align-items:flex-start;will-change:transform;transform:translate3d(0,0,0)}
+.detailswipepanel{flex:0 0 100%;min-width:0;overflow:visible}
+.detailswipepanel[aria-hidden="true"]{visibility:visible}
 .dailyhero{padding-top:28px}
 .celestial{margin-top:26px;border-top:1px solid var(--ink);border-bottom:1px solid var(--hairline)}
 .celestial .detailrow:first-of-type{border-top:none}
@@ -926,7 +933,7 @@ footer.site b{color:var(--ink);font-weight:600}
 .daycell.extended .dayhi,.daycell.extended .daylo{opacity:.82}
 .predtag{position:absolute;top:6px;right:4px;font-size:.43rem;line-height:1;letter-spacing:.08em;font-weight:850;color:var(--rind-text);text-transform:uppercase}
 .daysignal{font-size:.5rem;line-height:1.05;color:var(--rind-text);font-weight:760;text-transform:uppercase;letter-spacing:.02em;max-width:95%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.extendedtabs{grid-template-columns:repeat(2,1fr)}
+.extendedtabs{--detail-count:2;grid-template-columns:repeat(2,1fr)}
 .extendedwarning{margin:18px 0 2px;padding:11px 0;border-top:1px solid var(--ink);border-bottom:1px solid var(--hairline)}
 .extendedwarning b{display:block;font-size:.73rem;text-transform:uppercase;letter-spacing:.07em;color:var(--rind-text)}
 .extendedwarning span{display:block;margin-top:4px;color:var(--muted);font-size:.78rem;line-height:1.45}

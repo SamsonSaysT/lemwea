@@ -1674,7 +1674,7 @@ function detailModalShell(title, subtitle, body){
   document.addEventListener('keydown', forecastDetailEsc);
   return el;
 }
-function closeForecastDetail(){ const el=$('#forecastDetail'); if(el) el.remove(); document.body.style.overflow=''; document.removeEventListener('keydown', forecastDetailEsc); }
+function closeForecastDetail(){ const el=$('#forecastDetail'); if(el){ try{el._detailSwipeCleanup?.();}catch(_e){} try{el._historySelectionCleanup?.();}catch(_e){} el.remove(); } document.body.style.overflow=''; document.removeEventListener('keydown', forecastDetailEsc); }
 function forecastDetailEsc(e){ if(e.key==='Escape') closeForecastDetail(); }
 
 function openHourlyDetail(epochH){
@@ -1733,69 +1733,185 @@ function summarizePeriod(date, night=false){
 }
 function safeMax(v){ return v===-Infinity?null:v; }
 
-function openExtendedDailyDetail(day){
-  const date=day.date, dt=new Date(date+'T12:00:00');
-  const subtitle=new Intl.DateTimeFormat('en-US',{weekday:'short',month:'short',day:'numeric'}).format(dt);
-  const signalBits=[day.tempSignal,day.precipSignal].filter(Boolean).join(' · ');
-  const tempAnom = day.tempAnomC!=null ? `${day.tempAnomC>0?'+':''}${(state.unit==='F' ? day.tempAnomC*9/5 : day.tempAnomC).toFixed(1)}°${state.unit}` : null;
-  const precipAmount = day.precipMm!=null ? P(day.precipMm) : null;
-  detailModalShell(state.loc.name, subtitle, `<div class="detailtabs extendedtabs" role="tablist"><button data-dtab="outlook" aria-selected="true">Outlook</button><button data-dtab="history" aria-selected="false">History</button></div><div id="dailyDetailContent"></div>`);
-  const renderOutlook=()=>{
-    const el=$('#dailyDetailContent'); if(!el) return;
-    el.innerHTML=`<div class="extendedwarning"><b>Extended prediction — not a normal forecast</b><span>This is coarse ensemble guidance this far out. Exact day-to-day weather can change a lot.</span></div>
-      <div class="detailhero dailyhero extendedhero">${iconFor(day.code,68,false)}<div class="extendedrange"><b>${T(day.hiC)}°</b><span>/</span><b>${T(day.loC)}°</b></div><div class="detailcond">${esc(signalBits || codeLabel(day.code))}</div></div>
-      <div class="detailrows">
-        ${metricRow('Model mean high', day.hiC!=null?`${T(day.hiC)}°${state.unit}`:'—')}
-        ${metricRow('Model mean low', day.loC!=null?`${T(day.loC)}°${state.unit}`:'—')}
-        ${metricRow('Temperature signal', day.tempSignal?`${esc(day.tempSignal)}${tempAnom?` · ${tempAnom}`:''}`:'—')}
-        ${metricRow('Precipitation signal', day.precipSignal?esc(day.precipSignal):'—')}
-        ${metricRow('Model precipitation', precipAmount)}
-        ${metricRow('Confidence', esc(day.confidence||'very low'))}
-      </div>
-      <div class="extendedsource"><b>What this is</b><p>ECMWF EC46 ensemble-mean guidance at roughly 36 km resolution. Lemons does not blend this into the regular 16-day forecast, and it should be read as a broad pattern prediction — not a promise that this exact high, low or icon will happen on this exact date.</p><p><strong>Cross-check it.</strong> As this date gets closer, use the normal Lemons squeeze plus weather.gov/NWS and another independent source before making plans.</p><div class="extendedlinks"><a href="https://www.weather.gov/" target="_blank" rel="noopener">weather.gov ↗</a><a href="https://www.cpc.ncep.noaa.gov/" target="_blank" rel="noopener">NOAA climate outlooks ↗</a></div></div>`;
+function initDetailTabSwipe(tabs, renderPanel){
+  const root=$('#forecastDetail');
+  const tabbar=root?.querySelector('.detailtabs');
+  const stage=root?.querySelector('.detailswipestage');
+  const track=root?.querySelector('.detailswipetrack');
+  const panels=tabs.map(tab=>root?.querySelector(`[data-dpanel="${tab}"]`));
+  if(!root||!tabbar||!stage||!track||panels.some(p=>!p)) return null;
+
+  let index=Math.max(0,tabs.findIndex(tab=>tabbar.querySelector(`[data-dtab="${tab}"]`)?.getAttribute('aria-selected')==='true'));
+  if(index<0) index=0;
+  let tracking=false,horizontal=false,startX=0,startY=0,lastX=0,lastT=0,velocityX=0,width=Math.max(1,stage.clientWidth),raf=0,pendingDx=0,trackX=-index*width,suppressClickUntil=0;
+  const prepared=new Set();
+
+  tabbar.style.setProperty('--detail-count',String(tabs.length));
+  tabbar.style.setProperty('--detail-pos',String(index));
+
+  const panelHeight=i=>Math.max(1,Math.ceil(panels[i]?.scrollHeight||1));
+  const setTrack=(x,animate=false,duration=240)=>{
+    track.style.transition=animate?`transform ${duration}ms cubic-bezier(.22,1,.36,1)`:'none';
+    trackX=x; track.style.transform=`translate3d(${x}px,0,0)`;
   };
-  $('#forecastDetail').querySelectorAll('[data-dtab]').forEach(b=>b.addEventListener('click',async()=>{
-    const tab=b.dataset.dtab;
-    $('#forecastDetail').querySelectorAll('[data-dtab]').forEach(x=>x.setAttribute('aria-selected',x.dataset.dtab===tab));
-    if(tab==='history') await renderHistoryTab(date,day); else renderOutlook();
-  }));
-  renderOutlook();
+  const setHeight=(h,animate=false,duration=220)=>{
+    stage.style.transition=animate?`height ${duration}ms cubic-bezier(.22,1,.36,1)`:'none';
+    stage.style.height=`${Math.max(1,Math.ceil(h))}px`;
+  };
+  const setIndicator=(pos,dragging=false)=>{
+    tabbar.classList.toggle('swiping',dragging);
+    tabbar.style.setProperty('--detail-pos',String(Math.max(0,Math.min(tabs.length-1,pos))));
+  };
+  const updateAria=i=>{
+    tabbar.querySelectorAll('[data-dtab]').forEach(b=>b.setAttribute('aria-selected',String(b.dataset.dtab===tabs[i])));
+    panels.forEach((p,pi)=>p.setAttribute('aria-hidden',pi===i?'false':'true'));
+  };
+  const ensure=i=>{
+    if(i<0||i>=tabs.length||prepared.has(tabs[i])) return;
+    prepared.add(tabs[i]);
+    const maybe=renderPanel(tabs[i],panels[i]);
+    Promise.resolve(maybe).catch(()=>{}).finally(()=>{
+      if(i===index&&!horizontal) setHeight(panelHeight(index),false);
+    });
+  };
+  const ensureNeighbor=dx=>{
+    const ni=index+(dx<0?1:-1);
+    ensure(ni);
+  };
+  const renderDrag=dx=>{
+    width=Math.max(1,stage.clientWidth);
+    let applied=dx;
+    if((index===0&&dx>0)||(index===tabs.length-1&&dx<0)) applied=dx*.22;
+    setTrack(-index*width+applied,false);
+    const pos=index-applied/width;
+    setIndicator(pos,true);
+    const ni=index+(applied<0?1:-1);
+    if(ni>=0&&ni<tabs.length){
+      const t=Math.min(1,Math.abs(applied)/width);
+      setHeight(panelHeight(index)+(panelHeight(ni)-panelHeight(index))*t,false);
+    }
+  };
+  const settle=(next,fromDrag=true)=>{
+    next=Math.max(0,Math.min(tabs.length-1,next));
+    ensure(next);
+    index=next; updateAria(index); setIndicator(index,false);
+    width=Math.max(1,stage.clientWidth);
+    const target=-index*width,dist=Math.abs(target-trackX);
+    const duration=fromDrag?Math.max(150,Math.min(270,150+dist/width*130)):245;
+    setTrack(target,true,duration); setHeight(panelHeight(index),true,Math.min(duration,230));
+    requestAnimationFrame(()=>setTimeout(()=>setHeight(panelHeight(index),false),duration+20));
+  };
+  const ignored=target=>!!target.closest('button,a,input,select,textarea,.historyplotinteractive,.historycharttypes,.extendedlinks,.detailclose');
+  const onStart=e=>{
+    if(e.touches.length!==1||ignored(e.target)) return;
+    tracking=true;horizontal=false;startX=lastX=e.touches[0].clientX;startY=e.touches[0].clientY;lastT=performance.now();velocityX=0;
+    track.style.transition='none';stage.style.transition='none';
+  };
+  const onMove=e=>{
+    if(!tracking||e.touches.length!==1) return;
+    const x=e.touches[0].clientX,y=e.touches[0].clientY,dx=x-startX,dy=y-startY;
+    if(!horizontal){
+      if(Math.abs(dx)<7&&Math.abs(dy)<7) return;
+      if(Math.abs(dy)>Math.abs(dx)*1.05){tracking=false;return;}
+      horizontal=true;stage.classList.add('dragging');ensureNeighbor(dx);
+    }
+    e.preventDefault();
+    const now=performance.now(),dt=Math.max(1,now-lastT);
+    velocityX=velocityX*.55+((x-lastX)/dt)*.45;lastX=x;lastT=now;pendingDx=dx;
+    if(!raf) raf=requestAnimationFrame(()=>{raf=0;renderDrag(pendingDx);});
+  };
+  const finish=e=>{
+    if(!tracking&&!horizontal) return;
+    const wasHorizontal=horizontal;tracking=false;horizontal=false;stage.classList.remove('dragging');
+    if(!wasHorizontal){setIndicator(index,false);return;}
+    const endX=e.changedTouches?.[0]?.clientX??lastX,dx=endX-startX;
+    if(Math.abs(dx)>10) suppressClickUntil=performance.now()+340;
+    const travel=Math.abs(dx)/Math.max(1,width),flick=Math.abs(velocityX)>.42;
+    let next=index;
+    if((travel>.18||flick)&&Math.abs(dx)>24) next=dx<0?index+1:index-1;
+    settle(next,true);
+  };
+  const cancel=()=>{ if(!tracking&&!horizontal)return;tracking=false;horizontal=false;stage.classList.remove('dragging');settle(index,true); };
+  const onClickCapture=e=>{if(performance.now()<suppressClickUntil){e.preventDefault();e.stopPropagation();}};
+  const onResize=()=>{width=Math.max(1,stage.clientWidth);setTrack(-index*width,false);setHeight(panelHeight(index),false);};
+
+  tabbar.querySelectorAll('[data-dtab]').forEach(b=>b.addEventListener('click',()=>settle(tabs.indexOf(b.dataset.dtab),false)));
+  stage.addEventListener('click',onClickCapture,true);
+  stage.addEventListener('touchstart',onStart,{passive:true});
+  stage.addEventListener('touchmove',onMove,{passive:false});
+  stage.addEventListener('touchend',finish,{passive:true});
+  stage.addEventListener('touchcancel',cancel,{passive:true});
+  window.addEventListener('resize',onResize,{passive:true});
+  const ro=typeof ResizeObserver!=='undefined'?new ResizeObserver(entries=>{for(const entry of entries){const pi=panels.indexOf(entry.target);if(pi===index&&!horizontal)setHeight(panelHeight(index),false);}}):null;
+  panels.forEach(p=>ro?.observe(p));
+
+  ensure(index); ensure(index+1);
+  updateAria(index); setTrack(-index*width,false); requestAnimationFrame(()=>setHeight(panelHeight(index),false));
+  root._detailSwipeCleanup=()=>{if(raf)cancelAnimationFrame(raf);ro?.disconnect();window.removeEventListener('resize',onResize);};
+  return {go:tab=>{const i=tabs.indexOf(tab);if(i>=0)settle(i,false);},refresh:onResize};
+}
+
+function extendedOutlookMarkup(day,date){
+  const dt=new Date(date+'T12:00:00');
+  const signalBits=[day.tempSignal,day.precipSignal].filter(Boolean).join(' · ');
+  const tempAnom=day.tempAnomC!=null?`${day.tempAnomC>0?'+':''}${(state.unit==='F'?day.tempAnomC*9/5:day.tempAnomC).toFixed(1)}°${state.unit}`:null;
+  const precipAmount=day.precipMm!=null?P(day.precipMm):null;
+  return `<div class="extendedwarning"><b>Extended prediction — not a normal forecast</b><span>This is coarse ensemble guidance this far out. Exact day-to-day weather can change a lot.</span></div>
+    <div class="detailhero dailyhero extendedhero">${iconFor(day.code,68,false)}<div class="extendedrange"><b>${T(day.hiC)}°</b><span>/</span><b>${T(day.loC)}°</b></div><div class="detailcond">${esc(signalBits||codeLabel(day.code))}</div></div>
+    <div class="detailrows">
+      ${metricRow('Model mean high',day.hiC!=null?`${T(day.hiC)}°${state.unit}`:'—')}
+      ${metricRow('Model mean low',day.loC!=null?`${T(day.loC)}°${state.unit}`:'—')}
+      ${metricRow('Temperature signal',day.tempSignal?`${esc(day.tempSignal)}${tempAnom?` · ${tempAnom}`:''}`:'—')}
+      ${metricRow('Precipitation signal',day.precipSignal?esc(day.precipSignal):'—')}
+      ${metricRow('Model precipitation',precipAmount)}
+      ${metricRow('Confidence',esc(day.confidence||'very low'))}
+    </div>
+    <div class="extendedsource"><b>What this is</b><p>ECMWF EC46 ensemble-mean guidance at roughly 36 km resolution. Lemons does not blend this into the regular 16-day forecast, and it should be read as a broad pattern prediction — not a promise that this exact high, low or icon will happen on this exact date.</p><p><strong>Cross-check it.</strong> As this date gets closer, use the normal Lemons squeeze plus weather.gov/NWS and another independent source before making plans.</p><div class="extendedlinks"><a href="https://www.weather.gov/" target="_blank" rel="noopener">weather.gov ↗</a><a href="https://www.cpc.ncep.noaa.gov/" target="_blank" rel="noopener">NOAA climate outlooks ↗</a></div></div>`;
+}
+
+function openExtendedDailyDetail(day){
+  const date=day.date,dt=new Date(date+'T12:00:00');
+  const subtitle=new Intl.DateTimeFormat('en-US',{weekday:'short',month:'short',day:'numeric'}).format(dt);
+  detailModalShell(state.loc.name,subtitle,`<div class="detailtabs extendedtabs" role="tablist"><button data-dtab="outlook" aria-selected="true">Outlook</button><button data-dtab="history" aria-selected="false">History</button></div><div class="detailswipestage"><div class="detailswipetrack"><section class="detailswipepanel" data-dpanel="outlook"></section><section class="detailswipepanel" data-dpanel="history"></section></div></div>`);
+  initDetailTabSwipe(['outlook','history'],(tab,panel)=>{
+    if(tab==='history') return renderHistoryTab(date,day,panel);
+    panel.innerHTML=extendedOutlookMarkup(day,date);
+  });
+}
+
+function regularDailyDetailMarkup(date,day,night){
+  const dt=new Date(date+'T12:00:00'),sum=summarizePeriod(date,night),det=state.detail?.daily?.get(date)||{};
+  sum.gustKmh=safeMax(sum.gustKmh);sum.precip=safeMax(sum.precip);
+  const temp=night?day.loC:day.hiC,code=det.code??day.code,pop=sum.precip??day.precip;
+  const amount=sum.snowCm>0?SNOW(sum.snowCm):P(sum.rainMm||(night?null:det.rainMm));
+  const sunMoon=night
+    ? `<div class="celestial"><span class="sectioncap">Moon</span>${metricRow('Moon phase',moonPhaseAt(dt).name)}${metricRow('Illumination',`${Math.round(moonPhaseAt(dt).frac*100)}%`)}</div>`
+    : `<div class="celestial"><span class="sectioncap">Sun</span>${metricRow('Rise',det.sunrise?skyTime(det.sunrise):'—')}${metricRow('Set',det.sunset?skyTime(det.sunset):'—')}${metricRow('Total daylight',durText(det.daylightSec))}</div>`;
+  return `<div class="detailhero dailyhero">${iconFor(code,76,night)}<div class="detailtemp">${T(temp)}°</div><div class="detailprecip">${pop!=null?`Precipitation: ${Math.round(pop)}%`:''}</div><div class="detailcond">${esc(codeLabel(code))}</div></div>
+    ${!night&&day.confidence?`<div class="forecastconfidence ${day.confidence}"><span>Forecast confidence</span><b>${confidenceLabel(day.confidence)}</b>${day.spreadC!=null?`<small>${state.unit==='F'?(day.spreadC*9/5).toFixed(1)+'°F':day.spreadC.toFixed(1)+'°C'} guidance spread · ${esc(day.blendMode||'weighted blend')}${day.ensembleCount!=null?` · ${day.ensembleCount} ensemble source${day.ensembleCount===1?'':'s'}`:''}</small>`:''}</div>`:''}
+    <div class="detailrows">
+      ${metricRow('Feels like',sum.feelsC!=null?`${T(sum.feelsC)}°${state.unit}`:'—')}
+      ${metricRow('Humidity',sum.humidity!=null?`${Math.round(sum.humidity)}%`:'—')}
+      ${metricRow('Wind',windText(sum.windKmh,sum.windDir))}
+      ${metricRow('Max wind gusts',sum.gustKmh!=null?`${W(sum.gustKmh)} ${windUnit()}`:'—')}
+      ${metricRow('Total hours of precipitation',sum.precipHours!=null?`${sum.precipHours} hr${sum.precipHours===1?'':'s'}`:'—')}
+      ${metricRow('Precipitation probability',pop!=null?`${Math.round(pop)}%`:'—')}
+      ${metricRow(sum.snowCm>0?'Snow amount':'Rain amount',amount)}
+      ${!night?metricRow('Max UV index',det.uv!=null?`${det.uv.toFixed(1)}${det.uv<3?' (Low)':det.uv<6?' (Moderate)':det.uv<8?' (High)':' (Very high)'}`:'—'):''}
+      ${metricRow('Cloud cover',sum.cloud!=null?`${Math.round(sum.cloud)}%`:'—')}
+      ${metricRow('Dew point',sum.dewC!=null?`${T(sum.dewC)}°${state.unit}`:'—')}
+    </div>${sunMoon}`;
 }
 
 function openDailyDetail(date){
-  const day=consensusDaily(DAILY_EXTENDED_DAYS).find(x=>x.date===date); if(!day) return;
-  if(day.extended){ openExtendedDailyDetail(day); return; }
-  const dt=new Date(date+'T12:00:00');
-  const title=state.loc.name;
-  const subtitle=new Intl.DateTimeFormat('en-US',{weekday:'short',month:'short',day:'numeric'}).format(dt);
-  detailModalShell(title, subtitle, `<div class="detailtabs" role="tablist"><button data-dtab="day" aria-selected="true">Day</button><button data-dtab="night" aria-selected="false">Night</button><button data-dtab="history" aria-selected="false">History</button></div><div id="dailyDetailContent"></div>`);
-  const renderTab=async tab=>{
-    $('#forecastDetail').querySelectorAll('[data-dtab]').forEach(b=>b.setAttribute('aria-selected',b.dataset.dtab===tab));
-    if(tab==='history'){ await renderHistoryTab(date,day); return; }
-    const night=tab==='night', sum=summarizePeriod(date,night), det=state.detail?.daily?.get(date)||{};
-    sum.gustKmh=safeMax(sum.gustKmh); sum.precip=safeMax(sum.precip);
-    const temp=night?day.loC:day.hiC, code=det.code??day.code, pop=sum.precip??day.precip;
-    const amount=sum.snowCm>0?SNOW(sum.snowCm):P(sum.rainMm || (night?null:det.rainMm));
-    const sunMoon = night
-      ? `<div class="celestial"><span class="sectioncap">Moon</span>${metricRow('Moon phase', moonPhaseAt(dt).name)}${metricRow('Illumination', `${Math.round(moonPhaseAt(dt).frac*100)}%`)}</div>`
-      : `<div class="celestial"><span class="sectioncap">Sun</span>${metricRow('Rise', det.sunrise?skyTime(det.sunrise):'—')}${metricRow('Set', det.sunset?skyTime(det.sunset):'—')}${metricRow('Total daylight', durText(det.daylightSec))}</div>`;
-    $('#dailyDetailContent').innerHTML=`<div class="detailhero dailyhero">${iconFor(code,76,night)}<div class="detailtemp">${T(temp)}°</div><div class="detailprecip">${pop!=null?`Precipitation: ${Math.round(pop)}%`:''}</div><div class="detailcond">${esc(codeLabel(code))}</div></div>
-      ${!night&&day.confidence?`<div class="forecastconfidence ${day.confidence}"><span>Forecast confidence</span><b>${confidenceLabel(day.confidence)}</b>${day.spreadC!=null?`<small>${state.unit==='F'?(day.spreadC*9/5).toFixed(1)+'°F':day.spreadC.toFixed(1)+'°C'} guidance spread · ${esc(day.blendMode||'weighted blend')}${day.ensembleCount!=null?` · ${day.ensembleCount} ensemble source${day.ensembleCount===1?'':'s'}`:''}</small>`:''}</div>`:''}
-      <div class="detailrows">
-        ${metricRow('Feels like', sum.feelsC!=null?`${T(sum.feelsC)}°${state.unit}`:'—')}
-        ${metricRow('Humidity', sum.humidity!=null?`${Math.round(sum.humidity)}%`:'—')}
-        ${metricRow('Wind', windText(sum.windKmh,sum.windDir))}
-        ${metricRow('Max wind gusts', sum.gustKmh!=null?`${W(sum.gustKmh)} ${windUnit()}`:'—')}
-        ${metricRow('Total hours of precipitation', sum.precipHours!=null?`${sum.precipHours} hr${sum.precipHours===1?'':'s'}`:'—')}
-        ${metricRow('Precipitation probability', pop!=null?`${Math.round(pop)}%`:'—')}
-        ${metricRow(sum.snowCm>0?'Snow amount':'Rain amount', amount)}
-        ${!night?metricRow('Max UV index', det.uv!=null?`${det.uv.toFixed(1)}${det.uv<3?' (Low)':det.uv<6?' (Moderate)':det.uv<8?' (High)':' (Very high)'}`:'—'):''}
-        ${metricRow('Cloud cover', sum.cloud!=null?`${Math.round(sum.cloud)}%`:'—')}
-        ${metricRow('Dew point', sum.dewC!=null?`${T(sum.dewC)}°${state.unit}`:'—')}
-      </div>${sunMoon}`;
-  };
-  $('#forecastDetail').querySelectorAll('[data-dtab]').forEach(b=>b.addEventListener('click',()=>renderTab(b.dataset.dtab)));
-  renderTab('day');
+  const day=consensusDaily(DAILY_EXTENDED_DAYS).find(x=>x.date===date);if(!day)return;
+  if(day.extended){openExtendedDailyDetail(day);return;}
+  const dt=new Date(date+'T12:00:00'),title=state.loc.name,subtitle=new Intl.DateTimeFormat('en-US',{weekday:'short',month:'short',day:'numeric'}).format(dt);
+  detailModalShell(title,subtitle,`<div class="detailtabs" role="tablist"><button data-dtab="day" aria-selected="true">Day</button><button data-dtab="night" aria-selected="false">Night</button><button data-dtab="history" aria-selected="false">History</button></div><div class="detailswipestage"><div class="detailswipetrack"><section class="detailswipepanel" data-dpanel="day"></section><section class="detailswipepanel" data-dpanel="night"></section><section class="detailswipepanel" data-dpanel="history"></section></div></div>`);
+  initDetailTabSwipe(['day','night','history'],(tab,panel)=>{
+    if(tab==='history') return renderHistoryTab(date,day,panel);
+    panel.innerHTML=regularDailyDetailMarkup(date,day,tab==='night');
+  });
 }
 
 function moonPhaseAt(dateLike){
@@ -1810,7 +1926,7 @@ const HISTORY_FIRST_YEAR = 1940;
 const HISTORY_PAGE_YEARS = 10;
 const HISTORY_CHART_W = 1000;
 let historyRenderSeq = 0;
-let historyChartModes = {temp:'line', rain:'line'};
+let historyChartModes = {temp:'bar', rain:'line'};
 let historyChartSelectionYears = {temp:null, rain:null};
 
 function historyInitialEndYear(date){
@@ -2006,6 +2122,15 @@ function historyChartPoints(kind,rows){
     ? rows.filter(r=>r.hiC!=null||r.loC!=null).sort((a,b)=>a.year-b.year)
     : rows.filter(r=>r.rainMm!=null).sort((a,b)=>a.year-b.year);
 }
+function clearHistoryGraphSelection(viewport,kind){
+  if(!viewport) return;
+  const scrub=viewport.querySelector('.historyscrub');
+  scrub?.classList.remove('is-active');
+  viewport.classList.remove('is-scrubbing');
+  historyChartSelectionYears[kind]=null;
+  viewport.removeAttribute('aria-valuenow');
+  viewport.removeAttribute('aria-valuetext');
+}
 function setupHistoryGraphScrubber(kind,rows,shell){
   const viewport=shell?.querySelector('.historyplotinteractive');
   const surface=viewport?.querySelector('.historyplotsurface');
@@ -2023,6 +2148,7 @@ function setupHistoryGraphScrubber(kind,rows,shell){
   const line=scrub.querySelector('.historyscrubline'), band=scrub.querySelector('.historyscrubband'), tip=scrub.querySelector('.historycharttip');
   const tipDate=tip?.querySelector('b'), tipValue=tip?.querySelector('span');
   const dotHi=scrub.querySelector('.temp-hi'), dotLo=scrub.querySelector('.temp-lo'), dotRain=scrub.querySelector('.historyscrubdot.rain');
+  viewport._clearHistorySelection=()=>clearHistoryGraphSelection(viewport,kind);
   const xFor=i=>pts.length===1?W/2:left+i*(right-left)/(pts.length-1);
   const yFor=v=>top+(ymax-v)*(bottom-top)/(ymax-ymin||1);
   const pctX=i=>100*xFor(i)/W;
@@ -2096,19 +2222,37 @@ function setupHistoryChartControls(rows,root){
     setupHistoryGraphScrubber(kind,rows,shell);
   }));
   ['temp','rain'].forEach(kind=>setupHistoryGraphScrubber(kind,rows,root.querySelector(`[data-history-chart-shell="${kind}"]`)));
+  const detail=$('#forecastDetail');
+  if(detail){
+    try{detail._historySelectionCleanup?.();}catch(_e){}
+    const clearAll=()=>root.querySelectorAll('.historyplotinteractive').forEach(v=>v._clearHistorySelection?.());
+    const outside=e=>{
+      root.querySelectorAll('.historyplotinteractive').forEach(v=>{ if(!v.contains(e.target)) v._clearHistorySelection?.(); });
+    };
+    let scrollRaf=0;
+    const onScroll=()=>{ if(scrollRaf) return; scrollRaf=requestAnimationFrame(()=>{scrollRaf=0;clearAll();}); };
+    detail.addEventListener('pointerdown',outside,true);
+    detail.addEventListener('scroll',onScroll,{passive:true});
+    detail._historySelectionCleanup=()=>{
+      if(scrollRaf) cancelAnimationFrame(scrollRaf);
+      detail.removeEventListener('pointerdown',outside,true);
+      detail.removeEventListener('scroll',onScroll);
+      clearAll();
+    };
+  }
 }
-async function renderHistoryPage(date,day){
-  const el=$('#dailyDetailContent'); if(!el) return;
+async function renderHistoryPage(date,day,targetEl=null){
+  const el=targetEl||$('#dailyDetailContent'); if(!el) return;
   const seq=++historyRenderSeq;
-  historyChartModes={temp:'line',rain:'line'};
+  historyChartModes={temp:'bar',rain:'line'};
   historyChartSelectionYears={temp:null,rain:null};
   el.innerHTML=historyLoadingMarkup(); el.setAttribute('aria-busy','true');
   const archive=await fetchAllHistory(date);
-  if(seq!==historyRenderSeq || !historyActive()) return;
+  if(seq!==historyRenderSeq || !el.isConnected) return;
   if(!archive){
     el.removeAttribute('aria-busy');
     el.innerHTML=`<div class="historyerror"><b>History did not come back for this spot.</b><span>Check your connection, then try the full record again.</span><button class="linkish" id="historyRetry">retry</button></div>`;
-    $('#historyRetry')?.addEventListener('click',()=>renderHistoryPage(date,day));
+    el.querySelector('#historyRetry')?.addEventListener('click',()=>renderHistoryPage(date,day,el));
     return;
   }
   const rows=archive.rows, newest=[...rows].sort((a,b)=>b.year-a.year), recentRows=newest.slice(0,10), latest=newest[0]||null;
@@ -2131,8 +2275,8 @@ async function renderHistoryPage(date,day){
   <p class="detailnote historynote">Historical rows use Open-Meteo's ERA5 reanalysis for this exact calendar date. ERA5 is a consistent gridded reconstruction rather than an official weather-station log. Missing years are simply omitted; the record ends at the oldest date the archive returns.</p>`;
   setupHistoryChartControls(rows,el);
 }
-async function renderHistoryTab(date,day){
-  return renderHistoryPage(date,day);
+async function renderHistoryTab(date,day,targetEl=null){
+  return renderHistoryPage(date,day,targetEl);
 }
 
 function aqiLabel(v){
@@ -2494,7 +2638,8 @@ function initRadar(){
     playing:false, timer:null, frameRaf:null, swapTimer:null, moveTimer:null, locked:true, scrubbing:false,
     activeLayer:null, pendingLayer:null, pendingIdx:-1, swapSeq:0,
     locationMarker, markerVisible, fsHandler:null, fitHandler:null, orientationHandler:null,
-    fitWidth:0, fallbackFullscreen:false, fsPlaceholder:null,
+    fitWidth:0, normalStageHeight:'', normalStageWidth:0, fallbackFullscreen:false, fsPlaceholder:null,
+    fullscreenSession:false, fullscreenLockWasLocked:null, fullscreenStageHeight:'', fullscreenStageWidth:0,
     hotIndices:new Set(), hotRadius:2, preloadGen:0, preloadQueue:[], preloadActive:0, preloadConcurrency:4, bgStarted:false,
     destroy(){
       clearTimeout(this.timer); clearTimeout(this.swapTimer); clearTimeout(this.moveTimer);
@@ -2593,7 +2738,10 @@ function initRadar(){
     const preferred = controlsH + 520;
     const stageH = Math.min(preferred, available);
 
-    radarStage.style.setProperty('--radar-stage-h', `${Math.round(stageH)}px`);
+    const fittedHeight = `${Math.round(stageH)}px`;
+    radar.normalStageHeight = fittedHeight;
+    radar.normalStageWidth = width;
+    radarStage.style.setProperty('--radar-stage-h', fittedHeight);
     radarStage.classList.add('radarfit');
     requestAnimationFrame(()=>map.invalidateSize());
   }
@@ -2615,15 +2763,77 @@ function initRadar(){
     }
     radar.fsPlaceholder = null;
   }
+
+  /* Fullscreen is a temporary interaction mode. Remember the exact fitted
+     console height and the user's pre-fullscreen lock state so leaving full
+     screen returns to the same compact radar instead of re-measuring while the
+     browser is still reporting fullscreen geometry. */
+  function beginFullscreenSession(){
+    if(radar.fullscreenSession) return;
+    /* Make sure there is a valid normal fitted height to come back to. */
+    if(!radar.normalStageHeight) fitRadarStage(true);
+    radar.fullscreenSession = true;
+    radar.fullscreenLockWasLocked = radar.locked;
+    radar.fullscreenStageHeight = radar.normalStageHeight || radarStage?.style.getPropertyValue('--radar-stage-h') || '';
+    radar.fullscreenStageWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+    /* Fullscreen should always be immediately draggable/zoomable. */
+    setMapLocked(false);
+  }
+
+  function restoreNormalRadarAfterFullscreen(){
+    if(!radar.fullscreenSession) return;
+    radar.fullscreenSession = false;
+
+    /* Restore the gesture state from before fullscreen. If the user entered
+       while locked, normal mode locks again. If they entered unlocked, keep it
+       unlocked exactly as requested. */
+    const shouldLock = radar.fullscreenLockWasLocked !== false;
+    radar.fullscreenLockWasLocked = null;
+    setMapLocked(shouldLock);
+
+    const width = window.innerWidth || document.documentElement.clientWidth || 0;
+    const sameLayout = radar.fullscreenStageWidth && Math.abs(width-radar.fullscreenStageWidth) < 40;
+    const savedHeight = radar.fullscreenStageHeight;
+    radar.fullscreenStageHeight = '';
+    radar.fullscreenStageWidth = 0;
+
+    /* Restore the pre-fullscreen static fit immediately. This avoids the old
+       520px-ish map flashing back in while fullscreen CSS is being removed. */
+    if(sameLayout && savedHeight && radarStage){
+      radar.normalStageHeight = savedHeight;
+      radar.normalStageWidth = width;
+      radar.fitWidth = width;
+      radarStage.style.setProperty('--radar-stage-h', savedHeight);
+      radarStage.classList.add('radarfit');
+    }
+
+    /* If orientation really changed, wait until the page has returned to its
+       normal document layout before measuring. Never measure during the
+       fullscreenchange frame itself; that was what caused the oversized map. */
+    if(!sameLayout){
+      requestAnimationFrame(()=>requestAnimationFrame(()=>fitRadarStage(true)));
+      setTimeout(()=>fitRadarStage(true), 180);
+    }
+
+    requestAnimationFrame(()=>{
+      map.invalidateSize();
+      setTimeout(()=>map.invalidateSize(), 120);
+    });
+  }
+
   function syncFullscreen(){
     const active = fullscreenElement()===radarStage || radar.fallbackFullscreen;
+    if(active){
+      beginFullscreenSession();
+    }else{
+      restoreNormalRadarAfterFullscreen();
+    }
     if(fsButton){
       fsButton.innerHTML = active ? exitFsIcon : enterFsIcon;
       fsButton.setAttribute('aria-label', active ? 'Exit radar fullscreen' : 'Open radar fullscreen');
       fsButton.title = active ? 'Exit fullscreen' : 'Fullscreen map';
       fsButton.setAttribute('aria-pressed', active ? 'true' : 'false');
     }
-    if(!active) fitRadarStage(true);
     requestAnimationFrame(()=>{
       map.invalidateSize();
       setTimeout(()=>map.invalidateSize(), 120);
@@ -2639,6 +2849,7 @@ function initRadar(){
   }
   async function enterFullscreen(){
     if(!radarStage) return;
+    beginFullscreenSession();
     try{
       if(radarStage.requestFullscreen) await radarStage.requestFullscreen();
       else if(radarStage.webkitRequestFullscreen) radarStage.webkitRequestFullscreen();
@@ -2661,7 +2872,11 @@ function initRadar(){
   }
   fsButton?.addEventListener('click', toggleFullscreen);
   fsClose?.addEventListener('click', e=>{ e.preventDefault(); e.stopPropagation(); exitFullscreen(); });
-  radar.fsHandler = syncFullscreen;
+  radar.fsHandler = ()=>{
+    /* Native Esc/back-button exits arrive here without going through our button. */
+    if(!fullscreenElement() && radar.fallbackFullscreen) restoreFallbackFullscreen();
+    syncFullscreen();
+  };
   document.addEventListener('fullscreenchange', radar.fsHandler);
   document.addEventListener('webkitfullscreenchange', radar.fsHandler);
 
